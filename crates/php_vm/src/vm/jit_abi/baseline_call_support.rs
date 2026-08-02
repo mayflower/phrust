@@ -950,7 +950,7 @@ pub(super) fn bind_native_property_reference_arguments(
         if let Some(reference) = context
             .bind_native_declared_property_reference(argument.property_receiver, &target.property)?
         {
-            argument.value.payload = reference as u64;
+            argument.value = reference;
             *encoded = reference;
             continue;
         }
@@ -984,7 +984,7 @@ pub(super) fn bind_native_property_reference_arguments(
             }
         };
         let reference = context.encode_native_reference_owner(reference)?;
-        argument.value.payload = reference as u64;
+        argument.value = reference;
         *encoded = reference;
     }
     Ok(())
@@ -2281,7 +2281,7 @@ fn take_captured_native_fiber_execution(
     let nested_link = std::mem::take(&mut state.delegation_handle);
     let target = context.native_execution_target_from_state(&state, fallback)?;
     let handle = context.run_in_native_execution_target(&target, |context| {
-        ensure_native_baseline_entry(context, target.function)
+        ensure_native_generic_entry(context, target.function)
     })?;
     let arity = handle
         .region_state_metadata()
@@ -2692,7 +2692,7 @@ fn resume_native_fiber_execution_in_target(
                 if generator_entry.is_some() {
                     execution.handle = context
                         .run_in_native_execution_target(&execution.target, |context| {
-                            ensure_native_baseline_entry(context, execution.target.function)
+                            ensure_native_generic_entry(context, execution.target.function)
                         })?;
                 }
                 let runtime = context.native_runtime_ptr();
@@ -3324,7 +3324,7 @@ fn invoke_native_method_with_prepared_trace_arguments(
         // published baseline-native artifact so deeper guard exits stay inside
         // the callee's native continuation chain. Normal/top-level invocation
         // and statically stable calls keep their optimizing entries.
-        ensure_native_baseline_entry(context, function)?
+        ensure_native_generic_entry(context, function)?
     } else {
         ensure_native_entry(context, function)?
     };

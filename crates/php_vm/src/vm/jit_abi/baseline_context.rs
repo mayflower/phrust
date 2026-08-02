@@ -138,10 +138,13 @@ pub(in crate::vm) fn activate_native_context(
         trusted_class_plan_count: u32::try_from(context.trusted_class_plans.len())
             .unwrap_or(u32::MAX),
         trusted_class_plan_reserved: 0,
-        trusted_function_entries: deployment.native_function_entries.as_ptr() as usize as u64,
-        trusted_function_entry_count: u32::try_from(deployment.native_function_entries.len())
-            .unwrap_or(u32::MAX),
-        trusted_function_entry_reserved: 0,
+        trusted_generic_function_entries: deployment.generic_function_entries.as_ptr() as usize
+            as u64,
+        trusted_generic_function_entry_count: u32::try_from(
+            deployment.generic_function_entries.len(),
+        )
+        .unwrap_or(u32::MAX),
+        trusted_generic_function_entry_reserved: 0,
         trusted_preferred_function_entries: deployment.preferred_function_entries.as_ptr() as usize
             as u64,
         trusted_preferred_function_entry_count: u32::try_from(
@@ -149,13 +152,11 @@ pub(in crate::vm) fn activate_native_context(
         )
         .unwrap_or(u32::MAX),
         trusted_preferred_function_entry_reserved: 0,
-        baseline_function_entry_counts: deployment.baseline_function_entry_counts.as_ptr() as usize
+        generic_function_entry_counts: deployment.generic_function_entry_counts.as_ptr() as usize
             as u64,
-        baseline_function_entry_count: u32::try_from(
-            deployment.baseline_function_entry_counts.len(),
-        )
-        .unwrap_or(u32::MAX),
-        baseline_function_entry_reserved: 0,
+        generic_function_entry_count: u32::try_from(deployment.generic_function_entry_counts.len())
+            .unwrap_or(u32::MAX),
+        generic_function_entry_reserved: 0,
         trusted_linked_functions,
         trusted_linked_function_count,
         trusted_linked_function_reserved: 0,
@@ -312,11 +313,11 @@ pub(super) fn with_baseline_native_context_for<R>(
     let requested_entries = runtime_state
         .header
         .active_runtime_view()
-        .trusted_function_entries;
+        .trusted_generic_function_entries;
     let active_entries = context
         .compiled
         .prepared_deployment_image()
-        .native_function_entries
+        .generic_function_entries
         .as_ptr() as usize as u64;
     if requested_entries == active_entries {
         let result = operation(context);
@@ -337,7 +338,7 @@ pub(super) fn with_baseline_native_context_for<R>(
             let entries = package
                 .compiled
                 .prepared_deployment_image()
-                .native_function_entries
+                .generic_function_entries
                 .as_ptr() as usize as u64;
             (entries == requested_entries).then_some(unit)
         })

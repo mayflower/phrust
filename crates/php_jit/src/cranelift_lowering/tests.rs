@@ -23,7 +23,7 @@ use super::{
     stable_builtin_type_predicate, test_native_execution_poll_fallback,
 };
 use crate::region_ir::{
-    BaselineRegionBuilder, CompileMetadata, NativeCompilerTier, RegionCallTarget,
+    CompileMetadata, GenericRegionBuilder, NativeCompilerTier, RegionCallTarget,
     RegionInstructionKind, RegionNativeCall,
 };
 use crate::{
@@ -131,7 +131,7 @@ fn assert_optimizing_artifact(handle: &crate::JitFunctionHandle) {
     assert_eq!(
         metadata.compiler_tier,
         NativeCompilerTier::Optimizing,
-        "test silently compiled through the baseline tier"
+        "test silently compiled through the Generic tier"
     );
     assert!(
         !metadata.production_lowering.is_empty(),
@@ -8058,7 +8058,7 @@ fn dynamic_array_constructor_family_is_rejected_before_optimizing_entry() {
     builder.terminate_return(function, block, result.map(Operand::Register), span);
     let unit = builder.finish();
 
-    let region = BaselineRegionBuilder::build(
+    let region = GenericRegionBuilder::build(
         &unit,
         function,
         &CompileMetadata {
@@ -8196,7 +8196,7 @@ fn dynamic_array_shape_family_is_rejected_before_optimizing_entry() {
     builder.terminate_return(function, block, result.map(Operand::Register), span);
     let unit = builder.finish();
 
-    let region = BaselineRegionBuilder::build(
+    let region = GenericRegionBuilder::build(
         &unit,
         function,
         &CompileMetadata {
@@ -8318,7 +8318,7 @@ fn published_array_set_family_stays_in_the_optimizing_region() {
     builder.terminate_return(function, block, result.map(Operand::Register), span);
     let unit = builder.finish();
 
-    let region = BaselineRegionBuilder::build(
+    let region = GenericRegionBuilder::build(
         &unit,
         function,
         &CompileMetadata {
@@ -8448,7 +8448,7 @@ fn optimizer_does_not_create_local_baseline_islands() {
     );
     builder.terminate_return(function, block, Some(Operand::Register(carried)), span);
     let unit = builder.finish();
-    let mut region = BaselineRegionBuilder::build(
+    let mut region = GenericRegionBuilder::build(
         &unit,
         function,
         &CompileMetadata {
@@ -8513,7 +8513,7 @@ fn optimizer_keeps_exact_echo_inside_the_direct_native_region() {
         span,
     );
     let unit = builder.finish();
-    let mut region = BaselineRegionBuilder::build(
+    let mut region = GenericRegionBuilder::build(
         &unit,
         function,
         &CompileMetadata {
@@ -8602,7 +8602,7 @@ fn optimizer_keeps_top_level_body_on_native_request_scope_slots() {
     );
     builder.terminate_return(function, block, None, span);
     let unit = builder.finish();
-    let mut region = BaselineRegionBuilder::build(
+    let mut region = GenericRegionBuilder::build(
         &unit,
         function,
         &CompileMetadata {
@@ -8818,12 +8818,12 @@ fn oversized_finished_clif_is_rejected_before_regalloc() {
     let block = ir_builder.append_block(function);
     ir_builder.terminate_return(function, block, None, span);
     let unit = ir_builder.finish();
-    let region = BaselineRegionBuilder::build(
+    let region = GenericRegionBuilder::build(
         &unit,
         function,
         &CompileMetadata {
             ir_fingerprint: "pre-regalloc-budget".to_owned(),
-            tier: NativeCompilerTier::Baseline,
+            tier: NativeCompilerTier::Generic,
             helper_abi_hash: 0,
             target_cpu: "test".to_owned(),
             semantic_config_hash: 0,
@@ -12771,13 +12771,13 @@ fn native_unwind_resumes_compiled_catch_without_interpreter_frame() {
     baseline_entries[function.index()].store(
         baseline
             .native_entry_address()
-            .expect("baseline catch entry address"),
+            .expect("Generic catch entry address"),
         std::sync::atomic::Ordering::Release,
     );
     let _runtime_view = crate::activate_native_runtime_view(crate::JitNativeRuntimeView {
         abi_version: crate::JIT_RUNTIME_ABI_VERSION,
-        trusted_function_entries: baseline_entries.as_mut_ptr() as usize as u64,
-        trusted_function_entry_count: baseline_entries.len() as u32,
+        trusted_generic_function_entries: baseline_entries.as_mut_ptr() as usize as u64,
+        trusted_generic_function_entry_count: baseline_entries.len() as u32,
         ..crate::JitNativeRuntimeView::default()
     });
     let native = baseline
@@ -13366,7 +13366,7 @@ fn cranelift_backend_compiles_and_invokes_constant_return_native_handle() {
         runtime_helpers: crate::JitRuntimeHelperAddresses::default(),
     });
 
-    assert_eq!(outcome.status, JitCompileStatus::Compiled);
+    assert_eq!(outcome.status, JitCompileStatus::Compiled, "{outcome:?}");
     assert!(outcome.code_bytes > 0, "{outcome:?}");
     assert!(outcome.compile_time_nanos > 0, "{outcome:?}");
     let handle = outcome.handle.expect("constant return should compile");
@@ -13376,6 +13376,31 @@ fn cranelift_backend_compiles_and_invokes_constant_return_native_handle() {
             .invoke_i64(&[], JIT_RUNTIME_ABI_HASH)
             .expect("native constant return should execute"),
         42
+    );
+}
+
+#[test]
+fn generic_entry_compile_only_probe_uses_relocatable_shared_abi() {
+    let (unit, function) = constant_return_fixture();
+    let mut backend = CraneliftNativeCompiler;
+    let outcome = backend.compile_region(&NativeCompileRequest {
+        compile: &JitCompileRequest::new("cl.generic.shared-abi.compile-only"),
+        unit: Some(&unit),
+        function: Some(function),
+        runtime_helpers: crate::JitRuntimeHelperAddresses::default(),
+    });
+
+    assert_eq!(outcome.status, JitCompileStatus::Compiled, "{outcome:?}");
+    let handle = outcome.handle.expect("Generic entry should compile");
+    let relocatable = handle
+        .relocatable_code()
+        .expect("Generic entry should retain symbolic relocations");
+    assert_eq!(relocatable.root, function);
+    assert!(
+        relocatable
+            .functions
+            .iter()
+            .any(|entry| entry.function == function)
     );
 }
 
@@ -13607,7 +13632,7 @@ fn cranelift_backend_executes_region_ir_without_whole_function_candidate_gate() 
     });
 
     assert_eq!(outcome.status, JitCompileStatus::Compiled, "{outcome:?}");
-    assert!(outcome.diagnostics[0].contains("baseline Region IR"));
+    assert!(outcome.diagnostics[0].contains("Generic Region IR"));
     assert!(outcome.diagnostics[0].contains("fast_path_hits=0"));
     let handle = outcome
         .handle
@@ -13633,7 +13658,7 @@ fn cranelift_backend_executes_multiblock_region_ir() {
     });
 
     assert_eq!(outcome.status, JitCompileStatus::Compiled, "{outcome:?}");
-    assert!(outcome.diagnostics[0].contains("baseline Region IR"));
+    assert!(outcome.diagnostics[0].contains("Generic Region IR"));
     assert!(outcome.diagnostics[0].contains("control_flow=true"));
     let handle = outcome.handle.expect("multi-block region should compile");
     assert_eq!(
@@ -13766,12 +13791,12 @@ fn compile_on_demand_failure_precedes_native_argument_frame_ownership() {
     FRAME_ALLOC_CALLS.store(0, Ordering::SeqCst);
     FRAME_RELEASE_CALLS.store(0, Ordering::SeqCst);
     let (unit, function, callee) = scalar_direct_call_fixture();
-    let region = BaselineRegionBuilder::build(
+    let region = GenericRegionBuilder::build(
         &unit,
         function,
         &CompileMetadata {
             ir_fingerprint: "resolve-before-frame".to_owned(),
-            tier: NativeCompilerTier::Baseline,
+            tier: NativeCompilerTier::Generic,
             helper_abi_hash: 0,
             target_cpu: "test".to_owned(),
             semantic_config_hash: 0,
@@ -13807,8 +13832,8 @@ fn compile_on_demand_failure_precedes_native_argument_frame_ownership() {
         .collect::<Vec<_>>();
     let _view = crate::activate_native_runtime_view(crate::JitNativeRuntimeView {
         abi_version: crate::JIT_RUNTIME_ABI_VERSION,
-        trusted_function_entries: entries.as_mut_ptr() as usize as u64,
-        trusted_function_entry_count: entries.len() as u32,
+        trusted_generic_function_entries: entries.as_mut_ptr() as usize as u64,
+        trusted_generic_function_entry_count: entries.len() as u32,
         ..crate::JitNativeRuntimeView::default()
     });
     let crate::JitI64InvokeOutcome::SideExit { status, .. } = outcome
@@ -13922,8 +13947,8 @@ fn published_same_unit_entry_uses_prevalidated_preferred_cell() {
     );
     let _view = crate::activate_native_runtime_view(crate::JitNativeRuntimeView {
         abi_version: crate::JIT_RUNTIME_ABI_VERSION,
-        trusted_function_entries: entries.as_mut_ptr() as usize as u64,
-        trusted_function_entry_count: entries.len() as u32,
+        trusted_generic_function_entries: entries.as_mut_ptr() as usize as u64,
+        trusted_generic_function_entry_count: entries.len() as u32,
         trusted_preferred_function_entries: optimizing_entries.as_mut_ptr() as usize as u64,
         trusted_preferred_function_entry_count: optimizing_entries.len() as u32,
         ..crate::JitNativeRuntimeView::default()
@@ -14013,8 +14038,8 @@ fn direct_call_does_not_replay_raw_compile_transition_in_caller() {
     );
     let _view = crate::activate_native_runtime_view(crate::JitNativeRuntimeView {
         abi_version: crate::JIT_RUNTIME_ABI_VERSION,
-        trusted_function_entries: entries.as_mut_ptr() as usize as u64,
-        trusted_function_entry_count: entries.len() as u32,
+        trusted_generic_function_entries: entries.as_mut_ptr() as usize as u64,
+        trusted_generic_function_entry_count: entries.len() as u32,
         trusted_preferred_function_entries: preferred_entries.as_mut_ptr() as usize as u64,
         trusted_preferred_function_entry_count: preferred_entries.len() as u32,
         ..crate::JitNativeRuntimeView::default()
@@ -14324,7 +14349,7 @@ fn optimizing_local_external_parent_uses_prepared_object_relocation() {
 #[test]
 fn optimizing_closure_creation_for_call_user_func_array_leaves_before_entry() {
     let (unit, function, closure) = closure_call_user_func_array_fixture();
-    let region = BaselineRegionBuilder::build(
+    let region = GenericRegionBuilder::build(
         &unit,
         function,
         &CompileMetadata {
@@ -14740,8 +14765,8 @@ fn optimizing_linked_default_retains_the_published_literal_owner_for_the_callee(
         reserved: 0,
     }];
     let callee_view = Box::new(crate::JitNativeRuntimeView {
-        trusted_function_entries: callee_baseline.as_mut_ptr() as usize as u64,
-        trusted_function_entry_count: 1,
+        trusted_generic_function_entries: callee_baseline.as_mut_ptr() as usize as u64,
+        trusted_generic_function_entry_count: 1,
         trusted_preferred_function_entries: callee_preferred.as_mut_ptr() as usize as u64,
         trusted_preferred_function_entry_count: 1,
         trusted_literal_slots: callee_literals.as_ptr() as usize as u64,
@@ -14750,9 +14775,10 @@ fn optimizing_linked_default_retains_the_published_literal_owner_for_the_callee(
     });
     let mut linked = [crate::JitNativeLinkedFunction {
         preferred_entry: callee_preferred.as_ptr() as usize as u64,
-        baseline_entry: callee_baseline.as_ptr() as usize as u64,
+        generic_entry: callee_baseline.as_ptr() as usize as u64,
         runtime_view: std::ptr::from_ref(callee_view.as_ref()) as usize as u64,
         prepared_class: 0,
+        ..crate::JitNativeLinkedFunction::default()
     }];
     let caller_view = crate::JitNativeRuntimeView {
         trusted_linked_functions: linked.as_mut_ptr() as usize as u64,
@@ -15028,17 +15054,18 @@ fn optimizing_published_linked_variadic_function_packs_the_tail_array() {
         linked_variadic_callee as *const () as usize,
     )];
     let callee_view = Box::new(crate::JitNativeRuntimeView {
-        trusted_function_entries: callee_baseline.as_mut_ptr() as usize as u64,
-        trusted_function_entry_count: 1,
+        trusted_generic_function_entries: callee_baseline.as_mut_ptr() as usize as u64,
+        trusted_generic_function_entry_count: 1,
         trusted_preferred_function_entries: callee_preferred.as_mut_ptr() as usize as u64,
         trusted_preferred_function_entry_count: 1,
         ..arena_view
     });
     let mut linked = [crate::JitNativeLinkedFunction {
         preferred_entry: callee_preferred.as_ptr() as usize as u64,
-        baseline_entry: callee_baseline.as_ptr() as usize as u64,
+        generic_entry: callee_baseline.as_ptr() as usize as u64,
         runtime_view: std::ptr::from_ref(callee_view.as_ref()) as usize as u64,
         prepared_class: 0,
+        ..crate::JitNativeLinkedFunction::default()
     }];
     let caller_view = crate::JitNativeRuntimeView {
         trusted_linked_functions: linked.as_mut_ptr() as usize as u64,
@@ -15092,8 +15119,14 @@ fn assert_published_linked_function_uses_native_view_and_restores_caller(
             let header = &*runtime.cast::<crate::JitNativeFastStateHeader>();
             let expected = EXPECTED_LINKED_ENTRIES.load(Ordering::SeqCst) as u64;
             LINKED_VIEW_OBSERVED.store(
-                header.active_runtime_view().trusted_function_entries == expected
-                    && (*deopt).active_runtime_view().trusted_function_entries == expected,
+                header
+                    .active_runtime_view()
+                    .trusted_generic_function_entries
+                    == expected
+                    && (*deopt)
+                        .active_runtime_view()
+                        .trusted_generic_function_entries
+                        == expected,
                 Ordering::SeqCst,
             );
             // Native entry arguments are already authoritative before the
@@ -15156,7 +15189,7 @@ fn assert_published_linked_function_uses_native_view_and_restores_caller(
         let metadata = handle
             .region_state_metadata()
             .expect("baseline linked-call metadata");
-        assert_eq!(metadata.compiler_tier, NativeCompilerTier::Baseline);
+        assert_eq!(metadata.compiler_tier, NativeCompilerTier::Generic);
     }
     let helper_imports = handle
         .relocatable_code()
@@ -15192,8 +15225,8 @@ fn assert_published_linked_function_uses_native_view_and_restores_caller(
     ];
     let callee_view = Box::new(crate::JitNativeRuntimeView {
         abi_version: crate::JIT_RUNTIME_ABI_VERSION,
-        trusted_function_entries: callee_baseline.as_mut_ptr() as usize as u64,
-        trusted_function_entry_count: 1,
+        trusted_generic_function_entries: callee_baseline.as_mut_ptr() as usize as u64,
+        trusted_generic_function_entry_count: 1,
         trusted_preferred_function_entries: callee_preferred.as_mut_ptr() as usize as u64,
         trusted_preferred_function_entry_count: 1,
         trusted_literal_slots: callee_literals.as_ptr() as usize as u64,
@@ -15201,14 +15234,15 @@ fn assert_published_linked_function_uses_native_view_and_restores_caller(
         ..crate::JitNativeRuntimeView::default()
     });
     EXPECTED_LINKED_ENTRIES.store(
-        callee_view.trusted_function_entries as usize,
+        callee_view.trusted_generic_function_entries as usize,
         Ordering::SeqCst,
     );
     let mut linked = [crate::JitNativeLinkedFunction {
         preferred_entry: callee_preferred.as_ptr() as usize as u64,
-        baseline_entry: callee_baseline.as_ptr() as usize as u64,
+        generic_entry: callee_baseline.as_ptr() as usize as u64,
         runtime_view: std::ptr::from_ref(callee_view.as_ref()) as usize as u64,
         prepared_class: 0,
+        ..crate::JitNativeLinkedFunction::default()
     }];
     let caller_entries = [std::sync::atomic::AtomicUsize::new(0)];
     let caller_entry_counts = [std::sync::atomic::AtomicUsize::new(0)];
@@ -15222,10 +15256,10 @@ fn assert_published_linked_function_uses_native_view_and_restores_caller(
     ];
     let caller_view = crate::JitNativeRuntimeView {
         abi_version: crate::JIT_RUNTIME_ABI_VERSION,
-        trusted_function_entries: caller_entries.as_ptr() as usize as u64,
-        trusted_function_entry_count: 1,
-        baseline_function_entry_counts: caller_entry_counts.as_ptr() as usize as u64,
-        baseline_function_entry_count: 1,
+        trusted_generic_function_entries: caller_entries.as_ptr() as usize as u64,
+        trusted_generic_function_entry_count: 1,
+        generic_function_entry_counts: caller_entry_counts.as_ptr() as usize as u64,
+        generic_function_entry_count: 1,
         trusted_linked_functions: linked.as_mut_ptr() as usize as u64,
         trusted_linked_function_count: 1,
         trusted_literal_slots: caller_literals.as_ptr() as usize as u64,
@@ -15647,7 +15681,7 @@ fn exact_preflight_fragments_planner_admitted_whole_optimizing_calls() {
     }
     let unit = builder.finish();
     let plan = NativeCompilePlan::for_region(
-        &BaselineRegionBuilder::build(
+        &GenericRegionBuilder::build(
             &unit,
             caller,
             &CompileMetadata {
@@ -15715,8 +15749,8 @@ fn exact_preflight_fragments_planner_admitted_whole_optimizing_calls() {
     preferred_entries[callee.index()].store(callee_entry, Ordering::Release);
     let _view = crate::activate_native_runtime_view(crate::JitNativeRuntimeView {
         abi_version: crate::JIT_RUNTIME_ABI_VERSION,
-        trusted_function_entries: baseline_entries.as_mut_ptr() as usize as u64,
-        trusted_function_entry_count: baseline_entries.len() as u32,
+        trusted_generic_function_entries: baseline_entries.as_mut_ptr() as usize as u64,
+        trusted_generic_function_entry_count: baseline_entries.len() as u32,
         trusted_preferred_function_entries: preferred_entries.as_mut_ptr() as usize as u64,
         trusted_preferred_function_entry_count: preferred_entries.len() as u32,
         ..crate::JitNativeRuntimeView::default()
@@ -15811,7 +15845,7 @@ fn implicit_method_receiver_survives_native_fragment_boundary() {
             .region_state_metadata()
             .expect("fragment metadata")
             .compiler_tier,
-        crate::region_ir::NativeCompilerTier::Baseline
+        crate::region_ir::NativeCompilerTier::Generic
     );
 }
 
@@ -15876,7 +15910,7 @@ fn baseline_native_continuation_resumes_exact_instruction() {
     let metadata = handle.region_state_metadata().expect("transition metadata");
     assert_eq!(
         metadata.compiler_tier,
-        crate::region_ir::NativeCompilerTier::Baseline
+        crate::region_ir::NativeCompilerTier::Generic
     );
     let transition = metadata
         .native_transitions
@@ -17824,7 +17858,7 @@ fn optimizing_terminator_consumes_authoritative_object_without_baseline_continua
         JitCompileStatus::Compiled,
         "{optimized:?}"
     );
-    let baseline = baseline.handle.expect("baseline terminator owner");
+    let baseline = baseline.handle.expect("Generic terminator owner");
     let optimized = optimized.handle.expect("optimizing terminator owner");
     assert_optimizing_artifact(&optimized);
     let condition = optimized
@@ -17867,8 +17901,8 @@ fn optimizing_terminator_consumes_authoritative_object_without_baseline_continua
     let _view = crate::activate_native_runtime_view(crate::JitNativeRuntimeView {
         abi_version: crate::JIT_RUNTIME_ABI_VERSION,
         direct_value_slots: direct_slots.as_mut_ptr() as usize as u64,
-        trusted_function_entries: baseline_entries.as_mut_ptr() as usize as u64,
-        trusted_function_entry_count: baseline_entries.len() as u32,
+        trusted_generic_function_entries: baseline_entries.as_mut_ptr() as usize as u64,
+        trusted_generic_function_entry_count: baseline_entries.len() as u32,
         ..crate::JitNativeRuntimeView::default()
     });
     assert_eq!(
@@ -18354,7 +18388,7 @@ fn baseline_mixed_string_identity_compares_bytes_instead_of_handle_indexes() {
             .region_state_metadata()
             .expect("baseline identity metadata")
             .compiler_tier,
-        NativeCompilerTier::Baseline
+        NativeCompilerTier::Generic
     );
 
     let bytes = b"names";
@@ -22256,7 +22290,7 @@ fn optimizing_non_total_callback_families_leave_before_entry() {
     builder.terminate_return(caller, block, Some(Operand::Register(reduced)), span);
     let unit = builder.finish();
 
-    let graph = BaselineRegionBuilder::build(
+    let graph = GenericRegionBuilder::build(
         &unit,
         caller,
         &CompileMetadata {
@@ -22456,8 +22490,8 @@ fn optimizing_non_total_callback_families_leave_before_entry() {
         direct_array_entries: entries.as_mut_ptr() as usize as u64,
         direct_array_next: std::ptr::from_mut(&mut entry_next) as usize as u64,
         direct_array_free_heads: entry_free.as_mut_ptr() as usize as u64,
-        trusted_function_entries: function_entries.as_mut_ptr() as usize as u64,
-        trusted_function_entry_count: function_entries.len() as u32,
+        trusted_generic_function_entries: function_entries.as_mut_ptr() as usize as u64,
+        trusted_generic_function_entry_count: function_entries.len() as u32,
         trusted_preferred_function_entries: preferred_entries.as_mut_ptr() as usize as u64,
         trusted_preferred_function_entry_count: preferred_entries.len() as u32,
         trusted_constant_views: constant_views.as_mut_ptr() as usize as u64,
@@ -22616,7 +22650,7 @@ fn optimizing_preg_replace_callback_imports_only_fixed_native_boundaries() {
     builder.terminate_return(caller, block, Some(Operand::Register(array_result)), span);
     let unit = builder.finish();
 
-    let graph = BaselineRegionBuilder::build(
+    let graph = GenericRegionBuilder::build(
         &unit,
         caller,
         &CompileMetadata {
@@ -22786,7 +22820,7 @@ fn optimizing_callback_sort_family_uses_one_compiled_mutable_boundary() {
     builder.terminate_return(caller, block, Some(Operand::Local(array_local)), span);
     let unit = builder.finish();
 
-    let graph = BaselineRegionBuilder::build(
+    let graph = GenericRegionBuilder::build(
         &unit,
         caller,
         &CompileMetadata {
@@ -23037,7 +23071,7 @@ fn optimizing_array_walk_family_uses_direct_reference_callback_boundary() {
     builder.terminate_return(caller, block, Some(Operand::Local(array_local)), span);
     let unit = builder.finish();
 
-    let graph = BaselineRegionBuilder::build(
+    let graph = GenericRegionBuilder::build(
         &unit,
         caller,
         &CompileMetadata {
@@ -23671,7 +23705,7 @@ fn optimizing_bind_global_uses_trusted_reference_slot_without_semantic_dispatch(
             .region_state_metadata()
             .expect("baseline global-binding metadata")
             .compiler_tier,
-        NativeCompilerTier::Baseline
+        NativeCompilerTier::Generic
     );
     for artifact in [&handle, &baseline] {
         let helper_imports = artifact
@@ -25389,8 +25423,8 @@ fn optimizing_runtime_guarded_function_cell_calls_native_callee_without_dispatch
     );
     let _view = crate::activate_native_runtime_view(crate::JitNativeRuntimeView {
         abi_version: crate::JIT_RUNTIME_ABI_VERSION,
-        trusted_function_entries: entries.as_mut_ptr() as usize as u64,
-        trusted_function_entry_count: entries.len() as u32,
+        trusted_generic_function_entries: entries.as_mut_ptr() as usize as u64,
+        trusted_generic_function_entry_count: entries.len() as u32,
         trusted_preferred_function_entries: optimizing_entries.as_mut_ptr() as usize as u64,
         trusted_preferred_function_entry_count: optimizing_entries.len() as u32,
         ..crate::JitNativeRuntimeView::default()
@@ -25669,8 +25703,8 @@ fn optimizing_variadic_call_packs_one_authoritative_native_array() {
     );
     let _entries = crate::activate_native_runtime_view(crate::JitNativeRuntimeView {
         abi_version: crate::JIT_RUNTIME_ABI_VERSION,
-        trusted_function_entries: entries.as_mut_ptr() as usize as u64,
-        trusted_function_entry_count: entries.len() as u32,
+        trusted_generic_function_entries: entries.as_mut_ptr() as usize as u64,
+        trusted_generic_function_entry_count: entries.len() as u32,
         trusted_preferred_function_entries: optimizing_entries.as_mut_ptr() as usize as u64,
         trusted_preferred_function_entry_count: optimizing_entries.len() as u32,
         ..crate::abi::current_native_runtime_view()
@@ -25774,7 +25808,7 @@ fn optimizing_variadic_unpack_stays_compiled_to_compiled() {
     );
     builder.terminate_return(caller, caller_block, Some(Operand::Register(result)), span);
     let unit = builder.finish();
-    let region = BaselineRegionBuilder::build(
+    let region = GenericRegionBuilder::build(
         &unit,
         caller,
         &CompileMetadata {
@@ -25885,8 +25919,8 @@ fn optimizing_variadic_unpack_stays_compiled_to_compiled() {
     );
     let _entries = crate::activate_native_runtime_view(crate::JitNativeRuntimeView {
         abi_version: crate::JIT_RUNTIME_ABI_VERSION,
-        trusted_function_entries: entries.as_mut_ptr() as usize as u64,
-        trusted_function_entry_count: entries.len() as u32,
+        trusted_generic_function_entries: entries.as_mut_ptr() as usize as u64,
+        trusted_generic_function_entry_count: entries.len() as u32,
         trusted_preferred_function_entries: optimizing_entries.as_mut_ptr() as usize as u64,
         trusted_preferred_function_entry_count: optimizing_entries.len() as u32,
         ..crate::abi::current_native_runtime_view()
@@ -26083,8 +26117,8 @@ fn optimizing_compiled_call_releases_its_borrowed_argument_owner() {
         direct_value_slots: direct_slots.as_mut_ptr() as usize as u64,
         direct_value_next: std::ptr::from_mut(&mut direct_next) as usize as u64,
         direct_value_free_head: std::ptr::from_mut(&mut direct_free) as usize as u64,
-        trusted_function_entries: entries.as_mut_ptr() as usize as u64,
-        trusted_function_entry_count: entries.len() as u32,
+        trusted_generic_function_entries: entries.as_mut_ptr() as usize as u64,
+        trusted_generic_function_entry_count: entries.len() as u32,
         trusted_preferred_function_entries: optimizing_entries.as_mut_ptr() as usize as u64,
         trusted_preferred_function_entry_count: optimizing_entries.len() as u32,
         ..crate::JitNativeRuntimeView::default()
@@ -26440,8 +26474,8 @@ fn optimizing_by_ref_dimension_call_clones_cow_root_without_helpers() {
     let mut roots_dirty = 0_u32;
     let _entries = crate::activate_native_runtime_view(crate::JitNativeRuntimeView {
         abi_version: crate::JIT_RUNTIME_ABI_VERSION,
-        trusted_function_entries: entries.as_mut_ptr() as usize as u64,
-        trusted_function_entry_count: entries.len() as u32,
+        trusted_generic_function_entries: entries.as_mut_ptr() as usize as u64,
+        trusted_generic_function_entry_count: entries.len() as u32,
         trusted_preferred_function_entries: preferred_entries.as_mut_ptr() as usize as u64,
         trusted_preferred_function_entry_count: preferred_entries.len() as u32,
         root_mutation_pending: std::ptr::from_mut(&mut roots_dirty) as usize as u64,
@@ -26629,8 +26663,8 @@ fn optimizing_prepared_default_calls_native_callee_without_dispatch() {
     optimizing_entries[callee.index()].store(callee_address, std::sync::atomic::Ordering::Release);
     let _view = crate::activate_native_runtime_view(crate::JitNativeRuntimeView {
         abi_version: crate::JIT_RUNTIME_ABI_VERSION,
-        trusted_function_entries: entries.as_mut_ptr() as usize as u64,
-        trusted_function_entry_count: entries.len() as u32,
+        trusted_generic_function_entries: entries.as_mut_ptr() as usize as u64,
+        trusted_generic_function_entry_count: entries.len() as u32,
         trusted_preferred_function_entries: optimizing_entries.as_mut_ptr() as usize as u64,
         trusted_preferred_function_entry_count: optimizing_entries.len() as u32,
         ..crate::JitNativeRuntimeView::default()
@@ -26871,8 +26905,8 @@ fn optimizing_prepared_method_default_calls_native_callee_without_dispatch() {
     optimizing_entries[callee.index()].store(callee_address, std::sync::atomic::Ordering::Release);
     let _view = crate::activate_native_runtime_view(crate::JitNativeRuntimeView {
         abi_version: crate::JIT_RUNTIME_ABI_VERSION,
-        trusted_function_entries: entries.as_mut_ptr() as usize as u64,
-        trusted_function_entry_count: entries.len() as u32,
+        trusted_generic_function_entries: entries.as_mut_ptr() as usize as u64,
+        trusted_generic_function_entry_count: entries.len() as u32,
         trusted_preferred_function_entries: optimizing_entries.as_mut_ptr() as usize as u64,
         trusted_preferred_function_entry_count: optimizing_entries.len() as u32,
         ..crate::JitNativeRuntimeView::default()
@@ -26993,7 +27027,7 @@ fn profiled_virtual_method_layout_guards_are_rejected_before_entry() {
         receiver_layout_id: 0x91ab,
         target: crate::JitMethodSpecializationTarget::Local(callee),
     };
-    let region = BaselineRegionBuilder::build_with_runtime_specializations(
+    let region = GenericRegionBuilder::build_with_runtime_specializations(
         &unit,
         caller,
         &CompileMetadata {
@@ -27055,7 +27089,7 @@ fn profiled_virtual_method_layout_guards_are_rejected_before_entry() {
         receiver_layout_id: 0x91ab,
         target: crate::JitMethodSpecializationTarget::Linked(linked_signature),
     };
-    let linked_region = BaselineRegionBuilder::build_with_runtime_specializations(
+    let linked_region = GenericRegionBuilder::build_with_runtime_specializations(
         &unit,
         caller,
         &CompileMetadata {

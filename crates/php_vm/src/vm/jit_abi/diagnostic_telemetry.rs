@@ -509,10 +509,10 @@ impl NativeRequestColdState<'_> {
         let mut telemetry = self.runtime_telemetry.borrow_mut();
         if let Some(metadata) = handle.region_state_metadata() {
             match metadata.compiler_tier {
-                php_jit::region_ir::NativeCompilerTier::Baseline => {
-                    telemetry.counters.native_baseline_entry_executions = telemetry
+                php_jit::region_ir::NativeCompilerTier::Generic => {
+                    telemetry.counters.native_generic_entry_executions = telemetry
                         .counters
-                        .native_baseline_entry_executions
+                        .native_generic_entry_executions
                         .saturating_add(1);
                 }
                 php_jit::region_ir::NativeCompilerTier::Optimizing => {
@@ -649,9 +649,9 @@ impl NativeRequestColdState<'_> {
         counters.native_execution_entries = counters
             .native_execution_entries
             .saturating_add(nested.native_execution_entries);
-        counters.native_baseline_entry_executions = counters
-            .native_baseline_entry_executions
-            .saturating_add(nested.native_baseline_entry_executions);
+        counters.native_generic_entry_executions = counters
+            .native_generic_entry_executions
+            .saturating_add(nested.native_generic_entry_executions);
         counters.native_optimizing_entry_executions = counters
             .native_optimizing_entry_executions
             .saturating_add(nested.native_optimizing_entry_executions);

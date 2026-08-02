@@ -443,7 +443,7 @@ pub(in crate::vm) extern "C" fn jit_baseline_native_builtin_dispatch_abi(
     source_end: u32,
     arguments: *const i64,
     argument_count: u32,
-    local_slots: *const php_jit::JitAbiSlot,
+    local_slots: *const i64,
     local_count: u32,
     transition_state: *mut php_jit::JitDeoptState,
     out: *mut php_jit::JitCallResult,
@@ -480,7 +480,7 @@ pub(in crate::vm) extern "C" fn jit_baseline_native_builtin_dispatch_diagnostic_
     source_end: u32,
     arguments: *const i64,
     argument_count: u32,
-    local_slots: *const php_jit::JitAbiSlot,
+    local_slots: *const i64,
     local_count: u32,
     transition_state: *mut php_jit::JitDeoptState,
     out: *mut php_jit::JitCallResult,
@@ -515,7 +515,7 @@ unsafe fn jit_baseline_native_builtin_dispatch_impl<const DIAGNOSTIC: bool>(
     source_end: u32,
     arguments: *const i64,
     argument_count: u32,
-    local_slots: *const php_jit::JitAbiSlot,
+    local_slots: *const i64,
     local_count: u32,
     transition_state: *mut php_jit::JitDeoptState,
     out: *mut php_jit::JitCallResult,
@@ -858,16 +858,12 @@ unsafe fn jit_baseline_native_call_dispatch_impl<const DIAGNOSTIC: bool>(
                     if compact_arguments {
                         encoded.extend_from_slice(compact_argument_values);
                     } else {
-                        encoded.extend(
-                            arguments
-                                .iter()
-                                .map(|argument| argument.value.payload as i64),
-                        );
+                        encoded.extend(arguments.iter().map(|argument| argument.value));
                     }
                     (std::borrow::Cow::Owned(encoded), encoded_capacity_before)
                 };
                 let empty_local_values = [];
-                let local_values: &[php_jit::JitAbiSlot] = if frame.local_count == 0 {
+                let local_values: &[i64] = if frame.local_count == 0 {
                     &empty_local_values
                 } else {
                     // SAFETY: ABI validation above proves a non-null caller-owned
@@ -875,7 +871,7 @@ unsafe fn jit_baseline_native_call_dispatch_impl<const DIAGNOSTIC: bool>(
                     // caller stays suspended for this synchronous dispatch.
                     unsafe {
                         std::slice::from_raw_parts(
-                            frame.local_slots as *const php_jit::JitAbiSlot,
+                            frame.local_slots as *const i64,
                             frame.local_count as usize,
                         )
                     }
@@ -2547,9 +2543,7 @@ unsafe fn jit_baseline_native_call_dispatch_impl<const DIAGNOSTIC: bool>(
                         let throwable = context.decode_baseline_value(encoded).ok()?;
                         let arguments = arguments
                             .iter()
-                            .map(|argument| {
-                                context.decode_baseline_value(argument.value.payload as i64)
-                            })
+                            .map(|argument| context.decode_baseline_value(argument.value))
                             .collect::<Result<Vec<_>, _>>()
                             .ok()?;
                         let mut throwable =
@@ -2598,9 +2592,7 @@ unsafe fn jit_baseline_native_call_dispatch_impl<const DIAGNOSTIC: bool>(
                     let throwable = context.decode_baseline_value(encoded).ok()?;
                     let decoded_arguments = arguments
                         .iter()
-                        .map(|argument| {
-                            context.decode_baseline_value(argument.value.payload as i64)
-                        })
+                        .map(|argument| context.decode_baseline_value(argument.value))
                         .collect::<Result<Vec<_>, _>>()
                         .ok()?;
                     let throwable =

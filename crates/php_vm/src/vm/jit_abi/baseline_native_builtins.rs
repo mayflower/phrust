@@ -1272,7 +1272,7 @@ fn execute_native_call_user_func_array_control(
     context: &mut NativeRequestColdState<'_>,
     arguments: &[i64],
     source: &php_ir::Instruction,
-    caller_locals: Option<(u32, &[php_jit::JitAbiSlot])>,
+    caller_locals: Option<(u32, &[i64])>,
 ) -> NativeCallResult {
     let [callback, arguments] = arguments else {
         return Err("call_user_func_array() expects exactly 2 arguments".into());
@@ -1431,7 +1431,7 @@ pub(super) fn execute_native_callback_builtin_control(
     name: &str,
     arguments: &[i64],
     source: &php_ir::Instruction,
-    caller_locals: Option<(u32, &[php_jit::JitAbiSlot])>,
+    caller_locals: Option<(u32, &[i64])>,
 ) -> Option<NativeCallResult> {
     match name {
         "call_user_func" | "forward_static_call" => Some(execute_native_call_user_func_encoded(
@@ -1455,7 +1455,7 @@ pub(super) fn execute_baseline_native_builtin_control(
     name: &str,
     arguments: &[i64],
     source: &php_ir::Instruction,
-    caller_locals: Option<(u32, &[php_jit::JitAbiSlot])>,
+    caller_locals: Option<(u32, &[i64])>,
     prepared: Option<crate::compiled_unit::PreparedNativeBuiltin>,
 ) -> NativeCallResult {
     let normalized = normalized_native_builtin_name(name);
@@ -1491,7 +1491,7 @@ pub(super) fn execute_baseline_native_builtin_control(
 /// remain observable.
 fn baseline_visible_call_arguments(
     context: &NativeRequestColdState<'_>,
-    caller_locals: Option<(u32, &[php_jit::JitAbiSlot])>,
+    caller_locals: Option<(u32, &[i64])>,
 ) -> Result<Vec<i64>, String> {
     // SAFETY: the fast state is separately allocated for the request and the
     // active linked view, when selected, is owned by the active dynamic-unit
@@ -1580,7 +1580,7 @@ fn baseline_visible_call_arguments(
             break;
         }
         if let Some(slot) = slots.get(parameter.local.index()) {
-            visible[index] = slot.payload as i64;
+            visible[index] = *slot;
         }
     }
     Ok(visible)
@@ -1593,7 +1593,7 @@ pub(super) fn execute_baseline_native_builtin(
     name: &str,
     arguments: &[i64],
     source: &php_ir::Instruction,
-    caller_locals: Option<(u32, &[php_jit::JitAbiSlot])>,
+    caller_locals: Option<(u32, &[i64])>,
     prepared: Option<crate::compiled_unit::PreparedNativeBuiltin>,
 ) -> Result<i64, String> {
     if let Some(prepared) = prepared
@@ -1849,7 +1849,7 @@ pub(super) fn execute_baseline_native_builtin(
                 let Some(slot) = slots.get(index) else {
                     continue;
                 };
-                let value = context.decode_baseline_value(slot.payload as i64)?;
+                let value = context.decode_baseline_value(*slot)?;
                 if matches!(value, Value::Uninitialized) {
                     continue;
                 }
@@ -1903,7 +1903,7 @@ pub(super) fn execute_baseline_native_builtin(
                 // PHP's compact() copies the current value into the result. It
                 // never exposes the caller's reference container, even when
                 // the source variable was explicitly bound by reference.
-                let value = match context.decode_baseline_value(slot.payload as i64)? {
+                let value = match context.decode_baseline_value(*slot)? {
                     Value::Reference(reference) => reference.get(),
                     value => value,
                 };

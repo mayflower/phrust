@@ -660,7 +660,7 @@ pub fn analyze_executable_value_flow(
 /// owner. Reference-backed, request-global, and suspension-backed locals keep
 /// using the runtime ownership path.
 #[must_use]
-pub fn analyze_baseline_value_ownership(region: &RegionGraph) -> ExecutableValueFlow {
+pub fn analyze_generic_value_ownership(region: &RegionGraph) -> ExecutableValueFlow {
     let local_storage = classify_locals(region);
     let borrowed_local_loads = find_borrowed_local_loads(region, &local_storage);
     let reference_dimension_loads = find_reference_dimension_loads(region, &local_storage);
@@ -2380,7 +2380,7 @@ mod tests {
             })
             .expect("static assignment semantic call");
 
-        let baseline = analyze_baseline_value_ownership(&region);
+        let baseline = analyze_generic_value_ownership(&region);
         assert!(baseline.consumes_call_operand(semantic.continuation_id, value));
     }
 
@@ -2452,7 +2452,7 @@ mod tests {
             })
             .expect("static assignment semantic call");
 
-        let baseline = analyze_baseline_value_ownership(&region);
+        let baseline = analyze_generic_value_ownership(&region);
         assert!(!baseline.consumes_call_operand(semantic.continuation_id, value));
     }
 
@@ -2495,7 +2495,7 @@ mod tests {
         let store_continuation = region.blocks[0].instructions[store.index()].continuation_id;
         let discard_continuation = region.blocks[0].instructions[discard.index()].continuation_id;
 
-        let baseline = analyze_baseline_value_ownership(&region);
+        let baseline = analyze_generic_value_ownership(&region);
         assert!(baseline.moves_value_into_local(store_continuation));
         assert!(baseline.elides_discard(discard_continuation));
         assert!(baseline.releases_local_at_frame_exit(local));
@@ -2604,7 +2604,7 @@ mod tests {
 
         for flow in [
             analyze_executable_value_flow(&region, &unit.constants),
-            analyze_baseline_value_ownership(&region),
+            analyze_generic_value_ownership(&region),
         ] {
             assert!(
                 flow.releases_local_at_frame_exit(reference_local),
@@ -2669,7 +2669,7 @@ mod tests {
             region.blocks[consumer.index()].instructions[discard.index()].continuation_id;
 
         for flow in [
-            analyze_baseline_value_ownership(&region),
+            analyze_generic_value_ownership(&region),
             analyze_executable_value_flow(&region, &unit.constants),
         ] {
             assert!(flow.moves_value_into_local(store_continuation));
@@ -2724,7 +2724,7 @@ mod tests {
         let region = build_baseline_region(&unit, function).expect("region");
 
         for flow in [
-            analyze_baseline_value_ownership(&region),
+            analyze_generic_value_ownership(&region),
             analyze_executable_value_flow(&region, &unit.constants),
         ] {
             assert!(flow.releases_local_at_frame_exit(local));
@@ -2889,7 +2889,7 @@ mod tests {
 
         for flow in [
             analyze_executable_value_flow(&region, &unit.constants),
-            analyze_baseline_value_ownership(&region),
+            analyze_generic_value_ownership(&region),
         ] {
             assert!(flow.owns_parameter_at_entry(local));
             assert!(flow.releases_local_at_frame_exit(local));
@@ -3183,7 +3183,7 @@ mod tests {
         let unit = builder.finish();
         let region = build_baseline_region(&unit, function).expect("region");
 
-        let baseline = analyze_baseline_value_ownership(&region);
+        let baseline = analyze_generic_value_ownership(&region);
         assert!(!baseline.can_borrow_local_load(region.blocks[0].instructions[0].continuation_id));
         assert_eq!(
             baseline.register_fact(loaded).ownership,
@@ -3296,7 +3296,7 @@ mod tests {
         let unit = builder.finish();
         let region = build_baseline_region(&unit, function).expect("region");
 
-        let baseline = analyze_baseline_value_ownership(&region);
+        let baseline = analyze_generic_value_ownership(&region);
         assert!(baseline.can_borrow_local_load(region.blocks[0].instructions[0].continuation_id));
         assert_eq!(
             baseline.register_fact(loaded).ownership,

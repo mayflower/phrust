@@ -119,8 +119,8 @@ fn request_profile_json(trace: &PerfTraceEvent, counters: Option<&VmCounters>) -
             Value::from(counters.native_execution_entries),
         );
         native.insert(
-            "baseline_entry_executions".to_owned(),
-            Value::from(counters.native_baseline_entry_executions),
+            "generic_entry_executions".to_owned(),
+            Value::from(counters.native_generic_entry_executions),
         );
         native.insert(
             "optimizing_entry_executions".to_owned(),

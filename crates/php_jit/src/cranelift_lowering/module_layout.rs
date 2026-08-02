@@ -4,7 +4,7 @@
 //! built before Cranelift lowering so compile breadth and structural cost are
 //! explicit and testable instead of being inferred from a module afterwards.
 
-use crate::region_ir::{RegionBlock, RegionGraph, RegionTerminator, baseline_instruction_lowering};
+use crate::region_ir::{RegionBlock, RegionGraph, RegionTerminator, generic_instruction_lowering};
 use php_ir::instruction::TerminatorKind;
 use php_ir::{BlockId, FunctionId, InstrId};
 use std::collections::{BTreeMap, BTreeSet};
@@ -55,7 +55,7 @@ fn maximum_region_block_instructions(
     tier: crate::region_ir::NativeCompilerTier,
     _block: &RegionBlock,
 ) -> usize {
-    if tier == crate::region_ir::NativeCompilerTier::Baseline {
+    if tier == crate::region_ir::NativeCompilerTier::Generic {
         // Baseline lowering may expand calls, ownership, references, locals,
         // and typed control into substantially more CLIF than the cheap
         // source estimate predicts. Region chunks are only potential exact
@@ -68,7 +68,7 @@ fn maximum_region_block_instructions(
 }
 
 fn estimated_instruction_clif_blocks(instruction: &crate::region_ir::RegionInstruction) -> usize {
-    let manifest = baseline_instruction_lowering(&instruction.source_kind);
+    let manifest = generic_instruction_lowering(&instruction.source_kind);
     let operation_cost = match &instruction.kind {
         // The generic call trampoline allocates argument and call frames,
         // branches on the call result, and releases both frames on the normal
@@ -520,7 +520,7 @@ fn block_planning_cost(block: &RegionBlock) -> FragmentPlanningCost {
             .instructions
             .iter()
             .filter(|instruction| {
-                baseline_instruction_lowering(&instruction.source_kind).requires_safepoint
+                generic_instruction_lowering(&instruction.source_kind).requires_safepoint
             })
             .map(|instruction| instruction.live_locals.len())
             .sum(),
@@ -965,7 +965,7 @@ impl NativeCompilePlan {
             .iter()
             .copied()
             .filter(|instruction| {
-                baseline_instruction_lowering(&instruction.source_kind).requires_safepoint
+                generic_instruction_lowering(&instruction.source_kind).requires_safepoint
             })
             .collect::<Vec<_>>();
         let safepoint_live_set_sum = safepoints
@@ -1114,7 +1114,7 @@ fn fragment_plan_for_blocks(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::region_ir::{BaselineRegionBuilder, CompileMetadata, NativeCompilerTier};
+    use crate::region_ir::{CompileMetadata, GenericRegionBuilder, NativeCompilerTier};
     use php_ir::{
         BinaryOp, FunctionFlags, InstructionKind, IrBuilder, IrSpan, LocalId, Operand, UnitId,
     };
@@ -1130,12 +1130,12 @@ mod tests {
             builder.terminate_return(function, block, None, span);
         }
         let unit = builder.finish();
-        let region = BaselineRegionBuilder::build(
+        let region = GenericRegionBuilder::build(
             &unit,
             FunctionId::new(1),
             &CompileMetadata {
                 ir_fingerprint: "plan-test".to_owned(),
-                tier: NativeCompilerTier::Baseline,
+                tier: NativeCompilerTier::Generic,
                 helper_abi_hash: 0,
                 target_cpu: "test".to_owned(),
                 semantic_config_hash: 0,
@@ -1170,12 +1170,12 @@ mod tests {
         }
         builder.terminate_return(function, block, result.map(php_ir::Operand::Register), span);
         let unit = builder.finish();
-        let region = BaselineRegionBuilder::build(
+        let region = GenericRegionBuilder::build(
             &unit,
             function,
             &CompileMetadata {
                 ir_fingerprint: "split-test".to_owned(),
-                tier: NativeCompilerTier::Baseline,
+                tier: NativeCompilerTier::Generic,
                 helper_abi_hash: 0,
                 target_cpu: "test".to_owned(),
                 semantic_config_hash: 0,
@@ -1257,12 +1257,12 @@ mod tests {
             span,
         );
         let unit = builder.finish();
-        let region = BaselineRegionBuilder::build(
+        let region = GenericRegionBuilder::build(
             &unit,
             function,
             &CompileMetadata {
                 ir_fingerprint: "balanced-preflight-cut".to_owned(),
-                tier: NativeCompilerTier::Baseline,
+                tier: NativeCompilerTier::Generic,
                 helper_abi_hash: 0,
                 target_cpu: "test".to_owned(),
                 semantic_config_hash: 0,
@@ -1312,7 +1312,7 @@ mod tests {
         }
         builder.terminate_return(function, block, result.map(php_ir::Operand::Register), span);
         let unit = builder.finish();
-        let region = BaselineRegionBuilder::build(
+        let region = GenericRegionBuilder::build(
             &unit,
             function,
             &CompileMetadata {
@@ -1366,12 +1366,12 @@ mod tests {
         }
         builder.terminate_return(function, block, result.map(php_ir::Operand::Register), span);
         let unit = builder.finish();
-        let region = BaselineRegionBuilder::build(
+        let region = GenericRegionBuilder::build(
             &unit,
             function,
             &CompileMetadata {
                 ir_fingerprint: "baseline-non-call-preflight-cut".to_owned(),
-                tier: NativeCompilerTier::Baseline,
+                tier: NativeCompilerTier::Generic,
                 helper_abi_hash: 0,
                 target_cpu: "test".to_owned(),
                 semantic_config_hash: 0,
@@ -1420,12 +1420,12 @@ mod tests {
         }
         builder.terminate_return(function, block, result.map(php_ir::Operand::Register), span);
         let unit = builder.finish();
-        let mut region = BaselineRegionBuilder::build(
+        let mut region = GenericRegionBuilder::build(
             &unit,
             function,
             &CompileMetadata {
                 ir_fingerprint: "cleanup-heavy-return".to_owned(),
-                tier: NativeCompilerTier::Baseline,
+                tier: NativeCompilerTier::Generic,
                 helper_abi_hash: 0,
                 target_cpu: "test".to_owned(),
                 semantic_config_hash: 0,
@@ -1509,12 +1509,12 @@ mod tests {
         }
         builder.terminate_return(function, block, result.map(Operand::Register), span);
         let unit = builder.finish();
-        let mut region = BaselineRegionBuilder::build(
+        let mut region = GenericRegionBuilder::build(
             &unit,
             function,
             &CompileMetadata {
                 ir_fingerprint: "wide-safepoint-state".to_owned(),
-                tier: NativeCompilerTier::Baseline,
+                tier: NativeCompilerTier::Generic,
                 helper_abi_hash: 0,
                 target_cpu: "test".to_owned(),
                 semantic_config_hash: 0,
@@ -1569,12 +1569,12 @@ mod tests {
         }
         builder.terminate_return(function, block, result.map(php_ir::Operand::Register), span);
         let unit = builder.finish();
-        let mut region = BaselineRegionBuilder::build(
+        let mut region = GenericRegionBuilder::build(
             &unit,
             function,
             &CompileMetadata {
                 ir_fingerprint: "optimizing-plan-test".to_owned(),
-                tier: NativeCompilerTier::Baseline,
+                tier: NativeCompilerTier::Generic,
                 helper_abi_hash: 0,
                 target_cpu: "test".to_owned(),
                 semantic_config_hash: 0,
@@ -1624,12 +1624,12 @@ mod tests {
         }
         builder.terminate_return(function, block, None, span);
         let unit = builder.finish();
-        let region = BaselineRegionBuilder::build(
+        let region = GenericRegionBuilder::build(
             &unit,
             function,
             &CompileMetadata {
                 ir_fingerprint: "call-cost-split-test".to_owned(),
-                tier: NativeCompilerTier::Baseline,
+                tier: NativeCompilerTier::Generic,
                 helper_abi_hash: 0,
                 target_cpu: "test".to_owned(),
                 semantic_config_hash: 0,

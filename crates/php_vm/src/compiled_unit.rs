@@ -221,7 +221,7 @@ pub(crate) struct PreparedDeploymentNativeImage {
     /// Dense baseline publication cells indexed by `FunctionId`. Generated
     /// code uses these only for an exact continuation after an optimizing
     /// callee side exit.
-    pub native_function_entries: Box<[std::sync::atomic::AtomicUsize]>,
+    pub generic_function_entries: Box<[std::sync::atomic::AtomicUsize]>,
     /// Dense ordinary-call cells indexed by `FunctionId`. Every published
     /// baseline initializes its cell and an optimizing publication atomically
     /// replaces that target, so generated calls never select a tier.
@@ -235,7 +235,7 @@ pub(crate) struct PreparedDeploymentNativeImage {
     /// Process-stable direct baseline-entry counters indexed by `FunctionId`.
     /// Baseline CLIF updates these counters and the request-completion
     /// coordinator consumes them to select optimizing candidates.
-    pub baseline_function_entry_counts: Box<[std::sync::atomic::AtomicU64]>,
+    pub generic_function_entry_counts: Box<[std::sync::atomic::AtomicU64]>,
 }
 
 impl PreparedUnit {
@@ -783,7 +783,7 @@ impl CompiledUnit {
                         _ => php_jit::JitNativeConstantView::default(),
                     })
                     .collect(),
-                native_function_entries: (0..unit.functions.len())
+                generic_function_entries: (0..unit.functions.len())
                     .map(|_| std::sync::atomic::AtomicUsize::new(0))
                     .collect(),
                 preferred_function_entries: (0..unit.functions.len())
@@ -792,7 +792,7 @@ impl CompiledUnit {
                 preferred_function_metadata: std::sync::RwLock::new(
                     (0..unit.functions.len()).map(|_| None).collect(),
                 ),
-                baseline_function_entry_counts: (0..unit.functions.len())
+                generic_function_entry_counts: (0..unit.functions.len())
                     .map(|_| std::sync::atomic::AtomicU64::new(0))
                     .collect(),
             }
@@ -1062,7 +1062,7 @@ impl CompiledUnit {
             let mut function_closure_sites = Vec::new();
             let mut function_global_sites = Vec::new();
             let metadata = php_jit::region_ir::CompileMetadata::default();
-            if let Ok(region) = php_jit::region_ir::BaselineRegionBuilder::build(
+            if let Ok(region) = php_jit::region_ir::GenericRegionBuilder::build(
                 &self.inner.unit,
                 function,
                 &metadata,

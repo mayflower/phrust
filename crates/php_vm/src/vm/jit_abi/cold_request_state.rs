@@ -1531,7 +1531,7 @@ impl<'a> NativeRequestColdState<'a> {
         address: usize,
     ) {
         let deployment = self.compiled.prepared_deployment_image();
-        if let Some(cell) = deployment.native_function_entries.get(function.index()) {
+        if let Some(cell) = deployment.generic_function_entries.get(function.index()) {
             cell.store(address, std::sync::atomic::Ordering::Release);
         }
         if let Some(cell) = deployment.preferred_function_entries.get(function.index()) {
@@ -1555,12 +1555,12 @@ impl<'a> NativeRequestColdState<'a> {
         let deployment = compiled.prepared_deployment_image();
         for (function, handle) in self.native_entries.iter() {
             if !handle.region_state_metadata().is_some_and(|metadata| {
-                metadata.compiler_tier == php_jit::region_ir::NativeCompilerTier::Baseline
+                metadata.compiler_tier == php_jit::region_ir::NativeCompilerTier::Generic
             }) {
                 continue;
             }
             if let (Some(cell), Some(preferred), Some(address)) = (
-                deployment.native_function_entries.get(function.index()),
+                deployment.generic_function_entries.get(function.index()),
                 deployment.preferred_function_entries.get(function.index()),
                 handle.native_entry_address(),
             ) {
@@ -6984,7 +6984,7 @@ impl<'a> NativeRequestColdState<'a> {
             .native_execution_scopes
             .get(index)
             .ok_or_else(|| format!("suspended native execution scope {identity} is missing"))?;
-        let function_entries = runtime_view.trusted_function_entries;
+        let function_entries = runtime_view.trusted_generic_function_entries;
         let inferred_unit = self
             .dynamic_units
             .iter()
@@ -6993,7 +6993,7 @@ impl<'a> NativeRequestColdState<'a> {
                 let entries = package
                     .compiled
                     .prepared_deployment_image()
-                    .native_function_entries
+                    .generic_function_entries
                     .as_ptr() as usize as u64;
                 (entries == function_entries).then_some(Some(unit))
             })
@@ -7001,7 +7001,7 @@ impl<'a> NativeRequestColdState<'a> {
                 let entries = self
                     .compiled
                     .prepared_deployment_image()
-                    .native_function_entries
+                    .generic_function_entries
                     .as_ptr() as usize as u64;
                 (self.current_dynamic_unit.is_none() && entries == function_entries).then_some(None)
             })
@@ -7368,17 +7368,17 @@ impl<'a> NativeRequestColdState<'a> {
             return;
         }
         let deployment = package.compiled.prepared_deployment_image();
-        let (Some(preferred_entry), Some(baseline_entry)) = (
+        let (Some(preferred_entry), Some(generic_entry)) = (
             deployment
                 .preferred_function_entries
                 .get(target.function.index()),
             deployment
-                .native_function_entries
+                .generic_function_entries
                 .get(target.function.index()),
         ) else {
             return;
         };
-        if baseline_entry.load(std::sync::atomic::Ordering::Acquire) == 0 {
+        if generic_entry.load(std::sync::atomic::Ordering::Acquire) == 0 {
             return;
         }
         let signature = php_jit::JitExternalFunctionSignature {
@@ -7420,9 +7420,18 @@ impl<'a> NativeRequestColdState<'a> {
         };
         let record = php_jit::JitNativeLinkedFunction {
             preferred_entry: std::ptr::from_ref(preferred_entry) as usize as u64,
-            baseline_entry: std::ptr::from_ref(baseline_entry) as usize as u64,
+            generic_entry: std::ptr::from_ref(generic_entry) as usize as u64,
             runtime_view: std::ptr::from_ref(package.published_runtime_view.as_ref()) as usize
                 as u64,
+            binding_plan: package
+                .compiled
+                .prepared_native_function_metadata_ptr(target.function)
+                .map_or(0, |metadata| metadata as usize as u64),
+            scope_context: receiver_layout_id,
+            generation: u64::from(package.compiled.unit().version),
+            signature_identity: super::super::external_function_signatures_hash(
+                std::slice::from_ref(&signature),
+            ),
             prepared_class: 0,
         };
         if !descriptor.install_external_method_pic(

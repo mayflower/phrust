@@ -24,7 +24,7 @@ const QUALITY_REGALLOC_COST_THRESHOLD: usize = 50_000;
 /// Scheduler class for bounded native compiler work.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) enum NativeCompilePriority {
-    RequestCriticalBaseline,
+    RequestCriticalGeneric,
     BackgroundOptimizing,
     CacheMaintenance,
 }
@@ -45,7 +45,7 @@ pub(crate) struct NativeCompileAdmission {
 impl NativeCompileAdmission {
     pub(crate) const fn request_critical(cost_tokens: usize) -> Self {
         Self {
-            priority: NativeCompilePriority::RequestCriticalBaseline,
+            priority: NativeCompilePriority::RequestCriticalGeneric,
             cost_tokens,
         }
     }
@@ -262,12 +262,12 @@ const fn regalloc_mode_for_admission(admission: NativeCompileAdmission) -> Nativ
         // groups remain quality-allocated because the single-pass allocator
         // can more than double their emitted spill code even after structural
         // fragmentation, violating the function artifact ceiling.
-        NativeCompilePriority::RequestCriticalBaseline
+        NativeCompilePriority::RequestCriticalGeneric
             if admission.cost_tokens < QUALITY_REGALLOC_COST_THRESHOLD =>
         {
             NativeRegallocMode::Fast
         }
-        NativeCompilePriority::RequestCriticalBaseline => NativeRegallocMode::Quality,
+        NativeCompilePriority::RequestCriticalGeneric => NativeRegallocMode::Quality,
         // Optimizing work is admitted separately and may spend allocation
         // time on machine-code quality without delaying a cold request.
         NativeCompilePriority::BackgroundOptimizing => NativeRegallocMode::Quality,
@@ -1105,9 +1105,9 @@ impl CraneliftCodeManager {
                 let identity = NativeFunctionCellIdentity::from(&key);
                 if let Some(cell) = state.function_cells.get(&identity) {
                     let tier = if key.compiler_tier == "optimizing" {
-                        NativeFunctionTier::Optimized
+                        NativeFunctionTier::Optimizing
                     } else {
-                        NativeFunctionTier::Baseline
+                        NativeFunctionTier::Generic
                     };
                     cell.retire_tier(tier);
                 }
@@ -1137,15 +1137,15 @@ impl CraneliftCodeManager {
             return;
         };
         let tier = if code_key.compiler_tier == "optimizing" {
-            NativeFunctionTier::Optimized
+            NativeFunctionTier::Optimizing
         } else {
-            NativeFunctionTier::Baseline
+            NativeFunctionTier::Generic
         };
         let entries = metadata.function_entries.clone();
         self.metrics
             .function_body_compile_count
             .fetch_add(entries.len() as u64, Ordering::Relaxed);
-        if tier == NativeFunctionTier::Optimized {
+        if tier == NativeFunctionTier::Optimizing {
             self.metrics
                 .optimized_function_publications
                 .fetch_add(entries.len() as u64, Ordering::Relaxed);
@@ -1348,7 +1348,7 @@ mod tests {
             compiled_unit: format!("unit-{index}"),
             region: format!("function-{index}"),
             abi_hash: JIT_RUNTIME_ABI_HASH,
-            compiler_tier: "baseline".to_owned(),
+            compiler_tier: "generic".to_owned(),
             helper_abi_hash: JIT_RUNTIME_ABI_HASH,
             helper_binding_hash: 0,
             target_cpu: "test-target:test-cpu".to_owned(),
@@ -1658,7 +1658,7 @@ mod tests {
                 deployment_unit: "lock-free-diagnostic".to_owned(),
                 function_id: 1,
                 signature_hash: 2,
-                compiler_tier: "baseline".to_owned(),
+                compiler_tier: "generic".to_owned(),
                 version: "test".to_owned(),
                 invalidation_generation: 0,
             }])

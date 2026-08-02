@@ -1371,7 +1371,7 @@ pub(super) fn resume_native_optimizing_exit_with_artifact(
                     cold_diagnostics::record_native_helper_failure(context, error.clone());
                     return Err(error);
                 }
-                let baseline = ensure_native_baseline_entry(context, function)?;
+                let baseline = ensure_native_generic_entry(context, function)?;
                 if let Err(error) =
                     reconcile_native_transition_owners(context, &source, &baseline, &state)
                 {

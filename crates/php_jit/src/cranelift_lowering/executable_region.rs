@@ -3337,7 +3337,7 @@ fn optimizing_admission_for_region(
             return Err(CraneliftLoweringError::new(
                 "JIT_CRANELIFT_REJECT_NON_TOTAL_OPTIMIZING_REGION",
                 format!(
-                    "dynamic-code continuation {} must enter the baseline tier before optimizing execution",
+                    "dynamic-code continuation {} must enter the Generic tier before optimizing execution",
                     instruction.continuation_id,
                 ),
             ));
@@ -9520,7 +9520,7 @@ pub(super) fn instruction_has_native_transition(
     // exit, including the first instruction of a baseline-only family. The
     // old hand-maintained allow-list covered direct guards but omitted such
     // island heads (for example a static-local operation), so valid optimized
-    // code produced a state the corresponding baseline artifact could not
+    // code produced a state the corresponding Generic artifact could not
     // enter.
     if instruction.optimizer_transition_entry {
         return true;
@@ -9571,7 +9571,7 @@ fn instruction_has_sparse_snapshot(
 
 /// Whether this artifact can be entered again at the instruction after it
 /// has already started executing. Guard failures in optimizing code exit to
-/// the baseline artifact; they are not optimizer resume entries. Conflating
+/// the Generic artifact; they are not optimizer resume entries. Conflating
 /// those two directions forced the normal optimizing path through a distinct
 /// CLIF block for every guardable PHP instruction.
 fn instruction_has_native_resume_entry(
@@ -9579,7 +9579,7 @@ fn instruction_has_native_resume_entry(
     tier: NativeCompilerTier,
 ) -> bool {
     match tier {
-        NativeCompilerTier::Baseline => instruction_has_native_transition(instruction, tier),
+        NativeCompilerTier::Generic => instruction_has_native_transition(instruction, tier),
         NativeCompilerTier::Optimizing => {
             matches!(
                 instruction.kind,
@@ -9610,7 +9610,7 @@ fn block_terminator_has_native_transition(
 /// transition ABI, so one cold loop can serve every handler, suspension, OSR,
 /// and tier-transition entry in the fragment.  Emitting the same local-copy
 /// sequence into every resume loader made cold state reconstruction dominate
-/// the machine code of large baseline functions.
+/// the machine code of large Generic functions.
 fn emit_streaming_local_restore_loop(
     builder: &mut FunctionBuilder<'_>,
     pointer_type: ir::Type,
@@ -10068,7 +10068,7 @@ pub(super) fn compile_region_graph_native(
     );
     regions.insert(function, replanned);
     let plan = NativeCompilePlan::for_region(&regions[&function]);
-    if regions[&function].compile_metadata.tier == NativeCompilerTier::Baseline
+    if regions[&function].compile_metadata.tier == NativeCompilerTier::Generic
         && let Some(fragment) = plan
             .fragments
             .iter()
@@ -10086,16 +10086,16 @@ pub(super) fn compile_region_graph_native(
         ));
     }
     let region = &regions[&function];
-    let compilation_mode = crate::cranelift_lowering::baseline_streaming::compiler_for_tier(
+    let compilation_mode = crate::cranelift_lowering::generic_streaming::compiler_for_tier(
         region.compile_metadata.tier,
     )
     .mode();
     let baseline_helper_imports = compilation_mode
-        == crate::cranelift_lowering::baseline_streaming::NativeCompilationMode::StreamingBaseline;
+        == crate::cranelift_lowering::generic_streaming::NativeCompilationMode::StreamingGeneric;
     let fragment_layout = (plan.fragments.len() > 1
         || regions
             .values()
-            .any(|candidate| candidate.compile_metadata.tier == NativeCompilerTier::Baseline))
+            .any(|candidate| candidate.compile_metadata.tier == NativeCompilerTier::Generic))
     .then(|| NativeFunctionFragmentLayout::for_plan(region, &plan))
     .transpose()?;
     let selected_plan = std::cell::RefCell::new(plan.clone());
@@ -10110,7 +10110,7 @@ pub(super) fn compile_region_graph_native(
             let flow = if candidate.compile_metadata.tier == NativeCompilerTier::Optimizing {
                 crate::region_ir::analyze_executable_value_flow(candidate, &unit.constants)
             } else {
-                crate::region_ir::analyze_baseline_value_ownership(candidate)
+                crate::region_ir::analyze_generic_value_ownership(candidate)
             };
             flow.verify_ownership(candidate).map_err(|error| {
                 CraneliftLoweringError::new("JIT_CRANELIFT_REJECT_OWNERSHIP", error)
@@ -13143,7 +13143,7 @@ pub(super) fn compile_region_graph_native(
         function,
         function_key,
         if compilation_mode
-            == crate::cranelift_lowering::baseline_streaming::NativeCompilationMode::StreamingBaseline
+            == crate::cranelift_lowering::generic_streaming::NativeCompilationMode::StreamingGeneric
         {
             crate::code_manager::NativeCompileAdmission::request_critical(
                 plan.admission_cost_tokens(),
@@ -13196,7 +13196,7 @@ pub(super) fn compile_region_graph_native(
             } else {
                 None
             };
-            let mut native_operations = BaselineNativeOperations::default();
+            let mut native_operations = GenericNativeOperations::default();
             let pointer_type = module.target_config().pointer_type();
             let mut exact_symbol_query = [None; StableSymbolQueryBuiltin::COUNT];
             for builtin in StableSymbolQueryBuiltin::all() {
@@ -13373,8 +13373,7 @@ pub(super) fn compile_region_graph_native(
                             signature.params.push(AbiParam::new(types::I64));
                         }
                     }
-                    StableByteCodecBuiltin::Base64Decode
-                    | StableByteCodecBuiltin::AddCSlashes => {
+                    StableByteCodecBuiltin::Base64Decode | StableByteCodecBuiltin::AddCSlashes => {
                         for _ in 0..2 {
                             signature.params.push(AbiParam::new(types::I64));
                         }
@@ -13404,8 +13403,7 @@ pub(super) fn compile_region_graph_native(
                     helper_address(builtin.symbol()),
                 )?);
             }
-            let mut exact_string_search_compare =
-                [None; StableStringSearchCompareBuiltin::COUNT];
+            let mut exact_string_search_compare = [None; StableStringSearchCompareBuiltin::COUNT];
             for builtin in StableStringSearchCompareBuiltin::all() {
                 if !needs_exact_string_search_compare[builtin.index()] {
                     continue;
@@ -13512,8 +13510,7 @@ pub(super) fn compile_region_graph_native(
                 let mut signature = module.make_signature();
                 let arity = match builtin {
                     StableArrayAggregateBuiltin::Sum => 1,
-                    StableArrayAggregateBuiltin::Count
-                    | StableArrayAggregateBuiltin::SizeOf => 2,
+                    StableArrayAggregateBuiltin::Count | StableArrayAggregateBuiltin::SizeOf => 2,
                 };
                 for _ in 0..arity {
                     signature.params.push(AbiParam::new(types::I64));
@@ -13564,7 +13561,9 @@ pub(super) fn compile_region_graph_native(
             let exact_array_multisort = if needs_exact_array_multisort {
                 let mut signature = module.make_signature();
                 signature.params.push(AbiParam::new(types::I32));
-                signature.params.push(AbiParam::new(module.target_config().pointer_type()));
+                signature
+                    .params
+                    .push(AbiParam::new(module.target_config().pointer_type()));
                 signature.returns.push(AbiParam::new(types::I64));
                 signature.returns.push(AbiParam::new(types::I64));
                 Some(declare_native_helper(
@@ -13576,8 +13575,7 @@ pub(super) fn compile_region_graph_native(
             } else {
                 None
             };
-            let mut exact_frame_introspection =
-                [None; StableFrameIntrospectionBuiltin::COUNT];
+            let mut exact_frame_introspection = [None; StableFrameIntrospectionBuiltin::COUNT];
             let mut exact_object_identity = [None; StableObjectIdentityBuiltin::COUNT];
             for builtin in StableObjectIdentityBuiltin::all() {
                 if !needs_exact_object_identity[builtin.index()] {
@@ -14012,8 +14010,7 @@ pub(super) fn compile_region_graph_native(
                     | StableConfigurationBuiltin::CfgVar
                     | StableConfigurationBuiltin::SetIncludePath
                     | StableConfigurationBuiltin::TimezoneSet => 1,
-                    StableConfigurationBuiltin::IniGetAll
-                    | StableConfigurationBuiltin::IniSet => 2,
+                    StableConfigurationBuiltin::IniGetAll | StableConfigurationBuiltin::IniSet => 2,
                 };
                 for _ in 0..arity {
                     signature.params.push(AbiParam::new(types::I64));
@@ -14174,8 +14171,7 @@ pub(super) fn compile_region_graph_native(
                     helper_address(builtin.symbol()),
                 )?);
             }
-            let mut exact_declaration_inventory =
-                [None; StableDeclarationInventoryBuiltin::COUNT];
+            let mut exact_declaration_inventory = [None; StableDeclarationInventoryBuiltin::COUNT];
             for builtin in StableDeclarationInventoryBuiltin::all() {
                 if !needs_exact_declaration_inventory[builtin.index()] {
                     continue;
@@ -15094,7 +15090,7 @@ pub(super) fn compile_region_graph_native(
                         )
                     })?;
                 functions.insert(value_release_commit_symbol, value_release_commit);
-                NativeTierOperations::Baseline {
+                NativeTierOperations::Generic {
                     call: native_call_helper,
                     dynamic_code: native_dynamic_code_helper,
                     operations: native_operations,
@@ -15247,16 +15243,15 @@ pub(super) fn compile_region_graph_native(
                     },
                 }
             };
-            let (mut fragment_functions, mut fragment_symbols) =
-                declare_fragment_functions(
-                    module,
-                    name,
-                    region,
-                    active_fragment_layout.as_ref(),
-                    0,
-                    &mut next_synthetic,
-                    &mut functions,
-                )?;
+            let (mut fragment_functions, mut fragment_symbols) = declare_fragment_functions(
+                module,
+                name,
+                region,
+                active_fragment_layout.as_ref(),
+                0,
+                &mut next_synthetic,
+                &mut functions,
+            )?;
             let inline_constants = collect_bounded_inline_values(unit, &regions);
             let tail_forwards = regions
                 .values()
@@ -15347,10 +15342,9 @@ pub(super) fn compile_region_graph_native(
             // fragment refinement used below.
             if active_fragment_layout.is_none() {
                 let register_liveness = NativeRegisterLiveness::analyze(region);
-                let compiler =
-                    crate::cranelift_lowering::baseline_streaming::compiler_for_tier(
-                        region.compile_metadata.tier,
-                    );
+                let compiler = crate::cranelift_lowering::generic_streaming::compiler_for_tier(
+                    region.compile_metadata.tier,
+                );
                 let preflight = compiler.compile_fragment(&mut |mode| {
                     define_region_graph_function(
                         module,
@@ -15381,8 +15375,10 @@ pub(super) fn compile_region_graph_native(
                             .exceeds_replan_margin(region.compile_metadata.tier) =>
                     {
                         active_plan = NativeCompilePlan::for_bounded_fragments(region);
-                        active_fragment_layout =
-                            Some(NativeFunctionFragmentLayout::for_plan(region, &active_plan)?);
+                        active_fragment_layout = Some(NativeFunctionFragmentLayout::for_plan(
+                            region,
+                            &active_plan,
+                        )?);
                         compiled_pre_regalloc_replans
                             .set(compiled_pre_regalloc_replans.get().saturating_add(1));
                         (fragment_functions, fragment_symbols) = declare_fragment_functions(
@@ -15398,8 +15394,10 @@ pub(super) fn compile_region_graph_native(
                     Ok(defined) => preflighted_whole = Some(defined),
                     Err(error) if error.code == "JIT_CRANELIFT_PRE_REGALLOC_BUDGET" => {
                         active_plan = NativeCompilePlan::for_bounded_fragments(region);
-                        active_fragment_layout =
-                            Some(NativeFunctionFragmentLayout::for_plan(region, &active_plan)?);
+                        active_fragment_layout = Some(NativeFunctionFragmentLayout::for_plan(
+                            region,
+                            &active_plan,
+                        )?);
                         compiled_pre_regalloc_replans
                             .set(compiled_pre_regalloc_replans.get().saturating_add(1));
                         (fragment_functions, fragment_symbols) = declare_fragment_functions(
@@ -15427,9 +15425,10 @@ pub(super) fn compile_region_graph_native(
                     let mut round_preflighted = BTreeMap::new();
                     if let Some(layout) = active_fragment_layout.as_ref() {
                         for fragment in &layout.fragments {
-                            let compiler = crate::cranelift_lowering::baseline_streaming::compiler_for_tier(
-                                region.compile_metadata.tier,
-                            );
+                            let compiler =
+                                crate::cranelift_lowering::generic_streaming::compiler_for_tier(
+                                    region.compile_metadata.tier,
+                                );
                             let preflight = compiler.compile_fragment(&mut |mode| {
                                 let func_id = if layout.fragments.len() == 1 {
                                     functions[&region.function]
@@ -15525,7 +15524,7 @@ pub(super) fn compile_region_graph_native(
                                             .iter()
                                             .map(|instruction| {
                                                 let manifest =
-                                                    crate::region_ir::baseline_instruction_lowering(
+                                                    crate::region_ir::generic_instruction_lowering(
                                                         &instruction.source_kind,
                                                     );
                                                 format!(
@@ -15544,7 +15543,7 @@ pub(super) fn compile_region_graph_native(
                                             region_block.instructions.len(),
                                             instructions,
                                             region_block.entry_live_locals.len(),
-                                            crate::region_ir::baseline_terminator_lowering(
+                                            crate::region_ir::generic_terminator_lowering(
                                                 &region_block.source_terminator,
                                             )
                                             .variant,
@@ -15571,8 +15570,10 @@ pub(super) fn compile_region_graph_native(
                     }
                     compiled_pre_regalloc_replans
                         .set(compiled_pre_regalloc_replans.get().saturating_add(1));
-                    active_fragment_layout =
-                        Some(NativeFunctionFragmentLayout::for_plan(region, &active_plan)?);
+                    active_fragment_layout = Some(NativeFunctionFragmentLayout::for_plan(
+                        region,
+                        &active_plan,
+                    )?);
                     (fragment_functions, fragment_symbols) = declare_fragment_functions(
                         module,
                         name,
@@ -15586,66 +15587,195 @@ pub(super) fn compile_region_graph_native(
             }
             {
                 let referenced_internal_functions = std::cell::RefCell::new(BTreeSet::new());
-                let mut append_defined = |symbol: FunctionId,
-                                      arity: u8,
-                                      local_count: u32,
-                                      mut defined: DefinedRegionFunction|
-             -> Result<(u64, u32), CraneliftLoweringError> {
-                let alignment = usize::try_from(defined.alignment).map_err(|_| {
-                    CraneliftLoweringError::new(
-                        "JIT_CRANELIFT_REJECT_CACHE_ALIGNMENT",
-                        "native function alignment does not fit usize",
-                    )
-                })?;
-                let padding = if alignment == 0 {
-                    0
-                } else {
-                    (alignment - relocatable_bytes.len() % alignment) % alignment
-                };
-                relocatable_bytes.resize(relocatable_bytes.len().saturating_add(padding), 0);
-                let code_offset = relocatable_bytes.len() as u64;
-                let candidate_bytes = defined.code.len() as u64;
-                clif_blocks = clif_blocks.saturating_add(defined.clif_blocks);
-                maximum_pre_regalloc.max_assign(defined.pre_regalloc);
-                maximum_temporary_cache_entries = maximum_temporary_cache_entries
-                    .max(defined.maximum_temporary_cache_entries);
-                relocatable_bytes.extend_from_slice(&defined.code);
-                for relocation in &mut defined.relocations {
-                    if let crate::JitRelocatableTarget::InternalFunction(function) =
-                        &relocation.target
-                    {
-                        referenced_internal_functions
-                            .borrow_mut()
-                            .insert(*function);
-                    }
-                    relocation.offset = relocation.offset.saturating_add(code_offset);
-                }
-                relocatable_relocations.append(&mut defined.relocations);
-                emitted_production_lowering.append(&mut defined.production_lowering);
-                relocatable_functions.push(crate::JitRelocatableFunction {
-                    function: symbol,
-                    code_offset,
-                    code_len: candidate_bytes,
-                    arity,
-                    local_count,
-                });
-                code_bytes = code_bytes.saturating_add(candidate_bytes);
-                native_pc_ranges.append(&mut defined.native_pc_ranges);
-                Ok((candidate_bytes, defined.native_stack_bytes))
-            };
-            // A compile group may contain many bounded native fragments. Reuse
-            // Cranelift's allocation-heavy translation scratch sequentially;
-            // `clear_context` preserves its backing allocations after every
-            // fragment while regalloc still sees only one fragment at a time.
-            for candidate in regions.values() {
-                if let Some(layout) = &active_fragment_layout {
-                    let mut function_bytes = 0_u64;
-                    let mut maximum_stack = 0_u32;
-                    if layout.fragments.len() == 1 {
-                        let fragment = &layout.fragments[0];
-                        let defined = if let Some(preflighted) =
-                            preflighted_fragments.remove(&fragment.id)
-                        {
+                let mut append_defined =
+                    |symbol: FunctionId,
+                     arity: u8,
+                     local_count: u32,
+                     mut defined: DefinedRegionFunction|
+                     -> Result<(u64, u32), CraneliftLoweringError> {
+                        let alignment = usize::try_from(defined.alignment).map_err(|_| {
+                            CraneliftLoweringError::new(
+                                "JIT_CRANELIFT_REJECT_CACHE_ALIGNMENT",
+                                "native function alignment does not fit usize",
+                            )
+                        })?;
+                        let padding = if alignment == 0 {
+                            0
+                        } else {
+                            (alignment - relocatable_bytes.len() % alignment) % alignment
+                        };
+                        relocatable_bytes
+                            .resize(relocatable_bytes.len().saturating_add(padding), 0);
+                        let code_offset = relocatable_bytes.len() as u64;
+                        let candidate_bytes = defined.code.len() as u64;
+                        clif_blocks = clif_blocks.saturating_add(defined.clif_blocks);
+                        maximum_pre_regalloc.max_assign(defined.pre_regalloc);
+                        maximum_temporary_cache_entries = maximum_temporary_cache_entries
+                            .max(defined.maximum_temporary_cache_entries);
+                        relocatable_bytes.extend_from_slice(&defined.code);
+                        for relocation in &mut defined.relocations {
+                            if let crate::JitRelocatableTarget::InternalFunction(function) =
+                                &relocation.target
+                            {
+                                referenced_internal_functions.borrow_mut().insert(*function);
+                            }
+                            relocation.offset = relocation.offset.saturating_add(code_offset);
+                        }
+                        relocatable_relocations.append(&mut defined.relocations);
+                        emitted_production_lowering.append(&mut defined.production_lowering);
+                        relocatable_functions.push(crate::JitRelocatableFunction {
+                            function: symbol,
+                            code_offset,
+                            code_len: candidate_bytes,
+                            arity,
+                            local_count,
+                        });
+                        code_bytes = code_bytes.saturating_add(candidate_bytes);
+                        native_pc_ranges.append(&mut defined.native_pc_ranges);
+                        Ok((candidate_bytes, defined.native_stack_bytes))
+                    };
+                // A compile group may contain many bounded native fragments. Reuse
+                // Cranelift's allocation-heavy translation scratch sequentially;
+                // `clear_context` preserves its backing allocations after every
+                // fragment while regalloc still sees only one fragment at a time.
+                for candidate in regions.values() {
+                    if let Some(layout) = &active_fragment_layout {
+                        let mut function_bytes = 0_u64;
+                        let mut maximum_stack = 0_u32;
+                        if layout.fragments.len() == 1 {
+                            let fragment = &layout.fragments[0];
+                            let defined = if let Some(preflighted) =
+                                preflighted_fragments.remove(&fragment.id)
+                            {
+                                compile_preflighted_region_function(
+                                    module,
+                                    codegen_context,
+                                    functions[&candidate.function],
+                                    candidate,
+                                    &functions,
+                                    preflighted,
+                                )?
+                            } else {
+                                let compiler =
+                                    crate::cranelift_lowering::generic_streaming::compiler_for_tier(
+                                        candidate.compile_metadata.tier,
+                                    );
+                                compiler.compile_fragment(&mut |compilation_mode| {
+                                    define_region_graph_function(
+                                        module,
+                                        codegen_context,
+                                        builder_context,
+                                        candidate,
+                                        &unit.constants,
+                                        &value_flows[&candidate.function],
+                                        functions[&candidate.function],
+                                        &functions,
+                                        &inline_constants,
+                                        &tail_forwards,
+                                        &function_params,
+                                        &request.external_function_signatures,
+                                        tier_operations,
+                                        &layout.register_liveness,
+                                        Some(NativeFragmentDefinition {
+                                            layout,
+                                            fragment,
+                                            functions: &fragment_functions,
+                                        }),
+                                        runtime_unit_identity,
+                                        compilation_mode,
+                                        true,
+                                        false,
+                                    )
+                                })?
+                            };
+                            let metrics = append_defined(
+                                candidate.function,
+                                region_arity(candidate)?,
+                                candidate.local_count,
+                                defined,
+                            )?;
+                            function_code_metrics.insert(candidate.function, metrics);
+                            continue;
+                        }
+                        for fragment in &layout.fragments {
+                            let defined = if let Some(preflighted) =
+                                preflighted_fragments.remove(&fragment.id)
+                            {
+                                compile_preflighted_region_function(
+                                    module,
+                                    codegen_context,
+                                    fragment_functions[&fragment.id],
+                                    candidate,
+                                    &functions,
+                                    preflighted,
+                                )?
+                            } else {
+                                let compiler =
+                                    crate::cranelift_lowering::generic_streaming::compiler_for_tier(
+                                        candidate.compile_metadata.tier,
+                                    );
+                                compiler.compile_fragment(&mut |compilation_mode| {
+                                    define_region_graph_function(
+                                        module,
+                                        codegen_context,
+                                        builder_context,
+                                        candidate,
+                                        &unit.constants,
+                                        &value_flows[&candidate.function],
+                                        fragment_functions[&fragment.id],
+                                        &functions,
+                                        &inline_constants,
+                                        &tail_forwards,
+                                        &function_params,
+                                        &request.external_function_signatures,
+                                        tier_operations,
+                                        &layout.register_liveness,
+                                        Some(NativeFragmentDefinition {
+                                            layout,
+                                            fragment,
+                                            functions: &fragment_functions,
+                                        }),
+                                        runtime_unit_identity,
+                                        compilation_mode,
+                                        false,
+                                        false,
+                                    )
+                                })?
+                            };
+                            let (bytes, stack) = append_defined(
+                                fragment_symbols[&fragment.id],
+                                0,
+                                candidate.local_count,
+                                defined,
+                            )?;
+                            function_bytes = function_bytes.saturating_add(bytes);
+                            maximum_stack = maximum_stack.max(stack);
+                        }
+                        let wrapper = define_region_fragment_wrapper(
+                            module,
+                            codegen_context,
+                            builder_context,
+                            candidate,
+                            functions[&candidate.function],
+                            &fragment_functions,
+                            layout,
+                            &functions,
+                            &value_flows[&candidate.function],
+                            tier_operations,
+                        )?;
+                        let (bytes, stack) = append_defined(
+                            candidate.function,
+                            region_arity(candidate)?,
+                            candidate.local_count,
+                            wrapper,
+                        )?;
+                        function_bytes = function_bytes.saturating_add(bytes);
+                        maximum_stack = maximum_stack.max(stack);
+                        function_code_metrics
+                            .insert(candidate.function, (function_bytes, maximum_stack));
+                    } else {
+                        let register_liveness = NativeRegisterLiveness::analyze(candidate);
+                        let defined = if let Some(preflighted) = preflighted_whole.take() {
                             compile_preflighted_region_function(
                                 module,
                                 codegen_context,
@@ -15653,10 +15783,10 @@ pub(super) fn compile_region_graph_native(
                                 candidate,
                                 &functions,
                                 preflighted,
-                            )?
+                            )
                         } else {
                             let compiler =
-                                crate::cranelift_lowering::baseline_streaming::compiler_for_tier(
+                                crate::cranelift_lowering::generic_streaming::compiler_for_tier(
                                     candidate.compile_metadata.tier,
                                 );
                             compiler.compile_fragment(&mut |compilation_mode| {
@@ -15674,19 +15804,15 @@ pub(super) fn compile_region_graph_native(
                                     &function_params,
                                     &request.external_function_signatures,
                                     tier_operations,
-                                    &layout.register_liveness,
-                                    Some(NativeFragmentDefinition {
-                                        layout,
-                                        fragment,
-                                        functions: &fragment_functions,
-                                    }),
+                                    &register_liveness,
+                                    None,
                                     runtime_unit_identity,
                                     compilation_mode,
-                                    true,
+                                    false,
                                     false,
                                 )
-                            })?
-                        };
+                            })
+                        }?;
                         let metrics = append_defined(
                             candidate.function,
                             region_arity(candidate)?,
@@ -15694,208 +15820,78 @@ pub(super) fn compile_region_graph_native(
                             defined,
                         )?;
                         function_code_metrics.insert(candidate.function, metrics);
-                        continue;
                     }
-                    for fragment in &layout.fragments {
-                        let defined = if let Some(preflighted) =
-                            preflighted_fragments.remove(&fragment.id)
-                        {
-                            compile_preflighted_region_function(
-                                module,
-                                codegen_context,
-                                fragment_functions[&fragment.id],
-                                candidate,
-                                &functions,
-                                preflighted,
-                            )?
-                        } else {
-                            let compiler =
-                                crate::cranelift_lowering::baseline_streaming::compiler_for_tier(
-                                    candidate.compile_metadata.tier,
-                                );
-                            compiler.compile_fragment(&mut |compilation_mode| {
-                                define_region_graph_function(
-                                    module,
-                                    codegen_context,
-                                    builder_context,
-                                    candidate,
-                                    &unit.constants,
-                                    &value_flows[&candidate.function],
-                                    fragment_functions[&fragment.id],
-                                    &functions,
-                                    &inline_constants,
-                                    &tail_forwards,
-                                    &function_params,
-                                    &request.external_function_signatures,
-                                    tier_operations,
-                                    &layout.register_liveness,
-                                    Some(NativeFragmentDefinition {
-                                        layout,
-                                        fragment,
-                                        functions: &fragment_functions,
-                                    }),
-                                    runtime_unit_identity,
-                                    compilation_mode,
-                                    false,
-                                    false,
-                                )
-                            })?
-                        };
-                        let (bytes, stack) = append_defined(
-                            fragment_symbols[&fragment.id],
-                            0,
-                            candidate.local_count,
-                            defined,
-                        )?;
-                        function_bytes = function_bytes.saturating_add(bytes);
-                        maximum_stack = maximum_stack.max(stack);
-                    }
-                    let wrapper = define_region_fragment_wrapper(
-                        module,
-                        codegen_context,
-                        builder_context,
-                        candidate,
-                        functions[&candidate.function],
-                        &fragment_functions,
-                        layout,
-                        &functions,
-                        &value_flows[&candidate.function],
-                        tier_operations,
-                    )?;
-                    let (bytes, stack) = append_defined(
-                        candidate.function,
-                        region_arity(candidate)?,
-                        candidate.local_count,
-                        wrapper,
-                    )?;
-                    function_bytes = function_bytes.saturating_add(bytes);
-                    maximum_stack = maximum_stack.max(stack);
-                    function_code_metrics
-                        .insert(candidate.function, (function_bytes, maximum_stack));
-                } else {
-                    let register_liveness = NativeRegisterLiveness::analyze(candidate);
-                    let defined = if let Some(preflighted) = preflighted_whole.take() {
-                        compile_preflighted_region_function(
-                            module,
-                            codegen_context,
-                            functions[&candidate.function],
-                            candidate,
-                            &functions,
-                            preflighted,
-                        )
-                    } else {
-                        let compiler =
-                            crate::cranelift_lowering::baseline_streaming::compiler_for_tier(
-                                candidate.compile_metadata.tier,
-                            );
-                        compiler.compile_fragment(&mut |compilation_mode| {
-                            define_region_graph_function(
+                }
+                let referenced = referenced_internal_functions.borrow().clone();
+                match tier_operations {
+                    NativeTierOperations::Optimizing { operations } => {
+                        // Optimizing support functions are part of an artifact only
+                        // when its emitted CLIF actually relocates to them. The old
+                        // unconditional bundle compiled and published all five
+                        // bodies even for pure scalar functions. Keep the exact
+                        // native dependency closure for the emitted direct paths.
+                        let needs_ensure =
+                            referenced.contains(&operations.array_ensure_unique_symbol);
+                        let needs_child = referenced.contains(&operations.array_child_entry_symbol);
+                        let needs_commit =
+                            referenced.contains(&operations.value_release_commit_symbol);
+
+                        if needs_ensure {
+                            let defined = define_direct_array_ensure_unique_function(
                                 module,
                                 codegen_context,
                                 builder_context,
-                                candidate,
-                                &unit.constants,
-                                &value_flows[&candidate.function],
-                                functions[&candidate.function],
-                                &functions,
-                                &inline_constants,
-                                &tail_forwards,
-                                &function_params,
-                                &request.external_function_signatures,
-                                tier_operations,
-                                &register_liveness,
-                                None,
-                                runtime_unit_identity,
-                                compilation_mode,
-                                false,
-                                false,
-                            )
-                        })
-                    }?;
-                    let metrics = append_defined(
-                        candidate.function,
-                        region_arity(candidate)?,
-                        candidate.local_count,
-                        defined,
-                    )?;
-                    function_code_metrics.insert(candidate.function, metrics);
-                }
-            }
-            let referenced = referenced_internal_functions.borrow().clone();
-            match tier_operations {
-                NativeTierOperations::Optimizing { operations } => {
-                // Optimizing support functions are part of an artifact only
-                // when its emitted CLIF actually relocates to them. The old
-                // unconditional bundle compiled and published all five
-                // bodies even for pure scalar functions. Keep the exact
-                // native dependency closure for the emitted direct paths.
-                let needs_ensure =
-                    referenced.contains(&operations.array_ensure_unique_symbol);
-                let needs_child =
-                    referenced.contains(&operations.array_child_entry_symbol);
-                let needs_commit =
-                    referenced.contains(&operations.value_release_commit_symbol);
-
-                if needs_ensure {
-                    let defined = define_direct_array_ensure_unique_function(
-                        module,
-                        codegen_context,
-                        builder_context,
-                        operations.array_ensure_unique,
-                    )?;
-                    let _ = append_defined(
-                        operations.array_ensure_unique_symbol,
-                        0,
-                        0,
-                        defined,
-                    )?;
-                }
-                if needs_child {
-                    let defined = define_direct_array_child_entry_function(
-                        module,
-                        codegen_context,
-                        builder_context,
-                        operations.array_child_entry,
-                    )?;
-                    let _ = append_defined(
-                        operations.array_child_entry_symbol,
-                        0,
-                        0,
-                        defined,
-                    )?;
-                }
-                if needs_commit {
-                    let defined = define_direct_value_release_commit_function(
-                        module,
-                        codegen_context,
-                        builder_context,
-                        operations.value_release_commit,
-                        operations.value_release_commit_symbol,
-                    )?;
-                    let _ = append_defined(
-                        operations.value_release_commit_symbol,
-                        0,
-                        0,
-                        defined,
-                    )?;
-                }
-                },
-                NativeTierOperations::Baseline {
-                    value_release_commit,
-                    value_release_commit_symbol,
-                    ..
-                } if referenced.contains(&value_release_commit_symbol) => {
-                    let defined = define_direct_value_release_commit_function(
-                        module,
-                        codegen_context,
-                        builder_context,
+                                operations.array_ensure_unique,
+                            )?;
+                            let _ = append_defined(
+                                operations.array_ensure_unique_symbol,
+                                0,
+                                0,
+                                defined,
+                            )?;
+                        }
+                        if needs_child {
+                            let defined = define_direct_array_child_entry_function(
+                                module,
+                                codegen_context,
+                                builder_context,
+                                operations.array_child_entry,
+                            )?;
+                            let _ =
+                                append_defined(operations.array_child_entry_symbol, 0, 0, defined)?;
+                        }
+                        if needs_commit {
+                            let defined = define_direct_value_release_commit_function(
+                                module,
+                                codegen_context,
+                                builder_context,
+                                operations.value_release_commit,
+                                operations.value_release_commit_symbol,
+                            )?;
+                            let _ = append_defined(
+                                operations.value_release_commit_symbol,
+                                0,
+                                0,
+                                defined,
+                            )?;
+                        }
+                    }
+                    NativeTierOperations::Generic {
                         value_release_commit,
                         value_release_commit_symbol,
-                    )?;
-                    let _ = append_defined(value_release_commit_symbol, 0, 0, defined)?;
-                },
-                NativeTierOperations::Baseline { .. } => {},
-            }
+                        ..
+                    } if referenced.contains(&value_release_commit_symbol) => {
+                        let defined = define_direct_value_release_commit_function(
+                            module,
+                            codegen_context,
+                            builder_context,
+                            value_release_commit,
+                            value_release_commit_symbol,
+                        )?;
+                        let _ = append_defined(value_release_commit_symbol, 0, 0, defined)?;
+                    }
+                    NativeTierOperations::Generic { .. } => {}
+                }
             }
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 module
@@ -16050,7 +16046,7 @@ pub(super) fn compile_region_graph_native(
                 &value_flows,
                 emitted_production_lowering,
             );
-            let mut handle = JitFunctionHandle::i64_status_out_native(
+            let mut handle = JitFunctionHandle::native_control_entry(
                 u64::from(function.raw()) + 1,
                 request.region_id.clone(),
                 CraneliftCompilerIdentity,
@@ -16062,7 +16058,7 @@ pub(super) fn compile_region_graph_native(
                 region_state_metadata,
             );
             if compilation_mode
-                == crate::cranelift_lowering::baseline_streaming::NativeCompilationMode::SsaOptimizing
+                == crate::cranelift_lowering::generic_streaming::NativeCompilationMode::SsaOptimizing
             {
                 let forbidden = relocatable_relocations.iter().find_map(|relocation| {
                     match &relocation.target {
@@ -16375,8 +16371,7 @@ pub(super) fn compile_region_graph_native(
             });
             compiled_clif_blocks.set(Some(clif_blocks));
             compiled_maximum_pre_regalloc.set(Some(maximum_pre_regalloc));
-            compiled_maximum_temporary_cache_entries
-                .set(Some(maximum_temporary_cache_entries));
+            compiled_maximum_temporary_cache_entries.set(Some(maximum_temporary_cache_entries));
             *selected_plan.borrow_mut() = active_plan;
             *selected_fragment_layout.borrow_mut() = active_fragment_layout;
             Ok((handle, code_bytes))
@@ -17220,22 +17215,24 @@ fn define_region_fragment_wrapper(
         let params = builder.block_params(entry).to_vec();
         let runtime = params[0];
         let arguments = params[1];
-        let result_out = params[2];
-        let deopt_out = params[3];
-        let resume_id = params[4];
-        let resume_state = params[5];
-        if region.compile_metadata.tier == NativeCompilerTier::Baseline {
-            lower_baseline_function_entry(&mut builder, deopt_out, region.function)?;
+        let result_slot =
+            builder.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
+        let result_out = builder.ins().stack_addr(pointer_type, result_slot, 0);
+        let deopt_out = params[2];
+        let resume_id = params[3];
+        let resume_state = params[4];
+        if region.compile_metadata.tier == NativeCompilerTier::Generic {
+            lower_generic_function_entry(&mut builder, deopt_out, region.function)?;
         }
-        let (arguments, resume_id) = if region.compile_metadata.tier == NativeCompilerTier::Baseline
+        let (arguments, resume_id) = if region.compile_metadata.tier == NativeCompilerTier::Generic
         {
-            let NativeTierOperations::Baseline { operations, .. } = tier_operations else {
+            let NativeTierOperations::Generic { operations, .. } = tier_operations else {
                 return Err(CraneliftLoweringError::new(
                     "JIT_CRANELIFT_NATIVE_ENTRY_BINDING",
                     "baseline fragment wrapper has no baseline operation plane",
                 ));
             };
-            lower_baseline_bind_packed_arguments(
+            lower_generic_bind_packed_arguments(
                 module,
                 &mut builder,
                 operations
@@ -17418,7 +17415,7 @@ fn define_region_fragment_wrapper(
             );
             let call = builder.ins().call(callee, &[runtime, frame]);
             let status = builder.inst_results(call)[0];
-            builder.ins().return_(&[status]);
+            return_native_php_control(&mut builder, status, result_out);
         }
         builder.seal_all_blocks();
         builder.finalize();
@@ -19298,6 +19295,7 @@ fn emit_optimizing_entry_admission(
     builder: &mut FunctionBuilder<'_>,
     admission: &NativeOptimizingAdmission,
     arguments: ir::Value,
+    result_out: ir::Value,
     deopt_out: ir::Value,
     function: FunctionId,
     accepted: ir::Block,
@@ -20140,7 +20138,7 @@ fn emit_optimizing_entry_admission(
         let contract_violation = builder
             .ins()
             .iconst(types::I32, i64::from(crate::JitCallStatus::ABI_MISMATCH.0));
-        builder.ins().return_(&[contract_violation]);
+        return_native_php_control(builder, contract_violation, result_out);
         return Ok(());
     }
     let mut required_entries = builder.ins().iconst(
@@ -20890,7 +20888,7 @@ fn emit_optimizing_entry_admission(
         let contract_violation = builder
             .ins()
             .iconst(types::I32, i64::from(crate::JitCallStatus::ABI_MISMATCH.0));
-        builder.ins().return_(&[contract_violation]);
+        return_native_php_control(builder, contract_violation, result_out);
         return Ok(());
     }
 
@@ -20983,7 +20981,7 @@ fn emit_optimizing_entry_admission(
     let contract_violation = builder
         .ins()
         .iconst(types::I32, i64::from(crate::JitCallStatus::ABI_MISMATCH.0));
-    builder.ins().return_(&[contract_violation]);
+    return_native_php_control(builder, contract_violation, result_out);
     Ok(())
 }
 
@@ -21005,7 +21003,7 @@ fn define_region_graph_function(
     register_liveness: &NativeRegisterLiveness,
     fragment: Option<NativeFragmentDefinition<'_>>,
     unit_identity: u64,
-    compilation_mode: crate::cranelift_lowering::baseline_streaming::NativeCompilationMode,
+    compilation_mode: crate::cranelift_lowering::generic_streaming::NativeCompilationMode,
     inline_fragment_entry: bool,
     preflight_only: bool,
 ) -> Result<DefinedRegionFunction, CraneliftLoweringError> {
@@ -21109,6 +21107,15 @@ fn define_region_graph_function(
         builder.switch_to_block(native_entry);
         let params = builder.block_params(native_entry).to_vec();
         let runtime = params[0];
+        let canonical_entry = fragment.is_none() || inline_fragment_entry;
+        let canonical_result_out = canonical_entry.then(|| {
+            let result_slot = builder.create_sized_stack_slot(StackSlotData::new(
+                StackSlotKind::ExplicitSlot,
+                8,
+                3,
+            ));
+            builder.ins().stack_addr(pointer_type, result_slot, 0)
+        });
         let frame_layout = fragment.map(|fragment| &fragment.layout.frame);
         let fragment_frame = if fragment.is_some() {
             if inline_fragment_entry {
@@ -21140,9 +21147,12 @@ fn define_region_graph_function(
                         let entry_id = builder.ins().iconst(types::I32, 0);
                         for (value, offset) in [
                             (params[1], layout.arguments_offset()),
-                            (params[2], layout.result_out_offset()),
-                            (params[3], layout.deopt_out_offset()),
-                            (params[5], layout.resume_state_offset()),
+                            (
+                                canonical_result_out.expect("canonical result slot"),
+                                layout.result_out_offset(),
+                            ),
+                            (params[2], layout.deopt_out_offset()),
+                            (params[4], layout.resume_state_offset()),
                         ] {
                             builder
                                 .ins()
@@ -21150,7 +21160,7 @@ fn define_region_graph_function(
                         }
                         builder.ins().store(
                             MemFlagsData::new(),
-                            params[4],
+                            params[3],
                             frame,
                             layout.resume_id_offset(),
                         );
@@ -21161,7 +21171,12 @@ fn define_region_graph_function(
                             layout.entry_id_offset(),
                         );
                         (
-                            params[1], params[2], params[3], params[4], params[5], entry_id,
+                            params[1],
+                            canonical_result_out.expect("canonical result slot"),
+                            params[2],
+                            params[3],
+                            params[4],
+                            entry_id,
                         )
                     } else {
                         (
@@ -21212,21 +21227,28 @@ fn define_region_graph_function(
                     Some(entry_id),
                 )
             } else {
-                (params[1], params[2], params[3], params[4], params[5], None)
+                (
+                    params[1],
+                    canonical_result_out.expect("canonical result slot"),
+                    params[2],
+                    params[3],
+                    params[4],
+                    None,
+                )
             };
-        if region.compile_metadata.tier == NativeCompilerTier::Baseline
+        if region.compile_metadata.tier == NativeCompilerTier::Generic
             && (fragment.is_none() || inline_fragment_entry)
         {
-            lower_baseline_function_entry(&mut builder, deopt_out, region.function)?;
+            lower_generic_function_entry(&mut builder, deopt_out, region.function)?;
         }
         let (
             native_call_helper,
             native_dynamic_code_helper,
-            mut baseline_operations,
-            baseline_value_release_commit,
+            mut generic_operations,
+            generic_value_release_commit,
             execution_poll,
         ) = match tier_operations {
-            NativeTierOperations::Baseline {
+            NativeTierOperations::Generic {
                 call,
                 dynamic_code,
                 operations,
@@ -21272,7 +21294,7 @@ fn define_region_graph_function(
         // cases. Baseline code needs the same fast paths: forcing every local,
         // scalar comparison, and retain/release through helpers dominated warm
         // execution long after compilation had finished.
-        if let Some(native_operations) = baseline_operations.as_mut() {
+        if let Some(native_operations) = generic_operations.as_mut() {
             native_operations.value_release = native_operations
                 .value_release
                 .map(NativeHelper::with_inline_runtime_view);
@@ -21301,14 +21323,14 @@ fn define_region_graph_function(
                 .foreach_next
                 .map(NativeHelper::with_inline_runtime_view);
         }
-        let (arguments, resume_id) = if region.compile_metadata.tier == NativeCompilerTier::Baseline
+        let (arguments, resume_id) = if region.compile_metadata.tier == NativeCompilerTier::Generic
             && (fragment.is_none() || inline_fragment_entry)
         {
-            lower_baseline_bind_packed_arguments(
+            lower_generic_bind_packed_arguments(
                 module,
                 &mut builder,
-                baseline_operations
-                    .expect("baseline entry requires baseline operations")
+                generic_operations
+                    .expect("Generic entry requires Generic operations")
                     .argument_check,
                 &region.params,
                 region
@@ -21513,6 +21535,7 @@ fn define_region_graph_function(
                 &mut builder,
                 &optimizing_admission,
                 arguments,
+                result_out,
                 deopt_out,
                 region.function,
                 bind_parameters,
@@ -21810,8 +21833,8 @@ fn define_region_graph_function(
                         let stored = lower_native_value_operation(
                             module,
                             &mut builder,
-                            baseline_operations
-                                .expect("baseline catch binding requires baseline operations")
+                            generic_operations
+                                .expect("Generic catch binding requires Generic operations")
                                 .local_store,
                             crate::JIT_LOCAL_STORE_MOVE_INPUT,
                             &[current, value, function, local_value],
@@ -22140,7 +22163,11 @@ fn define_region_graph_function(
             let invalid = builder
                 .ins()
                 .iconst(types::I32, i64::from(crate::JitCallStatus::RUNTIME_ERROR.0));
-            builder.ins().return_(&[invalid]);
+            if canonical_entry {
+                return_native_php_control(&mut builder, invalid, result_out);
+            } else {
+                builder.ins().return_(&[invalid]);
+            }
         } else {
             builder.ins().jump(normal_entry, &[]);
         }
@@ -22253,14 +22280,7 @@ fn define_region_graph_function(
                     let callee = module.declare_func_in_func(*target, builder.func);
                     builder.ins().return_call(
                         callee,
-                        &[
-                            runtime,
-                            arguments,
-                            result_out,
-                            deopt_out,
-                            resume_id,
-                            resume_state,
-                        ],
+                        &[runtime, arguments, deopt_out, resume_id, resume_state],
                     );
                     terminated = true;
                     break;
@@ -22331,7 +22351,7 @@ fn define_region_graph_function(
                             production_lowering.push(crate::JitProductionLoweringMetadata {
                                 function: region.function,
                                 continuation_id: instruction.continuation_id,
-                                operation: crate::region_ir::baseline_instruction_lowering(
+                                operation: crate::region_ir::generic_instruction_lowering(
                                     &instruction.source_kind,
                                 )
                                 .variant
@@ -22340,7 +22360,7 @@ fn define_region_graph_function(
                             });
                         })
                     }
-                    NativeTierOperations::Baseline { .. } => lower_baseline_region_instruction(
+                    NativeTierOperations::Generic { .. } => lower_generic_region_instruction(
                         module,
                         &mut builder,
                         functions,
@@ -22349,9 +22369,9 @@ fn define_region_graph_function(
                         external_function_signatures,
                         native_call_helper,
                         native_dynamic_code_helper,
-                        baseline_operations
-                            .expect("baseline instruction requires baseline operations"),
-                        baseline_value_release_commit,
+                        generic_operations
+                            .expect("Generic instruction requires Generic operations"),
+                        generic_value_release_commit,
                         &register_variables,
                         &blocks,
                         &suspension_blocks,
@@ -22465,7 +22485,7 @@ fn define_region_graph_function(
                         production_lowering.push(crate::JitProductionLoweringMetadata {
                             function: region.function,
                             continuation_id: region_block.terminator_continuation_id,
-                            operation: crate::region_ir::baseline_terminator_lowering(
+                            operation: crate::region_ir::generic_terminator_lowering(
                                 &region_block.source_terminator,
                             )
                             .variant
@@ -22474,7 +22494,7 @@ fn define_region_graph_function(
                         });
                     })
                 }
-                NativeTierOperations::Baseline { .. } => lower_region_terminator(
+                NativeTierOperations::Generic { .. } => lower_region_terminator(
                     &mut builder,
                     &terminator_blocks,
                     &locals,
@@ -22484,7 +22504,7 @@ fn define_region_graph_function(
                     pending_status,
                     pending_value,
                     module,
-                    baseline_operations.expect("baseline terminator requires baseline operations"),
+                    generic_operations.expect("Generic terminator requires Generic operations"),
                     region.function,
                     region.local_count,
                     region_block.terminator_continuation_id,
@@ -22645,7 +22665,11 @@ fn define_region_graph_function(
                 finished,
             );
             builder.switch_to_block(finished);
-            builder.ins().return_(&[status]);
+            if canonical_entry {
+                return_native_php_control(&mut builder, status, result_out);
+            } else {
+                builder.ins().return_(&[status]);
+            }
         }
         if let (Some(dispatch), Some(resume_default)) = (resume_dispatch, resume_default) {
             builder.switch_to_block(dispatch);
@@ -22657,7 +22681,11 @@ fn define_region_graph_function(
         builder
             .ins()
             .store(MemFlagsData::new(), terminal_value, result_out, 0);
-        builder.ins().return_(&[terminal_status]);
+        if canonical_entry {
+            return_native_php_control(&mut builder, terminal_status, result_out);
+        } else {
+            builder.ins().return_(&[terminal_status]);
+        }
         builder.seal_all_blocks();
         builder.finalize();
     }
@@ -22945,10 +22973,8 @@ fn region_graph_metadata<'a>(
                         .instructions
                         .iter()
                         .filter(move |instruction| {
-                            crate::region_ir::baseline_instruction_lowering(
-                                &instruction.source_kind,
-                            )
-                            .requires_safepoint
+                            crate::region_ir::generic_instruction_lowering(&instruction.source_kind)
+                                .requires_safepoint
                         })
                         .map(move |instruction| crate::JitNativeSafepointMetadata {
                             function: region.function,

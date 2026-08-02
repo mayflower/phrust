@@ -101,7 +101,7 @@ fn publish_dynamic_unit_entry(
             }
         }
         _ => {
-            if let Some(cell) = deployment.native_function_entries.get(function.index()) {
+            if let Some(cell) = deployment.generic_function_entries.get(function.index()) {
                 cell.store(address, std::sync::atomic::Ordering::Release);
             }
             if let Some(cell) = deployment.preferred_function_entries.get(function.index())
@@ -149,7 +149,7 @@ pub(in crate::vm) extern "C" fn jit_native_function_resolve_abi(
             // always enters the baseline callee. Background workers select
             // optimizing products later from direct baseline-entry counts;
             // merely reaching a declaration is no longer sufficient.
-            let handle = ensure_native_baseline_entry(context, function)?;
+            let handle = ensure_native_generic_entry(context, function)?;
             let address = handle.native_entry_address().ok_or_else(|| {
                 format!(
                     "native function entry {} has no executable address",
@@ -473,7 +473,7 @@ pub(super) fn ensure_native_entry(
         // entry. A function whose concrete property or global-reference plan
         // was not published must select its baseline-native body here, never
         // enter an optimizing artifact with an empty slot contract.
-        return ensure_native_baseline_entry(context, function);
+        return ensure_native_generic_entry(context, function);
     }
     let external_signatures =
         visible_external_function_signatures(context, &context.compiled, function);
@@ -484,7 +484,7 @@ pub(super) fn ensure_native_entry(
         let handle = if let Some(handle) = context.native_entries.get(&function) {
             handle.clone()
         } else {
-            ensure_native_baseline_entry(context, function)?
+            ensure_native_generic_entry(context, function)?
         };
         return install_active_native_entry(context, function, handle);
     }
@@ -505,7 +505,7 @@ pub(super) fn ensure_native_entry(
         let handle = if let Some(handle) = context.native_entries.get(&function) {
             handle.clone()
         } else {
-            ensure_native_baseline_entry(context, function)?
+            ensure_native_generic_entry(context, function)?
         };
         return install_active_native_entry(context, function, handle);
     }
@@ -529,34 +529,21 @@ pub(super) fn ensure_native_entry(
     install_active_native_entry(context, function, handle)
 }
 
-pub(super) fn ensure_native_baseline_entry(
+pub(super) fn ensure_native_generic_entry(
     context: &mut NativeRequestColdState<'_>,
     function: php_ir::FunctionId,
 ) -> Result<php_jit::JitFunctionHandle, String> {
     let external_signatures =
         visible_external_function_signatures(context, &context.compiled, function);
     let prepare_options = context.options.clone();
-    context.worker_state.prepare_native_baseline_entry(
+    context.worker_state.prepare_native_generic_entry(
         &context.compiled,
         function,
         &prepare_options,
         &external_signatures,
     )?;
     let mut resolved_options = prepare_options;
-    resolved_options.native_optimization = match resolved_options.native_optimization {
-        super::super::NativeOptimizationPolicy::Optimizing
-            if resolved_options.tiering.enabled && !resolved_options.tiering.native_eager =>
-        {
-            super::super::NativeOptimizationPolicy::TieredBaseline
-        }
-        super::super::NativeOptimizationPolicy::Optimizing
-        | super::super::NativeOptimizationPolicy::Baseline => {
-            super::super::NativeOptimizationPolicy::Baseline
-        }
-        super::super::NativeOptimizationPolicy::TieredBaseline => {
-            super::super::NativeOptimizationPolicy::TieredBaseline
-        }
-    };
+    resolved_options.native_optimization = super::super::NativeOptimizationPolicy::Generic;
     resolved_options.tiering.enabled = false;
     if let Some(handle) = context.worker_state.resolved_native_function(
         &context.compiled,
@@ -631,7 +618,7 @@ pub(super) fn prepare_dynamic_native_entry(
         return Ok(());
     }
     let mut baseline_options = context.options.clone();
-    baseline_options.native_optimization = super::super::NativeOptimizationPolicy::Baseline;
+    baseline_options.native_optimization = super::super::NativeOptimizationPolicy::Generic;
     baseline_options.tiering.enabled = false;
     let handle = context.worker_state.resolve_native_function(
         &compiled,
@@ -913,7 +900,7 @@ pub(super) fn select_baseline_for_global_plan_functions(package: &NativeDynamicU
             continue;
         }
         let baseline = deployment
-            .native_function_entries
+            .generic_function_entries
             .get(function.index())
             .map(|entry| entry.load(std::sync::atomic::Ordering::Acquire))
             .unwrap_or(0);
@@ -974,10 +961,10 @@ pub(super) fn schedule_hot_native_functions(context: &NativeRequestColdState<'_>
     for package in &context.dynamic_units {
         let deployment = package.compiled.prepared_deployment_image();
         for (index, ((baseline, preferred), entries)) in deployment
-            .native_function_entries
+            .generic_function_entries
             .iter()
             .zip(deployment.preferred_function_entries.iter())
-            .zip(deployment.baseline_function_entry_counts.iter())
+            .zip(deployment.generic_function_entry_counts.iter())
             .enumerate()
         {
             let baseline = baseline.load(std::sync::atomic::Ordering::Acquire);
@@ -1421,7 +1408,7 @@ fn prepare_linked_function_entries_for_caller(
                 let unpublished = package
                     .compiled
                     .prepared_deployment_image()
-                    .native_function_entries
+                    .generic_function_entries
                     .get(function.index())
                     .is_none_or(|entry| entry.load(std::sync::atomic::Ordering::Acquire) == 0);
                 let external_signatures =
@@ -1461,7 +1448,7 @@ fn prepare_linked_function_entries_for_caller(
                 .preferred_function_entries
                 .get(caller_function.index()),
             deployment
-                .native_function_entries
+                .generic_function_entries
                 .get(caller_function.index()),
         ) {
             let baseline = baseline.load(std::sync::atomic::Ordering::Acquire);
@@ -1571,7 +1558,7 @@ fn prepare_resolved_external_callers(
             let deployed_native_entry = package
                 .compiled
                 .prepared_deployment_image()
-                .native_function_entries
+                .generic_function_entries
                 .get(function.index())
                 .is_some_and(|entry| entry.load(std::sync::atomic::Ordering::Acquire) != 0);
             let has_native_entry = mapped_native_entry || deployed_native_entry;
@@ -1605,21 +1592,28 @@ fn linked_function_record(
         // incomplete optimizing publication contract.
         return None;
     }
-    let (preferred_entry, baseline_entry) = target.function().map_or(Some((0, 0)), |function| {
-        let deployment = target_unit.compiled.prepared_deployment_image();
-        Some((
-            std::ptr::from_ref(
-                deployment
-                    .preferred_function_entries
-                    .get(function.function.index())?,
-            ) as usize as u64,
-            std::ptr::from_ref(
-                deployment
-                    .native_function_entries
-                    .get(function.function.index())?,
-            ) as usize as u64,
-        ))
-    })?;
+    let (preferred_entry, generic_entry, binding_plan, signature_identity) =
+        target.function().map_or(Some((0, 0, 0, 0)), |function| {
+            let deployment = target_unit.compiled.prepared_deployment_image();
+            Some((
+                std::ptr::from_ref(
+                    deployment
+                        .preferred_function_entries
+                        .get(function.function.index())?,
+                ) as usize as u64,
+                std::ptr::from_ref(
+                    deployment
+                        .generic_function_entries
+                        .get(function.function.index())?,
+                ) as usize as u64,
+                target_unit
+                    .compiled
+                    .prepared_native_function_metadata_ptr(function.function)?
+                    as usize as u64,
+                u64::from(function.function.raw())
+                    ^ u64::from(target_unit.compiled.unit().version).rotate_left(17),
+            ))
+        })?;
     let prepared_class = call
         .source_name
         .rsplit_once("::")
@@ -1630,9 +1624,13 @@ fn linked_function_record(
     }
     Some(php_jit::JitNativeLinkedFunction {
         preferred_entry,
-        baseline_entry,
+        generic_entry,
         runtime_view: std::ptr::from_ref(target_unit.published_runtime_view.as_ref()) as usize
             as u64,
+        binding_plan,
+        scope_context: prepared_class,
+        generation: u64::from(target_unit.compiled.unit().version),
+        signature_identity,
         prepared_class,
     })
 }

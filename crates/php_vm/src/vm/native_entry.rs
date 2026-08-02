@@ -27,7 +27,7 @@ impl VmWorkerState {
         {
             let callee_signatures =
                 linked_external_function_signatures(unit, callee, external_signatures);
-            self.prepare_native_baseline_entry(unit, callee, options, &callee_signatures)?;
+            self.prepare_native_generic_entry(unit, callee, options, &callee_signatures)?;
         }
         Ok(())
     }
@@ -50,7 +50,7 @@ impl VmWorkerState {
             })?;
             let deployment = unit.prepared_deployment_image();
             let baseline = deployment
-                .native_function_entries
+                .generic_function_entries
                 .get(function.index())
                 .ok_or_else(|| {
                     format!(
@@ -84,7 +84,7 @@ impl VmWorkerState {
         }
         let root_signatures =
             linked_external_function_signatures(unit, function, external_signatures);
-        self.prepare_native_baseline_entry(unit, function, options, &root_signatures)?;
+        self.prepare_native_generic_entry(unit, function, options, &root_signatures)?;
         if !handle.region_state_metadata().is_some_and(|metadata| {
             metadata.compiler_tier == php_jit::region_ir::NativeCompilerTier::Optimizing
         }) {

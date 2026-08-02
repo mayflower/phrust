@@ -2,7 +2,7 @@
 
 use crate::code_manager::{ManagedCompileError, NativeCompileAdmission};
 use crate::region_ir::{
-    BaselineRegionBuilder, CompileMetadata, ExecutableValueFlow, NativeCompilerTier,
+    CompileMetadata, ExecutableValueFlow, GenericRegionBuilder, NativeCompilerTier,
     RegionArrayCallbackOperation, RegionArrayCallbackTarget, RegionBinaryOp, RegionCallResult,
     RegionCallTarget, RegionCastOp, RegionCompareOpCode, RegionGraph, RegionInstruction,
     RegionInstructionKind, RegionNativeCall, RegionNativeControl, RegionNativeDynamicCode,
@@ -72,7 +72,7 @@ struct OptimizingCompiledCallTarget<'a> {
 ///
 /// The publication cells and linked runtime view are engine-integrity
 /// invariants. Load them once before entering a callback loop; an individual
-/// invocation only selects the baseline entry when its value-dependent PHP
+/// invocation only selects the Generic entry when its value-dependent PHP
 /// parameter guards reject the optimizing entry.
 #[derive(Clone, Copy)]
 struct OptimizingPreparedCallback {
@@ -335,11 +335,11 @@ fn bounded_inline_call_operand(
 }
 use std::time::Instant;
 
-mod baseline_streaming;
 mod call_metadata;
 mod dynamic_code;
 mod executable_region;
 mod fallback_helpers;
+mod generic_streaming;
 mod module_layout;
 mod native_linkage;
 mod terminators;
@@ -358,7 +358,7 @@ pub const fn native_compiler_mode_identity(optimizing: bool) -> &'static str {
     if optimizing {
         native_linkage::OPTIMIZING_FUNCTION_SPECIALIZATION
     } else {
-        native_linkage::BASELINE_FUNCTION_SPECIALIZATION
+        native_linkage::GENERIC_FUNCTION_SPECIALIZATION
     }
 }
 
@@ -386,7 +386,7 @@ struct NativeScalarRegionCompileResult {
     pre_regalloc_replans: usize,
     fast_path_hits: u64,
     has_control_flow: bool,
-    compilation_mode: baseline_streaming::NativeCompilationMode,
+    compilation_mode: generic_streaming::NativeCompilationMode,
     plan: NativeCompilePlan,
 }
 
@@ -462,7 +462,7 @@ enum NativeDirectCallee {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-struct BaselineNativeOperations {
+struct GenericNativeOperations {
     runtime: Option<ir::Value>,
     semantic_dispatch: Option<NativeHelper>,
     function_resolve: Option<NativeHelper>,
@@ -904,16 +904,16 @@ impl NativeOptimizingOperations {
     }
 }
 
-/// Runtime entrypoints are a baseline-only capability.  The optimizing tier
+/// Runtime entrypoints are a Generic-tier capability. The optimizing tier
 /// deliberately has no variant carrying helper addresses, so an optimizing
 /// artifact cannot acquire a generic warm-runtime import by accident.
 #[derive(Clone, Copy, Debug)]
 #[allow(clippy::large_enum_variant)]
 enum NativeTierOperations {
-    Baseline {
+    Generic {
         call: Option<NativeHelper>,
         dynamic_code: Option<NativeHelper>,
-        operations: BaselineNativeOperations,
+        operations: GenericNativeOperations,
         value_release_commit: FuncId,
         value_release_commit_symbol: FunctionId,
     },
@@ -922,7 +922,7 @@ enum NativeTierOperations {
     },
 }
 
-impl BaselineNativeOperations {
+impl GenericNativeOperations {
     fn with_runtime(mut self, runtime: ir::Value) -> Self {
         self.runtime = Some(runtime);
         macro_rules! bind {
@@ -1059,11 +1059,57 @@ fn native_php_entry_signature(module: &JITModule) -> Signature {
     signature.params.push(AbiParam::new(pointer_type));
     signature.params.push(AbiParam::new(pointer_type));
     signature.params.push(AbiParam::new(pointer_type));
-    signature.params.push(AbiParam::new(pointer_type));
     signature.params.push(AbiParam::new(types::I32));
     signature.params.push(AbiParam::new(pointer_type));
-    signature.returns.push(AbiParam::new(types::I32));
+    // `JitNativeControlResult` is returned as two integer ABI words. The
+    // first contains the u32 status/detail pair and the second is the native
+    // encoded value. Generic and Optimizing entries use this exact signature.
+    signature.returns.push(AbiParam::new(types::I64));
+    signature.returns.push(AbiParam::new(types::I64));
     signature
+}
+
+fn return_native_php_control(
+    builder: &mut FunctionBuilder<'_>,
+    status: ir::Value,
+    result_out: ir::Value,
+) {
+    let status_word = if builder.func.dfg.value_type(status) == types::I64 {
+        status
+    } else {
+        builder.ins().uextend(types::I64, status)
+    };
+    let value = builder
+        .ins()
+        .load(types::I64, MemFlagsData::new(), result_out, 0);
+    builder.ins().return_(&[status_word, value]);
+}
+
+fn return_native_or_fragment_control(
+    builder: &mut FunctionBuilder<'_>,
+    status: ir::Value,
+    result_out: ir::Value,
+) {
+    if builder.func.signature.returns.len() == 2 {
+        return_native_php_control(builder, status, result_out);
+    } else {
+        debug_assert_eq!(builder.func.signature.returns.len(), 1);
+        builder.ins().return_(&[status]);
+    }
+}
+
+fn unpack_native_php_control(
+    builder: &mut FunctionBuilder<'_>,
+    call: ir::Inst,
+    result_out: ir::Value,
+) -> ir::Value {
+    let results = builder.inst_results(call);
+    let status_word = results[0];
+    let value = results[1];
+    builder
+        .ins()
+        .store(MemFlagsData::new(), value, result_out, 0);
+    builder.ins().ireduce(types::I32, status_word)
 }
 
 fn compile_managed_native(
@@ -1108,7 +1154,7 @@ fn compile_managed_native(
         region: format!("{}:function:{}", request.region_id, function.raw()),
         abi_hash: JIT_RUNTIME_ABI_HASH,
         compiler_tier: if request.opt_level < 2 {
-            "baseline".to_owned()
+            "generic".to_owned()
         } else {
             "optimizing".to_owned()
         },
@@ -1249,7 +1295,7 @@ fn compile_authoritative_region(request: &NativeCompileRequest<'_>) -> NativeCom
             .clone()
             .unwrap_or_else(|| format!("unit-{}-function-{}", unit.id.raw(), function.raw())),
         tier: if request.compile.opt_level < 2 {
-            NativeCompilerTier::Baseline
+            NativeCompilerTier::Generic
         } else {
             NativeCompilerTier::Optimizing
         },
@@ -1278,7 +1324,7 @@ fn compile_authoritative_region(request: &NativeCompileRequest<'_>) -> NativeCom
             compile.external_function_signatures.push(signature.clone());
         }
     }
-    let region = match BaselineRegionBuilder::build_with_runtime_specializations(
+    let region = match GenericRegionBuilder::build_with_runtime_specializations(
         unit,
         function,
         &metadata,
@@ -1330,7 +1376,7 @@ fn compile_authoritative_region(request: &NativeCompileRequest<'_>) -> NativeCom
             NativeCompileOutcome::compiled(
                 compiled.handle,
                 format!(
-                    "Cranelift baseline Region IR `{}` function={} compilation_mode={} abi_hash={} code_bytes={} clif_blocks={} max_fragment_clif_blocks={} max_fragment_clif_values={} max_fragment_clif_instructions={} max_fragment_block_parameters={} max_fragment_clif_loads={} max_fragment_clif_stores={} max_fragment_loads_per_source_instruction_milli={} max_fragment_stores_per_source_instruction_milli={} max_temporary_cache_entries={} fragment_frame_slots={} fragment_shared_register_slots={} fragment_scratch_register_slots={} pre_regalloc_replans={} fast_path_hits={} control_flow={} plan_ir_instructions={} plan_php_blocks={} plan_estimated_clif_blocks={} plan_virtual_values={} plan_safepoints={} plan_live_sum={} plan_fragments={} plan_max_fragment_blocks={} plan_max_fragment_instructions={} plan_max_fragment_estimated_clif_blocks={}",
+                    "Cranelift Generic Region IR `{}` function={} compilation_mode={} abi_hash={} code_bytes={} clif_blocks={} max_fragment_clif_blocks={} max_fragment_clif_values={} max_fragment_clif_instructions={} max_fragment_block_parameters={} max_fragment_clif_loads={} max_fragment_clif_stores={} max_fragment_loads_per_source_instruction_milli={} max_fragment_stores_per_source_instruction_milli={} max_temporary_cache_entries={} fragment_frame_slots={} fragment_shared_register_slots={} fragment_scratch_register_slots={} pre_regalloc_replans={} fast_path_hits={} control_flow={} plan_ir_instructions={} plan_php_blocks={} plan_estimated_clif_blocks={} plan_virtual_values={} plan_safepoints={} plan_live_sum={} plan_fragments={} plan_max_fragment_blocks={} plan_max_fragment_instructions={} plan_max_fragment_estimated_clif_blocks={}",
                     request.compile.region_id,
                     function.raw(),
                     compiled.compilation_mode.as_str(),
@@ -1407,20 +1453,20 @@ fn compile_authoritative_region(request: &NativeCompileRequest<'_>) -> NativeCom
             if request.compile.opt_level >= 2
                 && error.code == "JIT_CRANELIFT_PRE_REGALLOC_BUDGET" =>
         {
-            let mut baseline_compile = request.compile.clone();
-            baseline_compile.opt_level = 0;
-            baseline_compile.region_id = format!("{}.baseline", baseline_compile.region_id);
-            let baseline_request = NativeCompileRequest {
-                compile: &baseline_compile,
+            let mut generic_compile = request.compile.clone();
+            generic_compile.opt_level = 0;
+            generic_compile.region_id = format!("{}.generic", generic_compile.region_id);
+            let generic_request = NativeCompileRequest {
+                compile: &generic_compile,
                 unit: request.unit,
                 function: request.function,
                 runtime_helpers: request.runtime_helpers,
             };
-            let mut outcome = compile_authoritative_region(&baseline_request);
+            let mut outcome = compile_authoritative_region(&generic_request);
             outcome.diagnostics.insert(
                 0,
                 format!(
-                    "optimizing compile exceeded its exact backend budget and used baseline code: {error}"
+                    "optimizing compile exceeded its exact backend budget and used Generic code: {error}"
                 ),
             );
             if outcome.handle.is_some() {
@@ -1438,7 +1484,7 @@ fn compile_authoritative_region(request: &NativeCompileRequest<'_>) -> NativeCom
                 reason: error.code.to_owned(),
             },
             format!(
-                "Cranelift baseline Region IR compile rejected region `{}`: {error}",
+                "Cranelift Generic Region IR compile rejected region `{}`: {error}",
                 request.compile.region_id
             ),
         ),
@@ -1637,7 +1683,7 @@ fn use_region_register(
         Some(NativeRegisterStorage::Transient { .. }) | None => Err(CraneliftLoweringError::new(
             "JIT_CRANELIFT_REJECT_MISSING_REGISTER",
             format!(
-                "register {} has no dominating baseline value or frame slot",
+                "register {} has no dominating Generic value or frame slot",
                 register.raw()
             ),
         )),
@@ -1752,9 +1798,9 @@ fn lower_suspension_runtime_view(builder: &mut FunctionBuilder<'_>, state: ir::V
 }
 
 /// Records one baseline-native function entry in the process-owned dense
-/// counter plane. This is emitted only by baseline function entry bodies:
+/// counter plane. This is emitted only by Generic function entry bodies:
 /// optimizing code contains neither a telemetry branch nor a runtime helper.
-fn lower_baseline_function_entry(
+fn lower_generic_function_entry(
     builder: &mut FunctionBuilder<'_>,
     deopt_out: ir::Value,
     function: FunctionId,
@@ -1765,7 +1811,7 @@ fn lower_baseline_function_entry(
         types::I64,
         MemFlagsData::new(),
         view,
-        std::mem::offset_of!(crate::JitNativeRuntimeView, baseline_function_entry_counts) as i32,
+        std::mem::offset_of!(crate::JitNativeRuntimeView, generic_function_entry_counts) as i32,
     );
     let counters = if pointer_type == types::I64 {
         counters
@@ -1779,7 +1825,7 @@ fn lower_baseline_function_entry(
         .ok_or_else(|| {
             CraneliftLoweringError::new(
                 "JIT_CRANELIFT_FUNCTION_ENTRY_COUNTER",
-                "baseline function-entry counter offset does not fit the native address space",
+                "Generic function-entry counter offset does not fit the native address space",
             )
         })?;
     let counter = builder.ins().iadd_imm(counters, byte_offset);
@@ -1802,7 +1848,7 @@ fn lower_baseline_function_entry(
 /// A failed check returns before the callee frame becomes live, and the caller
 /// releases the current contents of every packed slot on that status edge.
 #[allow(clippy::too_many_arguments)]
-fn lower_baseline_bind_packed_arguments(
+fn lower_generic_bind_packed_arguments(
     module: &mut JITModule,
     builder: &mut FunctionBuilder<'_>,
     argument_check: Option<NativeHelper>,
@@ -1938,7 +1984,7 @@ fn lower_baseline_bind_packed_arguments(
         builder.ins().brif(ok, admitted, &[], failed, &[]);
 
         builder.switch_to_block(failed);
-        builder.ins().return_(&[status]);
+        return_native_php_control(builder, status, result_out);
 
         builder.switch_to_block(admitted);
         // The source SSA/local owner remains live in the caller. The packed
@@ -2438,7 +2484,7 @@ fn require_native_operation_ok(
 fn allocate_native_frame_storage(
     module: &mut JITModule,
     builder: &mut FunctionBuilder<'_>,
-    operations: BaselineNativeOperations,
+    operations: GenericNativeOperations,
     bytes: u32,
     alignment_log2: u8,
     _result_out: ir::Value,
@@ -2494,7 +2540,7 @@ fn allocate_native_stack_storage(
 fn release_native_frame_storage(
     module: &mut JITModule,
     builder: &mut FunctionBuilder<'_>,
-    operations: BaselineNativeOperations,
+    operations: GenericNativeOperations,
     pointer: ir::Value,
     _result_out: ir::Value,
 ) -> Result<(), CraneliftLoweringError> {
@@ -2804,7 +2850,7 @@ fn capture_native_fiber_callee_if_suspended(
     let runtime_error = builder
         .ins()
         .iconst(types::I32, i64::from(crate::JitCallStatus::RUNTIME_ERROR.0));
-    builder.ins().return_(&[runtime_error]);
+    return_native_php_control(builder, runtime_error, result_out);
 
     builder.switch_to_block(available);
     let index_pointer = builder.ins().uextend(pointer_type, index);
@@ -2884,7 +2930,7 @@ fn begin_native_call_or_resume(
     builder
         .ins()
         .store(MemFlagsData::new(), value, result_out, 0);
-    builder.ins().return_(&[status]);
+    return_native_php_control(builder, status, result_out);
 
     builder.switch_to_block(invoke);
     completed
@@ -3060,7 +3106,7 @@ fn lower_native_value_operation(
 fn lower_native_return_check_with_frame_cleanup(
     module: &mut JITModule,
     builder: &mut FunctionBuilder<'_>,
-    native_operations: BaselineNativeOperations,
+    native_operations: GenericNativeOperations,
     function: FunctionId,
     local_count: u32,
     failure_continuation: u32,
@@ -3135,7 +3181,7 @@ fn lower_native_return_check_with_frame_cleanup(
     builder
         .ins()
         .store(MemFlagsData::new(), checked, result_out, 0);
-    builder.ins().return_(&[status]);
+    return_native_php_control(builder, status, result_out);
 
     builder.switch_to_block(admitted);
     if input_is_owned {
@@ -3229,7 +3275,7 @@ fn lower_native_value_operation_with_state(
     builder
         .ins()
         .store(MemFlagsData::new(), value, result_out, 0);
-    builder.ins().return_(&[status]);
+    return_native_php_control(builder, status, result_out);
     builder.switch_to_block(ok);
     Ok(value)
 }
@@ -3464,7 +3510,7 @@ fn lower_direct_reference_argument(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn lower_baseline_native_binary_operation(
+fn lower_generic_native_binary_operation(
     module: &mut JITModule,
     builder: &mut FunctionBuilder<'_>,
     helper: Option<NativeHelper>,
@@ -3524,7 +3570,7 @@ fn lower_baseline_native_binary_operation(
     builder
         .ins()
         .store(MemFlagsData::new(), value, result_out, 0);
-    builder.ins().return_(&[status]);
+    return_native_php_control(builder, status, result_out);
     builder.switch_to_block(ok);
     Ok(value)
 }
@@ -3856,7 +3902,7 @@ impl NativeOptimizingTransition<'_> {
         builder
             .ins()
             .store(MemFlagsData::new(), value, self.result_out, 0);
-        builder.ins().return_(&[status]);
+        return_native_php_control(builder, status, self.result_out);
 
         let unreachable = builder.create_block();
         builder.switch_to_block(unreachable);
@@ -3871,8 +3917,8 @@ pub(super) struct EmittedOptimizingInstruction {
 }
 
 #[derive(Clone, Copy)]
-enum NativeBaselineArrayWriteFallback<'a> {
-    Baseline {
+enum NativeGenericArrayWriteFallback<'a> {
+    Generic {
         helper: Option<NativeHelper>,
         lifecycle: Option<NativeHelper>,
         operation: u32,
@@ -3890,14 +3936,14 @@ enum NativeBaselineArrayWriteFallback<'a> {
 fn lower_array_write_fallback(
     module: &mut JITModule,
     builder: &mut FunctionBuilder<'_>,
-    fallback: NativeBaselineArrayWriteFallback<'_>,
+    fallback: NativeGenericArrayWriteFallback<'_>,
     array: ir::Value,
     key: ir::Value,
     value: ir::Value,
     result_out: ir::Value,
     deopt_out: ir::Value,
 ) -> Result<ir::Value, CraneliftLoweringError> {
-    let NativeBaselineArrayWriteFallback::Baseline {
+    let NativeGenericArrayWriteFallback::Generic {
         helper,
         operation,
         function,
@@ -6554,7 +6600,7 @@ macro_rules! emit_total_exact_runtime_value {
         let abi_mismatch = $builder
             .ins()
             .iconst(types::I32, i64::from(crate::JitCallStatus::ABI_MISMATCH.0));
-        $builder.ins().return_(&[abi_mismatch]);
+        return_native_php_control($builder, abi_mismatch, $transition.result_out);
 
         $builder.switch_to_block(returned);
         Ok::<ir::Value, CraneliftLoweringError>(value)
@@ -6619,7 +6665,7 @@ macro_rules! emit_total_exact_scalar_value {
         let abi_mismatch = $builder
             .ins()
             .iconst(types::I32, i64::from(crate::JitCallStatus::ABI_MISMATCH.0));
-        $builder.ins().return_(&[abi_mismatch]);
+        return_native_php_control($builder, abi_mismatch, $transition.result_out);
         $builder.switch_to_block(returned);
         Ok::<ir::Value, CraneliftLoweringError>(value)
     }};
@@ -6682,7 +6728,7 @@ macro_rules! emit_total_exact_builtin_value {
         let abi_mismatch = $builder
             .ins()
             .iconst(types::I32, i64::from(crate::JitCallStatus::ABI_MISMATCH.0));
-        $builder.ins().return_(&[abi_mismatch]);
+        return_native_php_control($builder, abi_mismatch, $transition.result_out);
         $builder.switch_to_block(returned);
         Ok::<ir::Value, CraneliftLoweringError>(value)
     }};
@@ -6762,7 +6808,7 @@ macro_rules! emit_total_exact_owned_runtime_value {
         let abi_mismatch = $builder
             .ins()
             .iconst(types::I32, i64::from(crate::JitCallStatus::ABI_MISMATCH.0));
-        $builder.ins().return_(&[abi_mismatch]);
+        return_native_php_control($builder, abi_mismatch, $transition.result_out);
 
         $builder.switch_to_block(returned);
         Ok::<ir::Value, CraneliftLoweringError>(value)
@@ -17762,7 +17808,7 @@ fn lower_total_native_cow_array_dimension_reference(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn lower_baseline_array_fetch(
+fn lower_generic_array_fetch(
     module: &mut JITModule,
     builder: &mut FunctionBuilder<'_>,
     helper: Option<NativeHelper>,
@@ -17775,7 +17821,7 @@ fn lower_baseline_array_fetch(
     result_out: ir::Value,
     deopt_out: ir::Value,
 ) -> Result<ir::Value, CraneliftLoweringError> {
-    lower_baseline_array_fetch_inner(
+    lower_generic_array_fetch_inner(
         module,
         builder,
         helper,
@@ -17791,7 +17837,7 @@ fn lower_baseline_array_fetch(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn lower_baseline_array_fetch_inner(
+fn lower_generic_array_fetch_inner(
     module: &mut JITModule,
     builder: &mut FunctionBuilder<'_>,
     helper: Option<NativeHelper>,
@@ -18041,7 +18087,7 @@ fn lower_direct_foreach_next(
         builder
             .ins()
             .store(MemFlagsData::new(), value, result_out, 0);
-        builder.ins().return_(&[status]);
+        return_native_php_control(builder, status, result_out);
 
         builder.switch_to_block(invoke);
     }
@@ -18236,7 +18282,7 @@ fn lower_direct_foreach_next(
         builder
             .ins()
             .store(MemFlagsData::new(), value, result_out, 0);
-        builder.ins().return_(&[status]);
+        return_native_php_control(builder, status, result_out);
         builder.switch_to_block(ok);
     } else {
         require_native_operation_ok(builder, status, helper.terminal_exit()?)?;
@@ -18666,7 +18712,7 @@ fn lower_guarded_native_local_fetch(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn lower_baseline_by_value_array_operand(
+fn lower_generic_by_value_array_operand(
     module: &mut JITModule,
     builder: &mut FunctionBuilder<'_>,
     local_fetch: Option<NativeHelper>,
@@ -19370,7 +19416,7 @@ fn lower_optimizing_prepare_stable_callback(
 ) -> OptimizingPreparedCallback {
     let pointer_type = module.target_config().pointer_type();
     let caller_runtime_view = lower_active_runtime_view(builder, deopt_out);
-    let (preferred_entry, baseline_entry, linked_runtime_view) = match target.address {
+    let (preferred_entry, generic_entry, linked_runtime_view) = match target.address {
         OptimizingCompiledCallAddress::Local(function) => {
             let preferred_entries = builder.ins().load(
                 pointer_type,
@@ -19385,7 +19431,10 @@ fn lower_optimizing_prepare_stable_callback(
                 pointer_type,
                 MemFlagsData::new(),
                 caller_runtime_view,
-                std::mem::offset_of!(crate::JitNativeRuntimeView, trusted_function_entries) as i32,
+                std::mem::offset_of!(
+                    crate::JitNativeRuntimeView,
+                    trusted_generic_function_entries
+                ) as i32,
             );
             let entry_offset = i64::try_from(
                 function
@@ -19418,11 +19467,11 @@ fn lower_optimizing_prepare_stable_callback(
                 link,
                 std::mem::offset_of!(crate::JitNativeLinkedFunction, preferred_entry) as i32,
             );
-            let baseline_entry = builder.ins().load(
+            let generic_entry = builder.ins().load(
                 pointer_type,
                 MemFlagsData::new(),
                 link,
-                std::mem::offset_of!(crate::JitNativeLinkedFunction, baseline_entry) as i32,
+                std::mem::offset_of!(crate::JitNativeLinkedFunction, generic_entry) as i32,
             );
             let runtime_view = builder.ins().load(
                 pointer_type,
@@ -19430,7 +19479,7 @@ fn lower_optimizing_prepare_stable_callback(
                 link,
                 std::mem::offset_of!(crate::JitNativeLinkedFunction, runtime_view) as i32,
             );
-            (preferred_entry, baseline_entry, Some(runtime_view))
+            (preferred_entry, generic_entry, Some(runtime_view))
         }
     };
     OptimizingPreparedCallback {
@@ -19442,7 +19491,7 @@ fn lower_optimizing_prepare_stable_callback(
         baseline_address: builder.ins().atomic_load(
             pointer_type,
             MemFlagsData::new(),
-            baseline_entry,
+            generic_entry,
         ),
         linked_runtime_view,
         initial_resume_id: -1,
@@ -19622,7 +19671,10 @@ fn lower_optimizing_prepare_dynamic_callable(
         pointer_type,
         MemFlagsData::new(),
         runtime_view,
-        std::mem::offset_of!(crate::JitNativeRuntimeView, trusted_function_entries) as i32,
+        std::mem::offset_of!(
+            crate::JitNativeRuntimeView,
+            trusted_generic_function_entries
+        ) as i32,
     );
     let entry = builder.ins().iadd(baseline_entries, entry_offset);
     let address = builder
@@ -19811,16 +19863,9 @@ fn lower_optimizing_invoke_stable_callback(
     let native_call = builder.ins().call_indirect(
         signature,
         address,
-        &[
-            runtime,
-            packed,
-            callee_result_out,
-            deopt_out,
-            resume_id,
-            empty_resume_state,
-        ],
+        &[runtime, packed, deopt_out, resume_id, empty_resume_state],
     );
-    let status = builder.inst_results(native_call)[0];
+    let status = unpack_native_php_control(builder, native_call, callee_result_out);
     let status_dispatch = builder.create_block();
     let returned = builder.create_block();
     let propagate = builder.create_block();
@@ -19908,16 +19953,9 @@ fn lower_optimizing_invoke_stable_callback(
         let resumed = builder.ins().call_indirect(
             signature,
             address,
-            &[
-                runtime,
-                packed,
-                callee_result_out,
-                deopt_out,
-                resume_id,
-                deopt_out,
-            ],
+            &[runtime, packed, deopt_out, resume_id, deopt_out],
         );
-        let resumed_status = builder.inst_results(resumed)[0];
+        let resumed_status = unpack_native_php_control(builder, resumed, callee_result_out);
         builder
             .ins()
             .jump(status_dispatch, &[resumed_status.into()]);
@@ -19997,7 +20035,7 @@ fn lower_optimizing_invoke_stable_callback(
     )?;
     publish_native_register_values(builder, deopt_out, transition.live_values)?;
     publish_native_fiber_suspension_link(builder, deopt_out, suspension_link);
-    builder.ins().return_(&[propagated_status]);
+    return_native_php_control(builder, propagated_status, result_out);
 
     builder.switch_to_block(returned);
     let result = builder.ins().stack_load(types::I64, result_slot, 0);
@@ -20413,7 +20451,7 @@ fn lower_optimizing_commit_dynamic_call_arguments(
 
 /// Invoke one runtime-resolved same-unit function from a direct positional
 /// argument array. Callable publication supplies the exact fixed arity and
-/// baseline entry; no generic binder, operation ID, or Rust `Value` participates.
+/// Generic entry; no generic binder, operation ID, or Rust `Value` participates.
 #[allow(clippy::too_many_arguments)]
 fn lower_optimizing_invoke_dynamic_unpack(
     module: &mut JITModule,
@@ -20492,7 +20530,7 @@ fn lower_optimizing_prevalidate_consumed_dynamic_call_operands(
 }
 
 /// Execute one already packed dynamic callable frame through its immutable
-/// baseline entry. The special entry selector performs typed visible-argument
+/// Generic entry. The special entry selector performs typed visible-argument
 /// binding in place; generated cleanup therefore commits the current owner in
 /// every hidden and visible slot.
 #[allow(clippy::too_many_arguments)]
@@ -20541,16 +20579,9 @@ fn lower_optimizing_invoke_packed_dynamic(
     let call = builder.ins().call_indirect(
         signature,
         prepared.baseline_address,
-        &[
-            runtime,
-            packed,
-            callee_result_out,
-            deopt_out,
-            resume_id,
-            resume_state,
-        ],
+        &[runtime, packed, deopt_out, resume_id, resume_state],
     );
-    let status = builder.inst_results(call)[0];
+    let status = unpack_native_php_control(builder, call, callee_result_out);
     let returned = builder.create_block();
     let propagate = builder.create_block();
     builder.append_block_param(propagate, types::I32);
@@ -20589,7 +20620,7 @@ fn lower_optimizing_invoke_packed_dynamic(
     )?;
     publish_native_register_values(builder, deopt_out, transition.live_values)?;
     publish_native_fiber_suspension_link(builder, deopt_out, suspension_link);
-    builder.ins().return_(&[status]);
+    return_native_php_control(builder, status, result_out);
 
     builder.switch_to_block(returned);
     let result = builder.ins().stack_load(types::I64, result_slot, 0);
@@ -22841,7 +22872,7 @@ fn lower_optimizing_region_instruction(
                     builder
                         .ins()
                         .store(MemFlagsData::new(), value, result_out, 0);
-                    builder.ins().return_(&[status]);
+                    return_native_php_control(builder, status, result_out);
                 }
                 let unreachable = builder.create_block();
                 builder.switch_to_block(unreachable);
@@ -22880,7 +22911,7 @@ fn lower_optimizing_region_instruction(
                 let status = builder
                     .ins()
                     .iconst(types::I32, i64::from(crate::JitCallStatus::THROW.0));
-                builder.ins().return_(&[status]);
+                return_native_php_control(builder, status, result_out);
                 let unreachable = builder.create_block();
                 builder.switch_to_block(unreachable);
                 builder.seal_block(unreachable);
@@ -24810,14 +24841,7 @@ fn lower_optimizing_region_instruction(
                 let native_call = builder.ins().call_indirect(
                     signature,
                     address,
-                    &[
-                        runtime,
-                        arguments,
-                        callee_result_out,
-                        deopt_out,
-                        resume_id,
-                        resume_state,
-                    ],
+                    &[runtime, arguments, deopt_out, resume_id, resume_state],
                 );
                 let restore_trace_publication = |builder: &mut FunctionBuilder<'_>| {
                     if let Some(publication) = trace_publication {
@@ -24827,7 +24851,7 @@ fn lower_optimizing_region_instruction(
                         lower_optimizing_commit_owned_value(builder, array, transition);
                     }
                 };
-                let status = builder.inst_results(native_call)[0];
+                let status = unpack_native_php_control(builder, native_call, callee_result_out);
                 let status_dispatch = builder.create_block();
                 let returned = builder.create_block();
                 let propagate = builder.create_block();
@@ -24908,16 +24932,10 @@ fn lower_optimizing_region_instruction(
                     let resumed = builder.ins().call_indirect(
                         signature,
                         address,
-                        &[
-                            runtime,
-                            arguments,
-                            callee_result_out,
-                            deopt_out,
-                            resume_id,
-                            deopt_out,
-                        ],
+                        &[runtime, arguments, deopt_out, resume_id, deopt_out],
                     );
-                    let resumed_status = builder.inst_results(resumed)[0];
+                    let resumed_status =
+                        unpack_native_php_control(builder, resumed, callee_result_out);
                     builder
                         .ins()
                         .jump(status_dispatch, &[resumed_status.into()]);
@@ -25010,7 +25028,7 @@ fn lower_optimizing_region_instruction(
                 )?;
                 publish_native_register_values(builder, deopt_out, transition.live_values)?;
                 publish_native_fiber_suspension_link(builder, deopt_out, suspension_link);
-                builder.ins().return_(&[propagated_status]);
+                return_native_php_control(builder, propagated_status, result_out);
 
                 builder.switch_to_block(preserve_callee);
                 restore_trace_publication(builder);
@@ -25024,7 +25042,7 @@ fn lower_optimizing_region_instruction(
                         0,
                     );
                 }
-                builder.ins().return_(&[propagated_status]);
+                return_native_php_control(builder, propagated_status, result_out);
 
                 builder.switch_to_block(returned);
                 restore_trace_publication(builder);
@@ -28411,7 +28429,7 @@ fn lower_optimizing_region_instruction(
                 let abi_mismatch = builder
                     .ins()
                     .iconst(types::I32, i64::from(crate::JitCallStatus::ABI_MISMATCH.0));
-                builder.ins().return_(&[abi_mismatch]);
+                return_native_php_control(builder, abi_mismatch, result_out);
                 builder.switch_to_block(returned);
                 define_optimizing_call_result(
                     builder,
@@ -30191,7 +30209,7 @@ fn lower_optimizing_region_instruction(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn lower_baseline_region_instruction(
+fn lower_generic_region_instruction(
     module: &mut JITModule,
     builder: &mut FunctionBuilder<'_>,
     functions: &BTreeMap<FunctionId, FuncId>,
@@ -30200,7 +30218,7 @@ fn lower_baseline_region_instruction(
     external_function_signatures: &[crate::JitExternalFunctionSignature],
     native_call_helper: Option<NativeHelper>,
     native_dynamic_code_helper: Option<NativeHelper>,
-    native_operations: BaselineNativeOperations,
+    native_operations: GenericNativeOperations,
     direct_value_release_commit: Option<ir::FuncRef>,
     register_variables: &NativeRegisterMap,
     blocks: &BTreeMap<BlockId, ir::Block>,
@@ -30664,7 +30682,7 @@ fn lower_baseline_region_instruction(
                     deopt_out,
                 )?;
             }
-            let stored = lower_baseline_store_local_or_keep_globals_proxy(
+            let stored = lower_generic_store_local_or_keep_globals_proxy(
                 module,
                 builder,
                 native_operations.local_store,
@@ -31189,7 +31207,7 @@ fn lower_baseline_region_instruction(
             let lhs = lower_region_operand(builder, locals, registers, lhs_operand)?;
             let rhs = lower_region_operand(builder, locals, registers, rhs_operand)?;
             let cl_value = if native_operations.baseline_binary.is_some() {
-                lower_baseline_native_binary_operation(
+                lower_generic_native_binary_operation(
                     module,
                     builder,
                     native_operations.baseline_binary,
@@ -31244,7 +31262,7 @@ fn lower_baseline_region_instruction(
             let value = if let Some(value) = direct {
                 value
             } else if *op == RegionUnaryOp::Not {
-                let truthy = terminators::lower_baseline_unknown_condition(
+                let truthy = terminators::lower_generic_unknown_condition(
                     module,
                     builder,
                     native_operations.truthy.ok_or_else(|| {
@@ -32034,7 +32052,6 @@ fn lower_baseline_region_instruction(
                     .runtime
                     .expect("native call must carry request fast state"),
                 arguments,
-                callee_result_out,
                 deopt_out,
                 builder.ins().iconst(types::I32, -1),
                 builder.ins().iconst(pointer_type, 0),
@@ -32059,7 +32076,7 @@ fn lower_baseline_region_instruction(
                         .call_indirect(signature, address, &callee_call_args)
                 }
             };
-            let status = builder.inst_results(call)[0];
+            let status = unpack_native_php_control(builder, call, callee_result_out);
             let exception_routes = local_direct_target.filter(|target| {
                 function_params
                     .get(target)
@@ -32147,7 +32164,6 @@ fn lower_baseline_region_instruction(
                         .runtime
                         .expect("native call must carry request fast state"),
                     arguments,
-                    callee_result_out,
                     deopt_out,
                     resume_id,
                     deopt_out,
@@ -32168,7 +32184,7 @@ fn lower_baseline_region_instruction(
                         unreachable!("linked callees do not carry same-unit exception routes")
                     }
                 };
-                let resumed_status = builder.inst_results(resumed)[0];
+                let resumed_status = unpack_native_php_control(builder, resumed, callee_result_out);
                 builder
                     .ins()
                     .jump(status_dispatch, &[resumed_status.into()]);
@@ -32278,11 +32294,11 @@ fn lower_baseline_region_instruction(
                 transition_live_registers,
             )?;
             publish_native_fiber_suspension_link(builder, deopt_out, suspension_link);
-            builder.ins().return_(&[status]);
+            return_native_php_control(builder, status, result_out);
             builder.switch_to_block(preserve_callee);
             // Guard exits and other non-unwind statuses retain the callee's
             // precise continuation so native transitions can resume it.
-            builder.ins().return_(&[status]);
+            return_native_php_control(builder, status, result_out);
             builder.switch_to_block(ok);
             restore_native_call_trace(builder, trace_publication);
             if let Some((_, fast_view_pointer, _, previous_fast_view)) = linked_caller_runtime_view
@@ -32446,7 +32462,7 @@ fn lower_baseline_region_instruction(
                     builder
                         .ins()
                         .store(MemFlagsData::new(), value, result_out, 0);
-                    builder.ins().return_(&[status]);
+                    return_native_php_control(builder, status, result_out);
                 }
                 let unreachable = builder.create_block();
                 builder.switch_to_block(unreachable);
@@ -32496,7 +32512,7 @@ fn lower_baseline_region_instruction(
                 let status = builder
                     .ins()
                     .iconst(types::I32, i64::from(crate::JitCallStatus::THROW.0));
-                builder.ins().return_(&[status]);
+                return_native_php_control(builder, status, result_out);
                 let unreachable = builder.create_block();
                 builder.switch_to_block(unreachable);
                 builder.seal_block(unreachable);
@@ -32644,7 +32660,7 @@ fn lower_baseline_region_instruction(
             )?;
         }
         RegionInstructionKind::NewArray { dst } => {
-            let value = lower_baseline_direct_new_array(
+            let value = lower_generic_direct_new_array(
                 module,
                 builder,
                 native_operations.array_new,
@@ -32889,7 +32905,7 @@ fn lower_baseline_region_instruction(
                     result_out,
                 )?;
             } else {
-                value = lower_baseline_by_value_array_operand(
+                value = lower_generic_by_value_array_operand(
                     module,
                     builder,
                     native_operations.local_fetch,
@@ -32915,7 +32931,7 @@ fn lower_baseline_region_instruction(
                     false,
                     result_out,
                     deopt_out,
-                    NativeBaselineArrayWriteFallback::Baseline {
+                    NativeGenericArrayWriteFallback::Generic {
                         helper: native_operations.array_insert,
                         lifecycle: native_operations.value_release,
                         operation,
@@ -32939,7 +32955,7 @@ fn lower_baseline_region_instruction(
                     false,
                     result_out,
                     deopt_out,
-                    NativeBaselineArrayWriteFallback::Baseline {
+                    NativeGenericArrayWriteFallback::Generic {
                         helper: native_operations.array_insert,
                         lifecycle: native_operations.value_release,
                         operation,
@@ -32979,7 +32995,7 @@ fn lower_baseline_region_instruction(
                 lower_region_operand(builder, locals, registers, RegionOperand::Register(*array))?;
             let source_operand = *source;
             let source = lower_region_operand(builder, locals, registers, source_operand)?;
-            let source = lower_baseline_by_value_array_operand(
+            let source = lower_generic_by_value_array_operand(
                 module,
                 builder,
                 native_operations.local_fetch,
@@ -33047,7 +33063,7 @@ fn lower_baseline_region_instruction(
             let operation =
                 native_dim_operation(u32::from(quiet), function, instruction.continuation_id);
             let value = if *mode == php_ir::instruction::DimFetchMode::Read {
-                lower_baseline_array_fetch(
+                lower_generic_array_fetch(
                     module,
                     builder,
                     native_operations.array_fetch,
@@ -33149,7 +33165,7 @@ fn lower_baseline_region_instruction(
                 )?
             };
             let value = lower_region_operand(builder, locals, registers, value_operand)?;
-            let value = lower_baseline_by_value_array_operand(
+            let value = lower_generic_by_value_array_operand(
                 module,
                 builder,
                 native_operations.local_fetch,
@@ -33176,7 +33192,7 @@ fn lower_baseline_region_instruction(
                     false,
                     result_out,
                     deopt_out,
-                    NativeBaselineArrayWriteFallback::Baseline {
+                    NativeGenericArrayWriteFallback::Generic {
                         helper: if local_array_write {
                             native_operations.array_insert_local
                         } else {
@@ -33307,7 +33323,7 @@ fn lower_baseline_region_instruction(
                 )?
             };
             let value = lower_region_operand(builder, locals, registers, value_operand)?;
-            let value = lower_baseline_by_value_array_operand(
+            let value = lower_generic_by_value_array_operand(
                 module,
                 builder,
                 native_operations.local_fetch,
@@ -33331,7 +33347,7 @@ fn lower_baseline_region_instruction(
                     false,
                     result_out,
                     deopt_out,
-                    NativeBaselineArrayWriteFallback::Baseline {
+                    NativeGenericArrayWriteFallback::Generic {
                         helper: if local_array_write {
                             native_operations.array_insert_local
                         } else {
@@ -33440,7 +33456,7 @@ fn lower_baseline_region_instruction(
             }
             for key in keys {
                 let key = lower_array_key_operand(builder, locals, registers, constants, *key)?;
-                value = lower_baseline_array_fetch(
+                value = lower_generic_array_fetch(
                     module,
                     builder,
                     native_operations.array_fetch,
@@ -33485,7 +33501,7 @@ fn lower_baseline_region_instruction(
             }
             for key in keys {
                 let key = lower_array_key_operand(builder, locals, registers, constants, *key)?;
-                value = lower_baseline_array_fetch(
+                value = lower_generic_array_fetch(
                     module,
                     builder,
                     native_operations.array_fetch,
@@ -33570,7 +33586,7 @@ fn lower_baseline_region_instruction(
                     result_out,
                 )?;
             }
-            let stored = lower_baseline_store_local_or_keep_globals_proxy(
+            let stored = lower_generic_store_local_or_keep_globals_proxy(
                 module,
                 builder,
                 native_operations.local_store,
@@ -33670,7 +33686,7 @@ fn lower_baseline_region_instruction(
                 result_out,
                 deopt_out,
             )?;
-            let truthy = terminators::lower_baseline_unknown_condition(
+            let truthy = terminators::lower_generic_unknown_condition(
                 module,
                 builder,
                 native_operations.truthy.ok_or_else(|| {
@@ -33954,7 +33970,7 @@ fn lower_baseline_region_instruction(
                 .iconst(types::I32, i64::from(instruction.continuation_id));
             let call = call_native_helper(module, builder, helper, &[function_id, continuation_id]);
             let status = builder.inst_results(call)[0];
-            builder.ins().return_(&[status]);
+            return_native_php_control(builder, status, result_out);
             let unreachable = builder.create_block();
             builder.switch_to_block(unreachable);
             builder.seal_block(unreachable);
@@ -34161,7 +34177,7 @@ fn lower_native_suspension(
         std::mem::offset_of!(crate::JitDeoptState, delegation_handle) as i32,
     );
     let status_value = builder.ins().iconst(types::I32, i64::from(status.0));
-    builder.ins().return_(&[status_value]);
+    return_native_php_control(builder, status_value, result_out);
 
     let resume_block = *suspension_blocks
         .get(&instruction.continuation_id)
@@ -34201,7 +34217,7 @@ fn lower_native_suspension(
     builder
         .ins()
         .store(MemFlagsData::new(), resume_value, result_out, 0);
-    builder.ins().return_(&[resume_status]);
+    return_native_php_control(builder, resume_status, result_out);
     builder.switch_to_block(resume_ok);
     registers.clear();
     for (snapshot_slot, register) in register_ids.into_iter().enumerate() {
@@ -34556,7 +34572,7 @@ fn lower_direct_semantic_call(
         builder
             .ins()
             .store(MemFlagsData::new(), control_value, result_out, 0);
-        builder.ins().return_(&[status]);
+        return_native_php_control(builder, status, result_out);
     }
 
     builder.switch_to_block(ok);
@@ -34805,7 +34821,7 @@ fn lower_native_call_trampoline(
                     result_out,
                 )?);
                 if let Some((local, original)) = speculative_original_local {
-                    let flags_offset = base + 24;
+                    let flags_offset = base + 16;
                     speculative_local_bindings
                         .entry(local)
                         .and_modify(|(_, offsets)| offsets.push(flags_offset))
@@ -34819,37 +34835,30 @@ fn lower_native_call_trampoline(
                     .store(MemFlagsData::new(), payload, pointer, base);
                 continue;
             }
-            let tag = if lowered.is_some() { 3 } else { 0 };
-            let tag = builder.ins().iconst(types::I32, tag);
-            builder.ins().store(MemFlagsData::new(), tag, pointer, base);
-            let abi_flags = builder.ins().iconst(types::I32, 0);
             builder
                 .ins()
-                .store(MemFlagsData::new(), abi_flags, pointer, base + 4);
-            builder
-                .ins()
-                .store(MemFlagsData::new(), payload, pointer, base + 8);
+                .store(MemFlagsData::new(), payload, pointer, base);
             let name_hash = argument
                 .and_then(|argument| argument.name.as_deref())
                 .map_or(0, stable_call_symbol_hash);
             let name_hash = builder.ins().iconst(types::I64, name_hash as i64);
             builder
                 .ins()
-                .store(MemFlagsData::new(), name_hash, pointer, base + 16);
+                .store(MemFlagsData::new(), name_hash, pointer, base + 8);
             let flags = builder.ins().iconst(
                 types::I32,
                 i64::from(argument.map_or(0, native_argument_flags)),
             );
             builder
                 .ins()
-                .store(MemFlagsData::new(), flags, pointer, base + 24);
+                .store(MemFlagsData::new(), flags, pointer, base + 16);
             let source_slot = argument
                 .and_then(|argument| argument.by_ref_local)
                 .map_or(u32::MAX, LocalId::raw);
             let source_slot = builder.ins().iconst(types::I32, i64::from(source_slot));
             builder
                 .ins()
-                .store(MemFlagsData::new(), source_slot, pointer, base + 28);
+                .store(MemFlagsData::new(), source_slot, pointer, base + 20);
             let property_receiver = argument
                 .and_then(|argument| argument.by_ref_property.as_ref())
                 .map(|target| lower_ir_operand(builder, locals, registers, target.object))
@@ -34857,7 +34866,7 @@ fn lower_native_call_trampoline(
                 .unwrap_or_else(|| builder.ins().iconst(types::I64, 0));
             builder
                 .ins()
-                .store(MemFlagsData::new(), property_receiver, pointer, base + 32);
+                .store(MemFlagsData::new(), property_receiver, pointer, base + 24);
         }
         pointer
     };
@@ -34875,7 +34884,7 @@ fn lower_native_call_trampoline(
         }
         _ => 0,
     };
-    let local_slot_size = std::mem::size_of::<crate::JitAbiSlot>();
+    let local_slot_size = std::mem::size_of::<i64>();
     let local_slots_ptr = if published_local_count == 0 {
         builder.ins().iconst(pointer_type, 0)
     } else {
@@ -34891,16 +34900,10 @@ fn lower_native_call_trampoline(
         let pointer = allocate_native_stack_storage(builder, pointer_type, bytes, 3);
         for index in 0..published_local_count {
             let base = i32::try_from(index as usize * local_slot_size).unwrap_or(i32::MAX);
-            let tag = builder.ins().iconst(types::I32, 3);
-            builder.ins().store(MemFlagsData::new(), tag, pointer, base);
-            let flags = builder.ins().iconst(types::I32, 0);
-            builder
-                .ins()
-                .store(MemFlagsData::new(), flags, pointer, base + 4);
             let value = use_local_variable(builder, locals, LocalId::new(index))?;
             builder
                 .ins()
-                .store(MemFlagsData::new(), value, pointer, base + 8);
+                .store(MemFlagsData::new(), value, pointer, base);
         }
         pointer
     };
@@ -35088,7 +35091,7 @@ fn lower_native_call_trampoline(
         builder
             .ins()
             .store(MemFlagsData::new(), control_value, result_out, 0);
-        builder.ins().return_(&[status]);
+        return_native_php_control(builder, status, result_out);
     }
     builder.switch_to_block(ok);
     for (local, (original, flag_offsets)) in speculative_local_bindings {

@@ -13,7 +13,7 @@ fn reject_unpublished_optimizer_boundaries(
                 return Err(CraneliftLoweringError::new(
                     "JIT_CRANELIFT_REJECT_DYNAMIC_CODE_PUBLICATION",
                     format!(
-                        "dynamic-code continuation {} must enter the baseline tier before optimizing execution",
+                        "dynamic-code continuation {} must enter the Generic tier before optimizing execution",
                         instruction.continuation_id,
                     ),
                 ));

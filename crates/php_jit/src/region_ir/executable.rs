@@ -33,8 +33,8 @@ impl NativeCompileError {
 pub enum NativeCompilerTier {
     /// Exhaustive, non-speculative lowering without profile feedback.
     #[default]
-    Baseline,
-    /// Guarded transformations layered on top of the baseline graph.
+    Generic,
+    /// Guarded transformations layered on top of the Generic graph.
     Optimizing,
 }
 
@@ -1381,8 +1381,8 @@ impl RegionTerminator {
     }
 }
 
-/// Builds exhaustive baseline Region IR from authoritative PHP IR.
-pub struct BaselineRegionBuilder;
+/// Builds exhaustive Generic Region IR from authoritative PHP IR.
+pub struct GenericRegionBuilder;
 
 #[derive(Clone)]
 struct KnownClosure {
@@ -1553,7 +1553,7 @@ pub fn native_continuation_capacity_upper_bound(
     Some(capacity)
 }
 
-impl BaselineRegionBuilder {
+impl GenericRegionBuilder {
     pub fn build(
         unit: &IrUnit,
         function: FunctionId,
@@ -5940,7 +5940,7 @@ pub fn build_baseline_region(
     unit: &IrUnit,
     function: FunctionId,
 ) -> Result<RegionGraph, NativeCompileError> {
-    BaselineRegionBuilder::build(unit, function, &CompileMetadata::default())
+    GenericRegionBuilder::build(unit, function, &CompileMetadata::default())
 }
 
 fn declaration_metadata(unit: &IrUnit, function: FunctionId) -> RegionDeclarationMetadata {

@@ -11,13 +11,13 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use php_ir::{FunctionId, LocalId, RegId};
 
 /// Version for the C-compatible runtime ABI records.
-pub const JIT_RUNTIME_ABI_VERSION: u32 = 121;
+pub const JIT_RUNTIME_ABI_VERSION: u32 = 122;
 
 /// Stable ABI fingerprint for Cranelift ABI.
 ///
 /// This is updated only when a `repr(C)` boundary type changes layout or tag
 /// meaning. It is intentionally independent from Rust type names.
-pub const JIT_RUNTIME_ABI_HASH: u64 = 0xc725_19ae_0000_00aa;
+pub const JIT_RUNTIME_ABI_HASH: u64 = 0x7dc0_d4d1_0000_00ab;
 
 /// No stable length is published for this runtime value slot.
 pub const JIT_NATIVE_VALUE_VIEW_NONE: u32 = 0;
@@ -689,10 +689,19 @@ pub struct JitNativeReferenceArrayView {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct JitNativeLinkedFunction {
     pub preferred_entry: u64,
-    /// Pointer to the target unit's immutable baseline publication cell for
+    /// Pointer to the target unit's immutable Generic publication cell for
     /// exact typed binding or a preferred-entry side exit.
-    pub baseline_entry: u64,
+    pub generic_entry: u64,
     pub runtime_view: u64,
+    /// Process-live immutable native argument-binding plan. Persisted
+    /// artifacts carry only the plan identity/relocation, never this pointer.
+    pub binding_plan: u64,
+    /// Published lexical/class scope context required by the callee.
+    pub scope_context: u64,
+    /// Deployment generation validated before this live link was published.
+    pub generation: u64,
+    /// Stable signature identity paired with `binding_plan`.
+    pub signature_identity: u64,
     /// Opaque prepared allocation plan for the statically named target class.
     /// Global-function links and non-allocatable classes publish zero.
     pub prepared_class: u64,
@@ -778,30 +787,30 @@ pub struct JitNativeRuntimeView {
     pub trusted_class_plans: u64,
     pub trusted_class_plan_count: u32,
     pub trusted_class_plan_reserved: u32,
-    /// Dense process-owned baseline entry cells indexed by `FunctionId`.
-    pub trusted_function_entries: u64,
-    pub trusted_function_entry_count: u32,
-    pub trusted_function_entry_reserved: u32,
+    /// Dense process-owned Generic entry cells indexed by `FunctionId`.
+    pub trusted_generic_function_entries: u64,
+    pub trusted_generic_function_entry_count: u32,
+    pub trusted_generic_function_entry_reserved: u32,
     /// Always-published preferred entries for ordinary native calls.
-    /// Publication initializes each cell with the baseline entry and upgrades
-    /// it atomically when an optimizing entry becomes available. Rejected
-    /// optimizing callees resume through `trusted_function_entries`.
+    /// Publication initializes each cell with the Generic entry and upgrades
+    /// it atomically when an Optimizing entry becomes available. Optimizer
+    /// misses resume through `trusted_generic_function_entries`.
     pub trusted_preferred_function_entries: u64,
     pub trusted_preferred_function_entry_count: u32,
     pub trusted_preferred_function_entry_reserved: u32,
-    /// Process-owned baseline-entry counters indexed by `FunctionId`.
+    /// Process-owned Generic-entry counters indexed by `FunctionId`.
     ///
-    /// Baseline CLIF increments its own slot directly. Request completion
+    /// Generic CLIF increments its own slot directly. Request completion
     /// reads these counters to select genuinely hot functions for optimizing
     /// publication without a helper call or a tier-selection branch in
     /// generated optimizing code.
-    pub baseline_function_entry_counts: u64,
-    pub baseline_function_entry_count: u32,
-    pub baseline_function_entry_reserved: u32,
+    pub generic_function_entry_counts: u64,
+    pub generic_function_entry_count: u32,
+    pub generic_function_entry_reserved: u32,
     /// Exact cross-unit function targets indexed by immutable source-unit
-    /// linkage slots. Optimizing code reads the target cells and callee view
-    /// directly; unresolved names keep an empty record and take the caller's
-    /// one baseline continuation.
+    /// linkage slots. Generated code reads the target cells, binding plan, and
+    /// callee view directly; unresolved names keep an empty record and take
+    /// one cold resolution action.
     pub trusted_linked_functions: u64,
     pub trusted_linked_function_count: u32,
     pub trusted_linked_function_reserved: u32,
@@ -882,7 +891,7 @@ pub struct JitNativeRuntimeView {
 
 thread_local! {
     static ACTIVE_NATIVE_RUNTIME_VIEW: Cell<JitNativeRuntimeView> =
-        const { Cell::new(JitNativeRuntimeView { abi_version: 0, reserved: 0, direct_value_slots: 0, direct_value_next: 0, direct_value_free_head: 0, direct_value_reused_bytes: 0, direct_object_owners: 0, direct_array_states: 0, direct_array_entries: 0, direct_array_next: 0, direct_array_free_heads: 0, direct_array_reused_bytes: 0, direct_string_bytes: 0, direct_string_next: 0, direct_string_free_heads: 0, direct_string_reused_bytes: 0, active_call_arguments: 0, active_call_argument_count: 0, active_call_fixed_argument_count: 0, active_call_fixed_arguments: 0, active_call_tail_arguments: 0, trusted_globals_proxy: 0, trusted_request_local_function_offsets: 0, trusted_request_local_function_count: 0, trusted_request_local_reserved: 0, trusted_request_local_slots: 0, trusted_request_local_slot_count: 0, trusted_request_local_slot_reserved: 0, trusted_constant_views: 0, trusted_constant_view_count: 0, trusted_constant_view_reserved: 0, trusted_literal_slots: 0, trusted_literal_slot_count: 0, trusted_literal_slot_reserved: 0, trusted_constant_slots: 0, trusted_constant_slot_count: 0, trusted_constant_slot_reserved: 0, trusted_class_plans: 0, trusted_class_plan_count: 0, trusted_class_plan_reserved: 0, trusted_function_entries: 0, trusted_function_entry_count: 0, trusted_function_entry_reserved: 0, trusted_preferred_function_entries: 0, trusted_preferred_function_entry_count: 0, trusted_preferred_function_entry_reserved: 0, baseline_function_entry_counts: 0, baseline_function_entry_count: 0, baseline_function_entry_reserved: 0, trusted_linked_functions: 0, trusted_linked_function_count: 0, trusted_linked_function_reserved: 0, fiber_suspension_states: 0, fiber_suspension_next: 0, fiber_suspension_capacity: 0, fiber_execution_scope: 0, poll_counter: 0, root_mutation_pending: 0, trusted_property_function_offsets: 0, trusted_property_function_count: 0, trusted_property_reserved: 0, trusted_property_slots: 0, trusted_property_slot_count: 0, trusted_property_slot_reserved: 0, trusted_closure_plans: 0, trusted_closure_plan_count: 0, trusted_closure_plan_reserved: 0, trusted_exception_plans: 0, trusted_exception_plan_count: 0, trusted_exception_plan_reserved: 0, trusted_global_reference_slots: 0, trusted_global_reference_slot_count: 0, trusted_global_reference_slot_reserved: 0, trusted_static_local_slots: 0, trusted_static_local_slot_count: 0, trusted_static_local_slot_reserved: 0, static_property_slots: 0, static_property_slot_count: 0, static_property_slot_reserved: 0, trusted_static_property_slots: 0, trusted_static_property_slot_count: 0, trusted_static_property_slot_reserved: 0, trusted_instanceof_plans: 0, trusted_instanceof_plan_count: 0, trusted_instanceof_plan_reserved: 0, trusted_instanceof_entries: 0, trusted_instanceof_entry_count: 0, trusted_instanceof_entry_reserved: 0, trusted_exception_route_plans: 0, trusted_exception_route_plan_count: 0, trusted_exception_route_plan_reserved: 0, trusted_exception_route_entries: 0, trusted_exception_route_entry_count: 0, trusted_exception_route_entry_reserved: 0, error_reporting: 0 }) };
+        const { Cell::new(JitNativeRuntimeView { abi_version: 0, reserved: 0, direct_value_slots: 0, direct_value_next: 0, direct_value_free_head: 0, direct_value_reused_bytes: 0, direct_object_owners: 0, direct_array_states: 0, direct_array_entries: 0, direct_array_next: 0, direct_array_free_heads: 0, direct_array_reused_bytes: 0, direct_string_bytes: 0, direct_string_next: 0, direct_string_free_heads: 0, direct_string_reused_bytes: 0, active_call_arguments: 0, active_call_argument_count: 0, active_call_fixed_argument_count: 0, active_call_fixed_arguments: 0, active_call_tail_arguments: 0, trusted_globals_proxy: 0, trusted_request_local_function_offsets: 0, trusted_request_local_function_count: 0, trusted_request_local_reserved: 0, trusted_request_local_slots: 0, trusted_request_local_slot_count: 0, trusted_request_local_slot_reserved: 0, trusted_constant_views: 0, trusted_constant_view_count: 0, trusted_constant_view_reserved: 0, trusted_literal_slots: 0, trusted_literal_slot_count: 0, trusted_literal_slot_reserved: 0, trusted_constant_slots: 0, trusted_constant_slot_count: 0, trusted_constant_slot_reserved: 0, trusted_class_plans: 0, trusted_class_plan_count: 0, trusted_class_plan_reserved: 0, trusted_generic_function_entries: 0, trusted_generic_function_entry_count: 0, trusted_generic_function_entry_reserved: 0, trusted_preferred_function_entries: 0, trusted_preferred_function_entry_count: 0, trusted_preferred_function_entry_reserved: 0, generic_function_entry_counts: 0, generic_function_entry_count: 0, generic_function_entry_reserved: 0, trusted_linked_functions: 0, trusted_linked_function_count: 0, trusted_linked_function_reserved: 0, fiber_suspension_states: 0, fiber_suspension_next: 0, fiber_suspension_capacity: 0, fiber_execution_scope: 0, poll_counter: 0, root_mutation_pending: 0, trusted_property_function_offsets: 0, trusted_property_function_count: 0, trusted_property_reserved: 0, trusted_property_slots: 0, trusted_property_slot_count: 0, trusted_property_slot_reserved: 0, trusted_closure_plans: 0, trusted_closure_plan_count: 0, trusted_closure_plan_reserved: 0, trusted_exception_plans: 0, trusted_exception_plan_count: 0, trusted_exception_plan_reserved: 0, trusted_global_reference_slots: 0, trusted_global_reference_slot_count: 0, trusted_global_reference_slot_reserved: 0, trusted_static_local_slots: 0, trusted_static_local_slot_count: 0, trusted_static_local_slot_reserved: 0, static_property_slots: 0, static_property_slot_count: 0, static_property_slot_reserved: 0, trusted_static_property_slots: 0, trusted_static_property_slot_count: 0, trusted_static_property_slot_reserved: 0, trusted_instanceof_plans: 0, trusted_instanceof_plan_count: 0, trusted_instanceof_plan_reserved: 0, trusted_instanceof_entries: 0, trusted_instanceof_entry_count: 0, trusted_instanceof_entry_reserved: 0, trusted_exception_route_plans: 0, trusted_exception_route_plan_count: 0, trusted_exception_route_plan_reserved: 0, trusted_exception_route_entries: 0, trusted_exception_route_entry_count: 0, trusted_exception_route_entry_reserved: 0, error_reporting: 0 }) };
     // Standalone compiler tests may publish only the arena fields they
     // exercise. Production activation always supplies its request-owned head.
     static FALLBACK_DIRECT_VALUE_FREE_HEAD: Cell<u32> =
@@ -898,7 +907,7 @@ thread_local! {
 
 static EMPTY_NATIVE_FUNCTION_ENTRIES: [std::sync::atomic::AtomicUsize; 4_096] =
     [const { std::sync::atomic::AtomicUsize::new(0) }; 4_096];
-static EMPTY_BASELINE_FUNCTION_ENTRY_COUNTS: [std::sync::atomic::AtomicU64; 4_096] =
+static EMPTY_GENERIC_FUNCTION_ENTRY_COUNTS: [std::sync::atomic::AtomicU64; 4_096] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 4_096];
 static EMPTY_NATIVE_LITERAL_SLOTS: [JitNativeTrustedLiteralSlot; 1] =
     [JitNativeTrustedLiteralSlot {
@@ -908,8 +917,12 @@ static EMPTY_NATIVE_LITERAL_SLOTS: [JitNativeTrustedLiteralSlot; 1] =
     }];
 static EMPTY_NATIVE_LINKED_FUNCTIONS: [JitNativeLinkedFunction; 1] = [JitNativeLinkedFunction {
     preferred_entry: 0,
-    baseline_entry: 0,
+    generic_entry: 0,
     runtime_view: 0,
+    binding_plan: 0,
+    scope_context: 0,
+    generation: 0,
+    signature_identity: 0,
     prepared_class: 0,
 }];
 
@@ -931,11 +944,11 @@ pub fn activate_native_runtime_view(mut view: JitNativeRuntimeView) -> JitNative
         view.trusted_literal_slots = EMPTY_NATIVE_LITERAL_SLOTS.as_ptr() as usize as u64;
         view.trusted_literal_slot_count = 1;
     }
-    if view.baseline_function_entry_counts == 0 {
-        view.baseline_function_entry_counts =
-            EMPTY_BASELINE_FUNCTION_ENTRY_COUNTS.as_ptr() as usize as u64;
-        view.baseline_function_entry_count =
-            u32::try_from(EMPTY_BASELINE_FUNCTION_ENTRY_COUNTS.len()).unwrap_or(u32::MAX);
+    if view.generic_function_entry_counts == 0 {
+        view.generic_function_entry_counts =
+            EMPTY_GENERIC_FUNCTION_ENTRY_COUNTS.as_ptr() as usize as u64;
+        view.generic_function_entry_count =
+            u32::try_from(EMPTY_GENERIC_FUNCTION_ENTRY_COUNTS.len()).unwrap_or(u32::MAX);
     }
     if view.direct_value_free_head == 0 {
         FALLBACK_DIRECT_VALUE_FREE_HEAD.with(|head| {
@@ -1022,17 +1035,17 @@ pub(crate) fn current_native_runtime_view() -> JitNativeRuntimeView {
         view.trusted_literal_slot_count = 1;
     }
     let empty = EMPTY_NATIVE_FUNCTION_ENTRIES.as_ptr() as usize as u64;
-    if view.trusted_function_entries == 0 {
-        view.trusted_function_entries = empty;
+    if view.trusted_generic_function_entries == 0 {
+        view.trusted_generic_function_entries = empty;
     }
     if view.trusted_preferred_function_entries == 0 {
         view.trusted_preferred_function_entries = empty;
     }
-    if view.baseline_function_entry_counts == 0 {
-        view.baseline_function_entry_counts =
-            EMPTY_BASELINE_FUNCTION_ENTRY_COUNTS.as_ptr() as usize as u64;
-        view.baseline_function_entry_count =
-            u32::try_from(EMPTY_BASELINE_FUNCTION_ENTRY_COUNTS.len()).unwrap_or(u32::MAX);
+    if view.generic_function_entry_counts == 0 {
+        view.generic_function_entry_counts =
+            EMPTY_GENERIC_FUNCTION_ENTRY_COUNTS.as_ptr() as usize as u64;
+        view.generic_function_entry_count =
+            u32::try_from(EMPTY_GENERIC_FUNCTION_ENTRY_COUNTS.len()).unwrap_or(u32::MAX);
     }
     if view.trusted_linked_functions == 0 {
         view.trusted_linked_functions = EMPTY_NATIVE_LINKED_FUNCTIONS.as_ptr() as usize as u64;
@@ -1680,7 +1693,8 @@ impl JitNativeArgFlags {
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct JitNativeCallArgument {
-    pub value: JitAbiSlot,
+    /// Authoritative encoded native value or reference/lvalue handle.
+    pub value: i64,
     /// Stable symbol hash for a named argument, zero for positional arguments.
     pub name_hash: u64,
     pub flags: JitNativeArgFlags,
@@ -1725,9 +1739,9 @@ pub struct JitNativeCallFrame {
     pub temporary_count: u32,
     pub argument_count: u32,
     pub flags: u32,
-    /// Caller-owned `JitAbiSlot` table.
+    /// Caller-owned encoded-native-value (`i64`) table.
     pub local_slots: u64,
-    /// Caller-owned `JitAbiSlot` table.
+    /// Caller-owned encoded-native-value (`i64`) table.
     pub temporary_slots: u64,
     /// Caller-owned `JitNativeCallArgument` table.
     pub arguments: u64,
@@ -1785,6 +1799,21 @@ impl JitNativeCallFrame {
     /// names, unpack flags and by-reference bindings are known absent.
     pub const FLAG_COMPACT_ARGUMENTS: u32 = 1 << 4;
 }
+
+/// The sole ordinary generated PHP entry ABI.
+///
+/// Generic and Optimizing Cranelift entries both receive the request fast
+/// state, a contiguous table of authoritative encoded native arguments, and
+/// optional native transition state. They return `JitNativeControlResult` in
+/// registers. Persistent artifacts store symbolic identities and relocations,
+/// never values of this function-pointer type.
+pub type JitNativePhpEntry = unsafe extern "C" fn(
+    runtime: *mut std::ffi::c_void,
+    arguments: *const i64,
+    transition_out: *mut JitDeoptState,
+    resume_id: i32,
+    resume_state: *const JitDeoptState,
+) -> JitNativeControlResult;
 
 /// Dynamic call resolver/invoker. It may compile and retry a native entry, but
 /// it must never invoke a bytecode or IR interpreter.
@@ -2570,18 +2599,18 @@ mod tests {
         JIT_RUNTIME_ABI_HASH, JIT_RUNTIME_ABI_VERSION, JitCExit, JitCExitTag, JitCFrameView,
         JitCValue, JitCValueTag, JitCallStatus, JitDeoptState, JitFrameHandle, JitFrameView,
         JitNativeArgFlags, JitNativeCallArgument, JitNativeCallFrame, JitNativeCallKind,
-        JitNativeControlRecord, JitNativeDynamicCodeKind, JitNativeDynamicCodeRequest,
-        JitNativeExceptionHandler, JitNativeFiberState, JitNativeFrameHeader,
-        JitNativeGeneratorState, JitNativeIndirectionEntry, JitNativeLinkedFunction,
-        JitNativePcMetadata, JitNativePreparedCallableView, JitNativePreparedClosureView,
-        JitNativeRootEntry, JitNativeRuntimeView, JitNativeSuspensionGenerationPolicy,
-        JitNativeValueSlot, JitOpaqueHandle, JitOpaqueValueKind, JitSideExit, JitVmContextHandle,
-        SideExitReason,
+        JitNativeControlRecord, JitNativeControlResult, JitNativeDynamicCodeKind,
+        JitNativeDynamicCodeRequest, JitNativeExceptionHandler, JitNativeFiberState,
+        JitNativeFrameHeader, JitNativeGeneratorState, JitNativeIndirectionEntry,
+        JitNativeLinkedFunction, JitNativePcMetadata, JitNativePhpEntry,
+        JitNativePreparedCallableView, JitNativePreparedClosureView, JitNativeRootEntry,
+        JitNativeRuntimeView, JitNativeSuspensionGenerationPolicy, JitNativeValueSlot,
+        JitOpaqueHandle, JitOpaqueValueKind, JitSideExit, JitVmContextHandle, SideExitReason,
     };
 
     #[test]
     fn c_abi_layout_is_stable() {
-        assert_eq!(JIT_RUNTIME_ABI_VERSION, 121);
+        assert_eq!(JIT_RUNTIME_ABI_VERSION, 122);
         assert_ne!(JIT_RUNTIME_ABI_HASH, 0);
         assert_eq!(size_of::<JitOpaqueHandle>(), 8);
         assert_eq!(size_of::<JitCValueTag>(), 4);
@@ -2593,6 +2622,8 @@ mod tests {
         assert_eq!(size_of::<JitCExit>(), 48);
         assert_eq!(align_of::<JitCExit>(), 8);
         assert_eq!(align_of::<JitNativeCallArgument>(), 8);
+        assert_eq!(size_of::<JitNativeCallArgument>(), 32);
+        assert_eq!(size_of::<JitNativeControlResult>(), 16);
         assert_eq!(align_of::<JitNativeCallFrame>(), 8);
         assert_eq!(align_of::<JitNativeDynamicCodeRequest>(), 8);
         assert_eq!(align_of::<JitNativeControlRecord>(), 8);
@@ -2624,7 +2655,7 @@ mod tests {
             offset_of!(JitNativePreparedCallableView, implicit_this),
             offset_of!(JitNativePreparedClosureView, implicit_this)
         );
-        assert_eq!(size_of::<JitNativeLinkedFunction>(), 32);
+        assert_eq!(size_of::<JitNativeLinkedFunction>(), 64);
         assert_eq!(std::mem::offset_of!(JitNativeValueSlot, refcount), 0);
         assert_eq!(std::mem::offset_of!(JitNativeValueSlot, payload), 16);
         assert_eq!(std::mem::offset_of!(JitNativeValueSlot, aux), 24);
@@ -2641,11 +2672,11 @@ mod tests {
     #[test]
     fn deopt_state_canonicalizes_a_selected_linked_runtime_view() {
         let caller = JitNativeRuntimeView {
-            trusted_function_entries: 0x1110,
+            trusted_generic_function_entries: 0x1110,
             ..JitNativeRuntimeView::default()
         };
         let callee = Box::new(JitNativeRuntimeView {
-            trusted_function_entries: 0x2220,
+            trusted_generic_function_entries: 0x2220,
             ..JitNativeRuntimeView::default()
         });
         let mut state = JitDeoptState {
@@ -2654,10 +2685,13 @@ mod tests {
             ..JitDeoptState::default()
         };
 
-        assert_eq!(state.active_runtime_view().trusted_function_entries, 0x2220);
+        assert_eq!(
+            state.active_runtime_view().trusted_generic_function_entries,
+            0x2220
+        );
         state.canonicalize_runtime_view();
         assert_eq!(state.runtime_view_pointer, 0);
-        assert_eq!(state.runtime_view.trusted_function_entries, 0x2220);
+        assert_eq!(state.runtime_view.trusted_generic_function_entries, 0x2220);
     }
 
     #[test]
@@ -2726,11 +2760,13 @@ mod tests {
         assert_eq!(frame.target.kind, JitNativeCallKind::METHOD);
 
         let argument = JitNativeCallArgument {
+            value: -17,
             flags: JitNativeArgFlags::NAMED.union(JitNativeArgFlags::BY_REFERENCE),
             source_slot: 3,
             ..JitNativeCallArgument::default()
         };
         assert_ne!(argument.flags.0 & JitNativeArgFlags::NAMED.0, 0);
+        assert_eq!(argument.value, -17);
 
         let entry = JitNativeIndirectionEntry::new(7);
         assert_eq!(entry.function_id(), 7);
@@ -2741,6 +2777,34 @@ mod tests {
         entry.publish(2, 0x5678);
         assert_eq!(entry.resolve(1), None);
         assert_eq!(entry.resolve(2), Some(0x5678));
+    }
+
+    #[test]
+    fn generic_and_optimizing_entries_share_one_native_control_signature() {
+        unsafe extern "C" fn structural_entry(
+            _runtime: *mut std::ffi::c_void,
+            arguments: *const i64,
+            _transition_out: *mut JitDeoptState,
+            _resume_id: i32,
+            _resume_state: *const JitDeoptState,
+        ) -> JitNativeControlResult {
+            let value = if arguments.is_null() {
+                0
+            } else {
+                // SAFETY: the test supplies one live encoded argument.
+                unsafe { *arguments }
+            };
+            JitNativeControlResult::returning(value)
+        }
+
+        let generic: JitNativePhpEntry = structural_entry;
+        let optimizing: JitNativePhpEntry = structural_entry;
+        assert_eq!(generic as usize, optimizing as usize);
+        assert_eq!(size_of::<JitNativePhpEntry>(), size_of::<usize>());
+
+        let thrown = JitNativeControlResult::control(JitCallStatus::THROW, 0, 0x55);
+        assert_eq!(thrown.status, JitCallStatus::THROW);
+        assert_eq!(thrown.value, 0x55);
     }
 
     #[test]

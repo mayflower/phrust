@@ -2496,7 +2496,7 @@ fn native_builtin_is_subclass_of(
 
 fn native_builtin_caller_class(
     context: &NativeRequestColdState<'_>,
-    caller_locals: Option<(u32, &[php_jit::JitAbiSlot])>,
+    caller_locals: Option<(u32, &[i64])>,
 ) -> Option<String> {
     let function = caller_locals?.0;
     context.unit.classes.iter().find_map(|class| {

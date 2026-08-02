@@ -104,19 +104,20 @@ pub use abi::{
     JitNativeFiberState, JitNativeForeachEntry, JitNativeForeachView, JitNativeFrameHeader,
     JitNativeGeneratorState, JitNativeIndirectionEntry, JitNativeInstanceOfEntry,
     JitNativeInstanceOfPlan, JitNativeLinkedFunction, JitNativeNumericStringResult,
-    JitNativePcMetadata, JitNativePreparedCallableView, JitNativePreparedClassPlan,
-    JitNativePreparedClosureView, JitNativePreparedExceptionView, JitNativeReferenceArrayEntry,
-    JitNativeReferenceArrayView, JitNativeReferenceScalarView, JitNativeRequestLocalSlot,
-    JitNativeResumeInputKind, JitNativeRootEntry, JitNativeRootKind, JitNativeRuntimeView,
-    JitNativeRuntimeViewGuard, JitNativeStaticPropertySlot, JitNativeSuspendKind,
-    JitNativeSuspensionGenerationPolicy, JitNativeTransitionState, JitNativeTrustedConstantSlot,
-    JitNativeTrustedGlobalReferenceSlot, JitNativeTrustedLiteralSlot, JitNativeTrustedPropertySlot,
-    JitNativeTrustedStaticLocalSlot, JitNativeTrustedStaticPropertySlot, JitNativeValueSlot,
-    JitOpaqueHandle, JitOpaqueValueKind, JitRegionResult, JitRuntimeCallout,
-    JitRuntimeCalloutResult, JitSideExit, JitVmContextHandle, SideExitReason,
-    activate_native_runtime_view, jit_native_direct_array_cursor, jit_native_direct_array_flags,
-    jit_native_direct_string_capacity, jit_native_direct_string_reserved,
-    jit_native_instanceof_index, jit_native_object_property_view_is_published,
+    JitNativePcMetadata, JitNativePhpEntry, JitNativePreparedCallableView,
+    JitNativePreparedClassPlan, JitNativePreparedClosureView, JitNativePreparedExceptionView,
+    JitNativeReferenceArrayEntry, JitNativeReferenceArrayView, JitNativeReferenceScalarView,
+    JitNativeRequestLocalSlot, JitNativeResumeInputKind, JitNativeRootEntry, JitNativeRootKind,
+    JitNativeRuntimeView, JitNativeRuntimeViewGuard, JitNativeStaticPropertySlot,
+    JitNativeSuspendKind, JitNativeSuspensionGenerationPolicy, JitNativeTransitionState,
+    JitNativeTrustedConstantSlot, JitNativeTrustedGlobalReferenceSlot, JitNativeTrustedLiteralSlot,
+    JitNativeTrustedPropertySlot, JitNativeTrustedStaticLocalSlot,
+    JitNativeTrustedStaticPropertySlot, JitNativeValueSlot, JitOpaqueHandle, JitOpaqueValueKind,
+    JitRegionResult, JitRuntimeCallout, JitRuntimeCalloutResult, JitSideExit, JitVmContextHandle,
+    SideExitReason, activate_native_runtime_view, jit_native_direct_array_cursor,
+    jit_native_direct_array_flags, jit_native_direct_string_capacity,
+    jit_native_direct_string_reserved, jit_native_instanceof_index,
+    jit_native_object_property_view_is_published,
 };
 pub use backend::{NativeCompileOutcome, NativeCompileRequest, NativeCompilerApi};
 pub use code_manager::{
@@ -1323,7 +1324,7 @@ impl JitFunctionHandle {
                 address,
                 arity: function_image.arity,
                 abi_hash: JIT_RUNTIME_ABI_HASH,
-                kind: JitNativeEntryKind::PackedI64StatusOut,
+                kind: JitNativeEntryKind::NativeControl,
             }),
             code_bytes: function_image.code_len,
             helper_calls_per_invocation: 0,
@@ -1403,7 +1404,7 @@ impl JitFunctionHandle {
     /// Creates a status/out-pointer integer native-entry handle.
     #[must_use]
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn i64_status_out_native(
+    pub(crate) fn native_control_entry(
         id: u64,
         region_id: String,
         compiler: CraneliftCompilerIdentity,
@@ -1422,7 +1423,7 @@ impl JitFunctionHandle {
                 address,
                 arity,
                 abi_hash: JIT_RUNTIME_ABI_HASH,
-                kind: JitNativeEntryKind::PackedI64StatusOut,
+                kind: JitNativeEntryKind::NativeControl,
             }),
             code_bytes,
             helper_calls_per_invocation,
@@ -1609,7 +1610,7 @@ impl JitFunctionHandle {
             .iter()
             .find(|entry| entry.function == function)?;
         let mut native_entry = self.native_entry?;
-        if native_entry.kind != JitNativeEntryKind::PackedI64StatusOut {
+        if native_entry.kind != JitNativeEntryKind::NativeControl {
             return None;
         }
         native_entry.address = function_entry.address;
@@ -1802,7 +1803,7 @@ impl JitFunctionHandle {
                     function: state.function_id,
                     continuation: state.continuation_id,
                 })?;
-        if require_baseline && metadata.compiler_tier != region_ir::NativeCompilerTier::Baseline {
+        if require_baseline && metadata.compiler_tier != region_ir::NativeCompilerTier::Generic {
             return Err(JitInvokeError::NativeTransitionRequiresBaseline);
         }
         if state.control_reserved == JIT_NATIVE_CATCH_BIND_TRANSITION_DETAIL {
@@ -1918,7 +1919,7 @@ impl JitFunctionHandle {
         entry.address = function_entry.address;
         entry.arity = function_entry.arity;
         let args = vec![0_i64; usize::from(function_entry.arity)];
-        entry.invoke_i64_status_out_with_resume(
+        entry.invoke_native_control_with_resume(
             &args,
             transition.resume_id,
             std::ptr::from_ref(&remapped_state),
@@ -2350,7 +2351,7 @@ struct JitNativeEntry {
 enum JitNativeEntryKind {
     #[allow(dead_code)]
     I64Return,
-    PackedI64StatusOut,
+    NativeControl,
 }
 
 macro_rules! invoke_i64_return_entry {
@@ -2366,13 +2367,13 @@ impl JitNativeEntry {
     fn invoke_i64(self, args: &[i64]) -> Result<i64, JitInvokeError> {
         match self.kind {
             JitNativeEntryKind::I64Return => self.invoke_i64_return(args),
-            JitNativeEntryKind::PackedI64StatusOut => self.invoke_i64_status_out(args),
+            JitNativeEntryKind::NativeControl => self.invoke_native_control(args),
         }
     }
 
     fn invoke_i64_with_deopt(self, args: &[i64]) -> Result<JitI64InvokeOutcome, JitInvokeError> {
         match self.kind {
-            JitNativeEntryKind::PackedI64StatusOut => self.invoke_i64_status_out_with_deopt(args),
+            JitNativeEntryKind::NativeControl => self.invoke_native_control_with_deopt(args),
             JitNativeEntryKind::I64Return => self
                 .invoke_i64_return(args)
                 .map(JitI64InvokeOutcome::Returned),
@@ -2385,10 +2386,10 @@ impl JitNativeEntry {
         entry_id: u32,
         state: &JitDeoptState,
     ) -> Result<JitI64InvokeOutcome, JitInvokeError> {
-        if self.kind != JitNativeEntryKind::PackedI64StatusOut {
+        if self.kind != JitNativeEntryKind::NativeControl {
             return Err(JitInvokeError::MissingOsrEntry(entry_id));
         }
-        self.invoke_i64_status_out_with_resume(
+        self.invoke_native_control_with_resume(
             args,
             entry_id as i32,
             state as *const _,
@@ -2405,12 +2406,12 @@ impl JitNativeEntry {
         mut state: JitDeoptState,
         runtime: *mut std::ffi::c_void,
     ) -> Result<JitI64InvokeOutcome, JitInvokeError> {
-        if self.kind != JitNativeEntryKind::PackedI64StatusOut {
+        if self.kind != JitNativeEntryKind::NativeControl {
             return Err(JitInvokeError::MissingNativeEntry);
         }
         state.control_status = status;
         state.control_value = value;
-        self.invoke_i64_status_out_with_resume(
+        self.invoke_native_control_with_resume(
             args,
             native_handler_resume_id(block),
             &state as *const _,
@@ -2426,7 +2427,7 @@ impl JitNativeEntry {
         value: i64,
         runtime: *mut std::ffi::c_void,
     ) -> Result<JitI64InvokeOutcome, JitInvokeError> {
-        if self.kind != JitNativeEntryKind::PackedI64StatusOut {
+        if self.kind != JitNativeEntryKind::NativeControl {
             return Err(JitInvokeError::MissingSuspensionEntry(
                 state.continuation_id,
             ));
@@ -2438,7 +2439,7 @@ impl JitNativeEntry {
             JitCallStatus::CONTINUE
         };
         resumed.control_value = value;
-        self.invoke_i64_status_out_with_resume(
+        self.invoke_native_control_with_resume(
             args,
             native_suspension_resume_id(state.continuation_id),
             &resumed as *const _,
@@ -2512,8 +2513,8 @@ impl JitNativeEntry {
         Ok(value)
     }
 
-    fn invoke_i64_status_out(self, args: &[i64]) -> Result<i64, JitInvokeError> {
-        match self.invoke_i64_status_out_with_deopt(args)? {
+    fn invoke_native_control(self, args: &[i64]) -> Result<i64, JitInvokeError> {
+        match self.invoke_native_control_with_deopt(args)? {
             JitI64InvokeOutcome::Returned(value) => Ok(value),
             JitI64InvokeOutcome::SideExit { status, .. } => {
                 Err(JitInvokeError::NativeStatus(status))
@@ -2521,11 +2522,11 @@ impl JitNativeEntry {
         }
     }
 
-    fn invoke_i64_status_out_with_deopt(
+    fn invoke_native_control_with_deopt(
         self,
         args: &[i64],
     ) -> Result<JitI64InvokeOutcome, JitInvokeError> {
-        self.invoke_i64_status_out_with_resume(args, -1, std::ptr::null(), std::ptr::null_mut())
+        self.invoke_native_control_with_resume(args, -1, std::ptr::null(), std::ptr::null_mut())
     }
 
     fn invoke_i64_with_deopt_runtime(
@@ -2533,18 +2534,16 @@ impl JitNativeEntry {
         args: &[i64],
         runtime: *mut std::ffi::c_void,
     ) -> Result<JitI64InvokeOutcome, JitInvokeError> {
-        self.invoke_i64_status_out_with_resume(args, -1, std::ptr::null(), runtime)
+        self.invoke_native_control_with_resume(args, -1, std::ptr::null(), runtime)
     }
 
-    fn invoke_i64_status_out_with_resume(
+    fn invoke_native_control_with_resume(
         self,
         args: &[i64],
         resume_id: i32,
         resume_state: *const JitDeoptState,
         runtime: *mut std::ffi::c_void,
     ) -> Result<JitI64InvokeOutcome, JitInvokeError> {
-        let mut out = 0_i64;
-        let out_ptr = &mut out as *mut i64;
         // Normal native returns only use the request runtime view inside this
         // buffer. Do not clear the 256 local and 64 register slots for every
         // warm call; complete the sparse state only when native code actually
@@ -2552,38 +2551,24 @@ impl JitNativeEntry {
         let mut deopt = prepare_native_deopt_out(runtime);
         let deopt_ptr = deopt.as_mut_ptr();
         // SAFETY: Handles are created only after Cranelift defines the matching
-        // packed status/out signature. `args.as_ptr()` remains valid for the
+        // shared native-control signature. `args.as_ptr()` remains valid for the
         // synchronous native call, including the zero-length case where native
         // code performs no argument loads. The public method checks the ABI hash
         // and exact arity before reaching this call.
-        let status = unsafe {
-            let function: extern "C" fn(
-                *mut std::ffi::c_void,
-                *const i64,
-                *mut i64,
-                *mut JitDeoptState,
-                i32,
-                *const JitDeoptState,
-            ) -> i32 = mem::transmute(self.address);
-            function(
-                runtime,
-                args.as_ptr(),
-                out_ptr,
-                deopt_ptr,
-                resume_id,
-                resume_state,
-            )
+        let control = unsafe {
+            let function: JitNativePhpEntry = mem::transmute(self.address);
+            function(runtime, args.as_ptr(), deopt_ptr, resume_id, resume_state)
         };
-        if status == JitCallStatus::RETURN.0 as i32 {
-            Ok(JitI64InvokeOutcome::Returned(out))
+        if control.status == JitCallStatus::RETURN {
+            Ok(JitI64InvokeOutcome::Returned(control.value))
         } else {
             // SAFETY: the call initializes every slot selected by the masks.
             // The preparation initialized all scalar metadata; this fills the
             // complementary sparse slots before constructing the Rust value.
             let deopt = unsafe { complete_native_deopt_out(deopt) };
             Ok(JitI64InvokeOutcome::SideExit {
-                status,
-                value: out,
+                status: control.status.0 as i32,
+                value: control.value,
                 state: deopt,
             })
         }
@@ -2696,7 +2681,7 @@ pub enum JitInvokeError {
     IncompleteOsrState(u32),
     /// Requested baseline-native continuation is absent.
     MissingNativeTransition { function: u32, continuation: u32 },
-    /// The selected target is not a non-speculative baseline artifact.
+    /// The selected target is not a non-speculative Generic artifact.
     NativeTransitionRequiresBaseline,
     /// Guard state omits a local/register required by the continuation.
     IncompleteNativeTransition {

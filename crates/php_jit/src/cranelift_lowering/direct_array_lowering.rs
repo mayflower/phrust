@@ -5,7 +5,7 @@ fn baseline_local_is_globals_proxy(function_local_names: &[String], local: Local
 }
 
 #[allow(clippy::too_many_arguments)]
-fn lower_baseline_store_local_or_keep_globals_proxy(
+fn lower_generic_store_local_or_keep_globals_proxy(
     module: &mut JITModule,
     builder: &mut FunctionBuilder<'_>,
     helper: Option<NativeHelper>,
@@ -35,7 +35,7 @@ fn lower_baseline_store_local_or_keep_globals_proxy(
     )
 }
 
-fn lower_baseline_direct_new_array(
+fn lower_generic_direct_new_array(
     module: &mut JITModule,
     builder: &mut FunctionBuilder<'_>,
     helper: Option<NativeHelper>,
@@ -316,7 +316,7 @@ fn lower_direct_array_append(
     move_value: bool,
     result_out: ir::Value,
     deopt_out: ir::Value,
-    fallback: NativeBaselineArrayWriteFallback<'_>,
+    fallback: NativeGenericArrayWriteFallback<'_>,
 ) -> Result<ir::Value, CraneliftLoweringError> {
     let literal_value_borrowed = builder.ins().iconst(types::I8, 0);
     let pointer_type = builder.func.dfg.value_type(deopt_out);
@@ -824,7 +824,7 @@ fn lower_direct_array_insert(
     move_value: bool,
     result_out: ir::Value,
     deopt_out: ir::Value,
-    fallback: NativeBaselineArrayWriteFallback<'_>,
+    fallback: NativeGenericArrayWriteFallback<'_>,
 ) -> Result<ir::Value, CraneliftLoweringError> {
     if constant_string_key {
         return lower_array_write_fallback(
@@ -951,7 +951,7 @@ fn lower_direct_array_insert(
 
     builder.switch_to_block(replace);
     let literal_value_borrowed = builder.ins().iconst(types::I8, 0);
-    let NativeBaselineArrayWriteFallback::Baseline {
+    let NativeGenericArrayWriteFallback::Generic {
         lifecycle,
         operation,
         ..

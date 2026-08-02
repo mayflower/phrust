@@ -250,7 +250,7 @@ fn dynamic_optimizer_rejects_unpublished_global_reference_plans() {
     );
 
     let deployment = package.compiled.prepared_deployment_image();
-    deployment.native_function_entries[entry.index()]
+    deployment.generic_function_entries[entry.index()]
         .store(0x1000, std::sync::atomic::Ordering::Release);
     deployment.preferred_function_entries[entry.index()]
         .store(0x2000, std::sync::atomic::Ordering::Release);
@@ -3406,13 +3406,13 @@ fn native_request_pool_reuses_only_reset_worker_owned_buffers() {
 #[test]
 fn nested_native_activation_restores_the_outer_fast_state_view() {
     let outer_view = php_jit::JitNativeRuntimeView {
-        trusted_function_entries: 0x1110,
-        trusted_function_entry_count: 30,
+        trusted_generic_function_entries: 0x1110,
+        trusted_generic_function_entry_count: 30,
         ..php_jit::JitNativeRuntimeView::default()
     };
     let inner_view = php_jit::JitNativeRuntimeView {
-        trusted_function_entries: 0x2220,
-        trusted_function_entry_count: 64,
+        trusted_generic_function_entries: 0x2220,
+        trusted_generic_function_entry_count: 64,
         ..php_jit::JitNativeRuntimeView::default()
     };
     let outer_header = php_jit::JitNativeFastStateHeader {
@@ -3447,12 +3447,18 @@ fn nested_native_activation_restores_the_outer_fast_state_view() {
     drop(inner);
 
     assert_eq!(
-        fast_state.header.runtime_view.trusted_function_entries,
-        outer_view.trusted_function_entries
+        fast_state
+            .header
+            .runtime_view
+            .trusted_generic_function_entries,
+        outer_view.trusted_generic_function_entries
     );
     assert_eq!(
-        fast_state.header.runtime_view.trusted_function_entry_count,
-        outer_view.trusted_function_entry_count
+        fast_state
+            .header
+            .runtime_view
+            .trusted_generic_function_entry_count,
+        outer_view.trusted_generic_function_entry_count
     );
     assert_eq!(
         super::ACTIVE_BASELINE_CONTEXT

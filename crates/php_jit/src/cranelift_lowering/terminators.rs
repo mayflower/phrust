@@ -314,7 +314,7 @@ fn lower_region_condition(
     builder: &mut FunctionBuilder<'_>,
     locals: &NativeLocalMap,
     registers: &NativeRegisterMap,
-    native_operations: BaselineNativeOperations,
+    native_operations: GenericNativeOperations,
     deopt_out: ir::Value,
     condition: RegionOperand,
     constants: &[IrConstant],
@@ -339,7 +339,7 @@ fn lower_region_condition(
         _ => {}
     }
     if let Some(helper) = native_operations.truthy {
-        lower_baseline_unknown_condition(module, builder, helper, value, deopt_out)
+        lower_generic_unknown_condition(module, builder, helper, value, deopt_out)
     } else if builder.func.dfg.value_type(value) == types::I64 {
         Ok(builder.ins().icmp_imm(IntCC::NotEqual, value, 0))
     } else {
@@ -350,7 +350,7 @@ fn lower_region_condition(
 /// Resolve the stable null/bool/int lanes without crossing the runtime ABI.
 /// Runtime handles and opaque constant-pool handles retain the typed helper
 /// slow path.
-pub(super) fn lower_baseline_unknown_condition(
+pub(super) fn lower_generic_unknown_condition(
     module: &mut JITModule,
     builder: &mut FunctionBuilder<'_>,
     helper: NativeHelper,
@@ -388,7 +388,7 @@ pub(super) fn lower_region_terminator(
     pending_status: Variable,
     pending_value: Variable,
     module: &mut JITModule,
-    native_operations: BaselineNativeOperations,
+    native_operations: GenericNativeOperations,
     function: FunctionId,
     local_count: u32,
     continuation_id: u32,
@@ -808,7 +808,7 @@ pub(super) fn lower_optimizing_region_terminator(
             let status = builder
                 .ins()
                 .iconst(types::I32, i64::from(crate::JitCallStatus::RETURN.0));
-            builder.ins().return_(&[status]);
+            return_native_or_fragment_control(builder, status, result_out);
         }
         RegionTerminator::ReturnReference {
             local,
@@ -873,7 +873,7 @@ pub(super) fn lower_optimizing_region_terminator(
                 types::I32,
                 i64::from(crate::JitCallStatus::RETURN_REFERENCE.0),
             );
-            builder.ins().return_(&[status]);
+            return_native_or_fragment_control(builder, status, result_out);
         }
         RegionTerminator::Exit {
             value,
@@ -930,7 +930,7 @@ pub(super) fn lower_optimizing_region_terminator(
             let status = builder
                 .ins()
                 .iconst(types::I32, i64::from(crate::JitCallStatus::EXIT.0));
-            builder.ins().return_(&[status]);
+            return_native_or_fragment_control(builder, status, result_out);
         }
         RegionTerminator::Return {
             finally: Some(_), ..
@@ -960,7 +960,7 @@ fn lower_region_frame_exit(
     status: ir::Value,
     finally: Option<BlockId>,
     module: &mut JITModule,
-    native_operations: BaselineNativeOperations,
+    native_operations: GenericNativeOperations,
     value_flow: &ExecutableValueFlow,
     function: FunctionId,
 ) -> Result<(), CraneliftLoweringError> {
@@ -982,7 +982,7 @@ fn lower_region_frame_exit(
         builder
             .ins()
             .store(MemFlagsData::new(), value, result_out, 0);
-        builder.ins().return_(&[status]);
+        return_native_or_fragment_control(builder, status, result_out);
     }
     Ok(())
 }
@@ -992,7 +992,7 @@ pub(super) fn lower_owned_frame_locals(
     module: &mut JITModule,
     builder: &mut FunctionBuilder<'_>,
     locals: &NativeLocalMap,
-    native_operations: BaselineNativeOperations,
+    native_operations: GenericNativeOperations,
     value_flow: &ExecutableValueFlow,
     function: FunctionId,
     result_out: ir::Value,

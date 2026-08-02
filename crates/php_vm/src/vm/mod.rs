@@ -453,7 +453,7 @@ impl VmWorkerState {
             // once, before invocation; never publish baseline code under the
             // optimizing cache identity.
             let mut baseline_options = options.clone();
-            baseline_options.native_optimization = NativeOptimizationPolicy::Baseline;
+            baseline_options.native_optimization = NativeOptimizationPolicy::Generic;
             baseline_options.tiering.enabled = false;
             return self.compile_native_with_priority(
                 unit,
@@ -490,7 +490,7 @@ impl VmWorkerState {
         Ok(compiled)
     }
 
-    fn prepare_native_baseline_entry(
+    fn prepare_native_generic_entry(
         &self,
         unit: &CompiledUnit,
         function: php_ir::FunctionId,
@@ -499,7 +499,7 @@ impl VmWorkerState {
     ) -> Result<usize, String> {
         let deployment = unit.prepared_deployment_image();
         let baseline_cell = deployment
-            .native_function_entries
+            .generic_function_entries
             .get(function.index())
             .ok_or_else(|| {
                 format!(
@@ -533,17 +533,7 @@ impl VmWorkerState {
             return Ok(previous_address);
         }
         let mut baseline_options = options.clone();
-        baseline_options.native_optimization = match options.native_optimization {
-            NativeOptimizationPolicy::Optimizing
-                if options.tiering.enabled && !options.tiering.native_eager =>
-            {
-                NativeOptimizationPolicy::TieredBaseline
-            }
-            NativeOptimizationPolicy::Optimizing | NativeOptimizationPolicy::Baseline => {
-                NativeOptimizationPolicy::Baseline
-            }
-            NativeOptimizationPolicy::TieredBaseline => NativeOptimizationPolicy::TieredBaseline,
-        };
+        baseline_options.native_optimization = NativeOptimizationPolicy::Generic;
         baseline_options.tiering.enabled = false;
         let key = native_compile_cache_key(
             unit,
@@ -598,7 +588,7 @@ impl VmWorkerState {
             {
                 let callee_signatures =
                     linked_external_function_signatures(unit, callee, external_signatures);
-                self.prepare_native_baseline_entry(unit, callee, options, &callee_signatures)?;
+                self.prepare_native_generic_entry(unit, callee, options, &callee_signatures)?;
             }
         }
         if preferred
@@ -1241,12 +1231,7 @@ impl Vm {
         let deployment = unit.prepared_deployment_image();
         if self.options.native_optimization == NativeOptimizationPolicy::Optimizing {
             let mut baseline_options = self.options.clone();
-            baseline_options.native_optimization =
-                if self.options.tiering.enabled && !self.options.tiering.native_eager {
-                    NativeOptimizationPolicy::TieredBaseline
-                } else {
-                    NativeOptimizationPolicy::Baseline
-                };
+            baseline_options.native_optimization = NativeOptimizationPolicy::Generic;
             baseline_options.tiering.enabled = false;
             let Ok(baseline) =
                 self.worker_state
@@ -1257,7 +1242,7 @@ impl Vm {
             let Some(baseline_address) = baseline.native_entry_address() else {
                 return 0;
             };
-            if let Some(cell) = deployment.native_function_entries.get(entry.index()) {
+            if let Some(cell) = deployment.generic_function_entries.get(entry.index()) {
                 cell.store(baseline_address, std::sync::atomic::Ordering::Release);
             }
             let Ok(optimizing) =
@@ -1288,7 +1273,7 @@ impl Vm {
             let Some(address) = handle.native_entry_address() else {
                 return 0;
             };
-            if let Some(baseline) = deployment.native_function_entries.get(entry.index()) {
+            if let Some(baseline) = deployment.generic_function_entries.get(entry.index()) {
                 baseline.store(address, std::sync::atomic::Ordering::Release);
             }
             if let Some(preferred) = deployment.preferred_function_entries.get(entry.index())
@@ -1409,7 +1394,7 @@ impl Vm {
             external_signatures,
         ) {
             let mut baseline_options = self.options.clone();
-            baseline_options.native_optimization = NativeOptimizationPolicy::TieredBaseline;
+            baseline_options.native_optimization = NativeOptimizationPolicy::Generic;
             baseline_options.tiering.enabled = false;
             let mut result =
                 Vm::with_options_and_worker_state(baseline_options, self.worker_state.clone())

@@ -1,6 +1,6 @@
 use super::*;
 
-fn lower_baseline_dynamic_caller_frame(
+fn lower_generic_dynamic_caller_frame(
     builder: &mut FunctionBuilder<'_>,
     locals: &NativeLocalMap,
     pointer_type: ir::Type,
@@ -247,7 +247,7 @@ pub(super) fn lower_native_dynamic_code(
         3,
     ));
     let out_ptr = builder.ins().stack_addr(pointer_type, out_slot, 0);
-    let caller_frame = lower_baseline_dynamic_caller_frame(builder, locals, pointer_type)?;
+    let caller_frame = lower_generic_dynamic_caller_frame(builder, locals, pointer_type)?;
     builder.ins().store(
         MemFlagsData::new(),
         caller_frame,
@@ -276,7 +276,7 @@ pub(super) fn lower_native_dynamic_code(
     builder
         .ins()
         .store(MemFlagsData::new(), control_value, result_out, 0);
-    builder.ins().return_(&[status]);
+    return_native_or_fragment_control(builder, status, result_out);
     builder.switch_to_block(success);
     if !locals.is_empty() {
         reload_baseline_dynamic_caller_frame(builder, locals, caller_frame)?;
