@@ -70,7 +70,7 @@ diagnostic_helper!(
 diagnostic_helper!(
     jit_native_dynamic_code_diagnostic_abi => jit_native_dynamic_code_abi,
     "dynamic_code",
-    (_vm_context: u64, request: *mut php_jit::JitNativeDynamicCodeRequest, out: *mut php_jit::JitCallResult) -> i32
+    (_vm_context: u64, request: *mut php_jit::JitNativeDynamicCodeRequest, out: *mut php_jit::JitNativeDynamicUnitResolution) -> i32
 );
 
 diagnostic_helper!(

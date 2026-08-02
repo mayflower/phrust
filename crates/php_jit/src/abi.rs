@@ -11,13 +11,13 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use php_ir::{FunctionId, LocalId, RegId};
 
 /// Version for the C-compatible runtime ABI records.
-pub const JIT_RUNTIME_ABI_VERSION: u32 = 122;
+pub const JIT_RUNTIME_ABI_VERSION: u32 = 123;
 
 /// Stable ABI fingerprint for Cranelift ABI.
 ///
 /// This is updated only when a `repr(C)` boundary type changes layout or tag
 /// meaning. It is intentionally independent from Rust type names.
-pub const JIT_RUNTIME_ABI_HASH: u64 = 0x7dc0_d4d1_0000_00ab;
+pub const JIT_RUNTIME_ABI_HASH: u64 = 0x7dc0_d4d1_0000_00ac;
 
 /// No stable length is published for this runtime value slot.
 pub const JIT_NATIVE_VALUE_VIEW_NONE: u32 = 0;
@@ -1843,12 +1843,79 @@ impl JitNativeDynamicCodeKind {
     pub const EMIT_DIAGNOSTIC: Self = Self(10);
 }
 
+/// One request-local include/eval binding published by the cold resolver.
+///
+/// `reference` is the authoritative native lvalue installed in the dynamic
+/// unit. Generated epilogue code uses `caller_slot` to update only the caller
+/// local that was materialized for the dynamic boundary. The record lives in
+/// caller-owned stack storage and is never persisted with an artifact.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct JitNativeDynamicBinding {
+    pub caller_slot: u32,
+    pub flags: u32,
+    pub reference: i64,
+}
+
+impl JitNativeDynamicBinding {
+    /// The caller local already owns the same reference identity.
+    pub const PRESERVE_REFERENCE: u32 = 1;
+}
+
+/// Cold dynamic-unit resolution action.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct JitNativeDynamicUnitAction(pub u32);
+
+impl JitNativeDynamicUnitAction {
+    /// Resolution produced an immediate PHP-visible result without a unit
+    /// invocation, for example an include_once hit or failed `include`.
+    pub const COMPLETE: Self = Self(1);
+    /// A compiled unit and its publication records are ready for generated
+    /// invocation.
+    pub const INVOKE: Self = Self(2);
+    /// Resolution produced typed native control and no invocation is allowed.
+    pub const CONTROL: Self = Self(3);
+}
+
+/// Request-local result of resolving and publishing one dynamic PHP unit.
+///
+/// Entry fields point at live publication cells, never at executable code.
+/// Every pointer is request-local and is consumed synchronously by generated
+/// code; none is part of a persisted artifact or cache key.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct JitNativeDynamicUnitResolution {
+    pub abi_version: u32,
+    pub struct_size: u32,
+    pub action: JitNativeDynamicUnitAction,
+    pub flags: u32,
+    pub unit_identity: u64,
+    pub generic_entry_cell: u64,
+    pub preferred_entry_cell: u64,
+    pub runtime_view: u64,
+    pub include_binding_plan: u64,
+    pub include_binding_count: u32,
+    pub include_binding_capacity: u32,
+    pub export_generation: u64,
+    pub declaration_generation: u64,
+    pub control_status: JitCallStatus,
+    pub control_detail: u32,
+    pub control_value: i64,
+}
+
+impl JitNativeDynamicUnitResolution {
+    /// A null return from an included unit has PHP's implicit include value
+    /// `1`. Generated code applies this after the native call.
+    pub const IMPLICIT_INCLUDE_RETURN: u32 = 1;
+}
+
 /// Native compile/publication request for dynamic PHP code.
 ///
 /// Source values are tagged scalar values or opaque VM handles. The runtime
-/// resolves and validates them, compiles the complete unit, publishes all
-/// native entries, and only then invokes the requested entry. No instruction
-/// stream or opcode identity crosses this boundary.
+/// resolves and validates them, compiles the complete unit, and publishes all
+/// native entries. Generated code alone invokes a published PHP entry. No
+/// instruction stream or opcode identity crosses this boundary.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct JitNativeDynamicCodeRequest {
@@ -1892,14 +1959,12 @@ impl Default for JitNativeDynamicCodeRequest {
     }
 }
 
-/// Runtime dynamic compiler/invoker. Successful return means the requested
-/// PHP code ran through a published native entry. Compile errors use
-/// `RUNTIME_ERROR`; a missing compiler uses `COMPILE_REQUIRED` and may never
-/// execute the dynamic unit before native compilation succeeds.
+/// Runtime dynamic resolver/publisher. It may return a published entry-cell
+/// pair and runtime view, but it never invokes the PHP body.
 pub type JitNativeDynamicCodeTrampoline = unsafe extern "C" fn(
     vm_context: u64,
     request: *mut JitNativeDynamicCodeRequest,
-    out: *mut JitCallResult,
+    out: *mut JitNativeDynamicUnitResolution,
 ) -> i32;
 
 /// Generation-safe process-local indirection entry. Persisted code stores only
@@ -2599,18 +2664,19 @@ mod tests {
         JIT_RUNTIME_ABI_HASH, JIT_RUNTIME_ABI_VERSION, JitCExit, JitCExitTag, JitCFrameView,
         JitCValue, JitCValueTag, JitCallStatus, JitDeoptState, JitFrameHandle, JitFrameView,
         JitNativeArgFlags, JitNativeCallArgument, JitNativeCallFrame, JitNativeCallKind,
-        JitNativeControlRecord, JitNativeControlResult, JitNativeDynamicCodeKind,
-        JitNativeDynamicCodeRequest, JitNativeExceptionHandler, JitNativeFiberState,
-        JitNativeFrameHeader, JitNativeGeneratorState, JitNativeIndirectionEntry,
-        JitNativeLinkedFunction, JitNativePcMetadata, JitNativePhpEntry,
-        JitNativePreparedCallableView, JitNativePreparedClosureView, JitNativeRootEntry,
-        JitNativeRuntimeView, JitNativeSuspensionGenerationPolicy, JitNativeValueSlot,
-        JitOpaqueHandle, JitOpaqueValueKind, JitSideExit, JitVmContextHandle, SideExitReason,
+        JitNativeControlRecord, JitNativeControlResult, JitNativeDynamicBinding,
+        JitNativeDynamicCodeKind, JitNativeDynamicCodeRequest, JitNativeDynamicUnitResolution,
+        JitNativeExceptionHandler, JitNativeFiberState, JitNativeFrameHeader,
+        JitNativeGeneratorState, JitNativeIndirectionEntry, JitNativeLinkedFunction,
+        JitNativePcMetadata, JitNativePhpEntry, JitNativePreparedCallableView,
+        JitNativePreparedClosureView, JitNativeRootEntry, JitNativeRuntimeView,
+        JitNativeSuspensionGenerationPolicy, JitNativeValueSlot, JitOpaqueHandle,
+        JitOpaqueValueKind, JitSideExit, JitVmContextHandle, SideExitReason,
     };
 
     #[test]
     fn c_abi_layout_is_stable() {
-        assert_eq!(JIT_RUNTIME_ABI_VERSION, 122);
+        assert_eq!(JIT_RUNTIME_ABI_VERSION, 123);
         assert_ne!(JIT_RUNTIME_ABI_HASH, 0);
         assert_eq!(size_of::<JitOpaqueHandle>(), 8);
         assert_eq!(size_of::<JitCValueTag>(), 4);
@@ -2626,6 +2692,10 @@ mod tests {
         assert_eq!(size_of::<JitNativeControlResult>(), 16);
         assert_eq!(align_of::<JitNativeCallFrame>(), 8);
         assert_eq!(align_of::<JitNativeDynamicCodeRequest>(), 8);
+        assert_eq!(size_of::<JitNativeDynamicBinding>(), 16);
+        assert_eq!(align_of::<JitNativeDynamicBinding>(), 8);
+        assert_eq!(size_of::<JitNativeDynamicUnitResolution>(), 96);
+        assert_eq!(align_of::<JitNativeDynamicUnitResolution>(), 8);
         assert_eq!(align_of::<JitNativeControlRecord>(), 8);
         assert_eq!(align_of::<JitNativeExceptionHandler>(), 4);
         assert_eq!(align_of::<JitNativeFrameHeader>(), 8);

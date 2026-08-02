@@ -9444,7 +9444,7 @@ extern "C" fn test_native_dynamic_code(
     _runtime: *mut std::ffi::c_void,
     _vm_context: u64,
     request: *mut crate::JitNativeDynamicCodeRequest,
-    out: *mut crate::JitCallResult,
+    out: *mut crate::JitNativeDynamicUnitResolution,
 ) -> i32 {
     test_native_dynamic_code_with_counter(request, out, &NATIVE_DYNAMIC_EFFECTS)
 }
@@ -9453,7 +9453,7 @@ extern "C" fn test_optimizer_native_dynamic_code(
     _runtime: *mut std::ffi::c_void,
     _vm_context: u64,
     request: *mut crate::JitNativeDynamicCodeRequest,
-    out: *mut crate::JitCallResult,
+    out: *mut crate::JitNativeDynamicUnitResolution,
 ) -> i32 {
     test_native_dynamic_code_with_counter(request, out, &OPTIMIZER_DYNAMIC_EFFECTS)
 }
@@ -9462,14 +9462,70 @@ extern "C" fn test_nested_native_dynamic_code(
     _runtime: *mut std::ffi::c_void,
     _vm_context: u64,
     request: *mut crate::JitNativeDynamicCodeRequest,
-    out: *mut crate::JitCallResult,
+    out: *mut crate::JitNativeDynamicUnitResolution,
 ) -> i32 {
     test_native_dynamic_code_with_counter(request, out, &NESTED_NATIVE_DYNAMIC_EFFECTS)
 }
 
+static PUBLISHED_DYNAMIC_ENTRY: AtomicUsize = AtomicUsize::new(0);
+static PUBLISHED_DYNAMIC_VIEW: AtomicUsize = AtomicUsize::new(0);
+static GENERATED_DYNAMIC_ENTRY_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+extern "C" fn test_published_dynamic_entry(
+    runtime: *mut std::ffi::c_void,
+    _arguments: *const i64,
+    _transition_out: *mut crate::JitDeoptState,
+    _resume_id: i32,
+    _resume_state: *const crate::JitDeoptState,
+) -> crate::JitNativeControlResult {
+    // SAFETY: the generated caller passes its live fast-state header and has
+    // selected the resolver-published runtime view for this call.
+    let selected =
+        unsafe { (&*runtime.cast::<crate::JitNativeFastStateHeader>()).runtime_view_pointer };
+    if selected != PUBLISHED_DYNAMIC_VIEW.load(Ordering::SeqCst) as u64 {
+        return crate::JitNativeControlResult::control(crate::JitCallStatus::RUNTIME_ERROR, 0, 0);
+    }
+    GENERATED_DYNAMIC_ENTRY_CALLS.fetch_add(1, Ordering::SeqCst);
+    crate::JitNativeControlResult::returning(777)
+}
+
+extern "C" fn test_dynamic_unit_resolver(
+    _runtime: *mut std::ffi::c_void,
+    _vm_context: u64,
+    request: *mut crate::JitNativeDynamicCodeRequest,
+    out: *mut crate::JitNativeDynamicUnitResolution,
+) -> i32 {
+    if request.is_null() || out.is_null() {
+        return crate::JitCallStatus::RUNTIME_ERROR.0 as i32;
+    }
+    // SAFETY: generated code owns both records for this synchronous resolver
+    // transition. Preserve the caller-owned binding-plan storage fields.
+    unsafe {
+        let request = &*request;
+        if request.kind != crate::JitNativeDynamicCodeKind::REQUIRE_ONCE {
+            return crate::JitCallStatus::RUNTIME_ERROR.0 as i32;
+        }
+        let plan = (*out).include_binding_plan;
+        let capacity = (*out).include_binding_capacity;
+        out.write(crate::JitNativeDynamicUnitResolution {
+            abi_version: crate::JIT_RUNTIME_ABI_VERSION,
+            struct_size: std::mem::size_of::<crate::JitNativeDynamicUnitResolution>() as u32,
+            action: crate::JitNativeDynamicUnitAction::INVOKE,
+            unit_identity: 0x4459_4e41_4d49_4301,
+            generic_entry_cell: std::ptr::from_ref(&PUBLISHED_DYNAMIC_ENTRY) as usize as u64,
+            preferred_entry_cell: std::ptr::from_ref(&PUBLISHED_DYNAMIC_ENTRY) as usize as u64,
+            runtime_view: PUBLISHED_DYNAMIC_VIEW.load(Ordering::SeqCst) as u64,
+            include_binding_plan: plan,
+            include_binding_capacity: capacity,
+            ..crate::JitNativeDynamicUnitResolution::default()
+        });
+    }
+    crate::JitCallStatus::RETURN.0 as i32
+}
+
 fn test_native_dynamic_code_with_counter(
     request: *mut crate::JitNativeDynamicCodeRequest,
-    out: *mut crate::JitCallResult,
+    out: *mut crate::JitNativeDynamicUnitResolution,
     effects: &AtomicUsize,
 ) -> i32 {
     if request.is_null() || out.is_null() {
@@ -9496,14 +9552,14 @@ fn test_native_dynamic_code_with_counter(
     };
     // SAFETY: `out` is checked and caller-owned.
     unsafe {
-        out.write(crate::JitCallResult {
-            status: crate::JitCallStatus::RETURN,
-            detail: request.continuation_id,
-            value: crate::JitAbiSlot {
-                tag: 3,
-                flags: 0,
-                payload,
-            },
+        out.write(crate::JitNativeDynamicUnitResolution {
+            abi_version: crate::JIT_RUNTIME_ABI_VERSION,
+            struct_size: std::mem::size_of::<crate::JitNativeDynamicUnitResolution>() as u32,
+            action: crate::JitNativeDynamicUnitAction::COMPLETE,
+            control_status: crate::JitCallStatus::RETURN,
+            control_detail: request.continuation_id,
+            control_value: payload as i64,
+            ..crate::JitNativeDynamicUnitResolution::default()
         });
     }
     crate::JitCallStatus::RETURN.0 as i32
@@ -15559,7 +15615,61 @@ fn include_executes_only_after_native_dynamic_compiler_returns_entry_result() {
 }
 
 #[test]
-fn optimizing_include_is_rejected_before_entry_without_a_cold_helper() {
+fn generated_include_caller_invokes_resolver_published_entry_and_restores_view() {
+    let (unit, function) = scalar_native_include_fixture();
+    let mut backend = CraneliftNativeCompiler;
+    let outcome = backend.compile_region(&NativeCompileRequest {
+        compile: &JitCompileRequest::new("cl.region.generated-native-include"),
+        unit: Some(&unit),
+        function: Some(function),
+        runtime_helpers: crate::JitRuntimeHelperAddresses {
+            native_dynamic_code: test_dynamic_unit_resolver as *const () as usize,
+            ..crate::JitRuntimeHelperAddresses::default()
+        },
+    });
+    assert_eq!(outcome.status, JitCompileStatus::Compiled, "{outcome:?}");
+    let handle = outcome.handle.expect("native include should compile");
+    let caller_entry_counts = [AtomicUsize::new(0)];
+    let caller_view = crate::JitNativeRuntimeView {
+        abi_version: crate::JIT_RUNTIME_ABI_VERSION,
+        generic_function_entry_counts: caller_entry_counts.as_ptr() as usize as u64,
+        generic_function_entry_count: 1,
+        ..crate::JitNativeRuntimeView::default()
+    };
+    let callee_view = Box::new(crate::JitNativeRuntimeView {
+        abi_version: crate::JIT_RUNTIME_ABI_VERSION,
+        ..crate::JitNativeRuntimeView::default()
+    });
+    PUBLISHED_DYNAMIC_ENTRY.store(
+        test_published_dynamic_entry as *const () as usize,
+        Ordering::SeqCst,
+    );
+    PUBLISHED_DYNAMIC_VIEW.store(
+        std::ptr::from_ref(callee_view.as_ref()) as usize,
+        Ordering::SeqCst,
+    );
+    GENERATED_DYNAMIC_ENTRY_CALLS.store(0, Ordering::SeqCst);
+    let mut fast = crate::JitNativeFastStateHeader {
+        abi_version: crate::JIT_RUNTIME_ABI_VERSION,
+        flags: 0,
+        runtime_view_pointer: 0,
+        runtime_view: caller_view,
+    };
+    let returned = handle
+        .invoke_i64_with_deopt_runtime(
+            &[],
+            JIT_RUNTIME_ABI_HASH,
+            std::ptr::from_mut(&mut fast).cast(),
+        )
+        .expect("published dynamic entry executes");
+    assert_eq!(returned, crate::JitI64InvokeOutcome::Returned(777));
+    assert_eq!(GENERATED_DYNAMIC_ENTRY_CALLS.load(Ordering::SeqCst), 1);
+    assert_eq!(fast.runtime_view_pointer, 0);
+    assert_eq!(fast.runtime_view, caller_view);
+}
+
+#[test]
+fn optimizing_include_uses_one_generic_continuation_without_a_cold_helper() {
     let (unit, function) = scalar_native_include_fixture();
     let mut backend = CraneliftNativeCompiler;
     let outcome = backend.compile_region(&NativeCompileRequest {
@@ -15571,12 +15681,16 @@ fn optimizing_include_is_rejected_before_entry_without_a_cold_helper() {
             ..crate::JitRuntimeHelperAddresses::default()
         },
     });
-    assert!(matches!(
-        outcome.status,
-        JitCompileStatus::Rejected { ref reason }
-            if reason.starts_with("JIT_CRANELIFT_REJECT_")
-    ));
-    assert!(outcome.handle.is_none());
+    assert_eq!(outcome.status, JitCompileStatus::Compiled, "{outcome:?}");
+    let error = outcome
+        .handle
+        .expect("optimizing include should compile")
+        .invoke_i64(&[], JIT_RUNTIME_ABI_HASH)
+        .expect_err("standalone optimizing entry requests its Generic continuation");
+    assert_eq!(
+        error,
+        crate::JitInvokeError::NativeStatus(crate::JitCallStatus::RECOMPILE_REQUESTED.0 as i32,)
+    );
 }
 
 #[test]

@@ -22745,11 +22745,17 @@ fn lower_optimizing_region_instruction(
         RegionInstructionKind::NativeDynamicCode(RegionNativeDynamicCode::Include {
             dst, ..
         }) => {
-            let _ = dst;
-            return Err(CraneliftLoweringError::new(
-                "JIT_CRANELIFT_UNPUBLISHED_INCLUDE",
-                "include reached optimizing lowering",
-            ));
+            emitted_class = crate::JitProductionLoweringClass::CompiledNativeCall;
+            let status = builder.ins().iconst(
+                types::I32,
+                i64::from(crate::JitCallStatus::RECOMPILE_REQUESTED.0),
+            );
+            let detail = builder
+                .ins()
+                .iconst(types::I32, i64::from(instruction.continuation_id));
+            let value = builder.ins().iconst(types::I64, 0);
+            transition.emit_control(builder, status, detail, value)?;
+            define_region_register(builder, register_variables, registers, *dst, value)?;
         }
         RegionInstructionKind::NativeDynamicCode(RegionNativeDynamicCode::MakeClosure {
             dst,
@@ -22838,6 +22844,31 @@ fn lower_optimizing_region_instruction(
                 "exact prepared closure allocator was not declared",
             )?;
             define_region_register(builder, register_variables, registers, *dst, closure)?;
+        }
+        RegionInstructionKind::NativeDynamicCode(RegionNativeDynamicCode::Eval { dst, .. }) => {
+            emitted_class = crate::JitProductionLoweringClass::CompiledNativeCall;
+            let status = builder.ins().iconst(
+                types::I32,
+                i64::from(crate::JitCallStatus::RECOMPILE_REQUESTED.0),
+            );
+            let detail = builder
+                .ins()
+                .iconst(types::I32, i64::from(instruction.continuation_id));
+            let value = builder.ins().iconst(types::I64, 0);
+            transition.emit_control(builder, status, detail, value)?;
+            define_region_register(builder, register_variables, registers, *dst, value)?;
+        }
+        RegionInstructionKind::NativeDynamicCode(_) => {
+            emitted_class = crate::JitProductionLoweringClass::CompiledNativeCall;
+            let status = builder.ins().iconst(
+                types::I32,
+                i64::from(crate::JitCallStatus::RECOMPILE_REQUESTED.0),
+            );
+            let detail = builder
+                .ins()
+                .iconst(types::I32, i64::from(instruction.continuation_id));
+            let value = builder.ins().iconst(types::I64, 0);
+            transition.emit_control(builder, status, detail, value)?;
         }
         RegionInstructionKind::NativeControl(control) => match control {
             RegionNativeControl::EnterTry { .. } | RegionNativeControl::LeaveTry => {
@@ -32563,6 +32594,8 @@ fn lower_generic_region_instruction(
                 operation,
                 instruction,
                 result_out,
+                deopt_out,
+                native_operations,
                 function,
                 pointer_type,
             )?;

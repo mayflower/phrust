@@ -28,11 +28,6 @@ thread_local! {
         const { RefCell::new(None) };
 }
 
-enum NativeDynamicCodeOutcome {
-    Returned(i64),
-    Exit(i64),
-}
-
 enum NativeIncludeFailure {
     Resolution(String),
     Execution(NativeCallControl),
@@ -182,12 +177,141 @@ fn release_native_include_local_bindings(
     first_error.map_or(Ok(()), Err)
 }
 
-// SAFETY: audited native ABI pointer boundary; see the function-local safety notes.
-#[allow(unsafe_code)]
-fn execute_native_include(
+fn publish_native_dynamic_unit(
+    context: &mut NativeRequestColdState<'_>,
+    compiled: crate::compiled_unit::CompiledUnit,
+    request: &php_jit::JitNativeDynamicCodeRequest,
+    resolution: &mut php_jit::JitNativeDynamicUnitResolution,
+    implicit_include_return: bool,
+) -> Result<(), NativeIncludeFailure> {
+    for declaration in compiled
+        .unit()
+        .linked_entry_autoload_declarations
+        .iter()
+        .flatten()
+    {
+        if !native_external_class_exists(context, declaration) {
+            return Err(NativeIncludeFailure::Resolution(format!(
+                "dynamic unit requires generated autoload continuation for {declaration}"
+            )));
+        }
+    }
+    let bindings = prepare_native_include_local_bindings(context, &compiled, request)
+        .map_err(|error| NativeIncludeFailure::Execution(error.into()))?;
+    if bindings.len() > resolution.include_binding_capacity as usize
+        || (!bindings.is_empty() && resolution.include_binding_plan == 0)
+    {
+        let _ = release_native_include_local_bindings(context, &bindings);
+        return Err(NativeIncludeFailure::Execution(
+            "dynamic include binding plan exceeds caller storage".into(),
+        ));
+    }
+    let mut stabilized = bindings
+        .iter()
+        .map(|binding| binding.reference)
+        .collect::<Vec<_>>();
+    if let Err(error) = context.stabilize_owned_native_values_for_cross_unit(&mut stabilized) {
+        let _ = release_native_include_local_bindings(context, &bindings);
+        return Err(NativeIncludeFailure::Execution(error.into()));
+    }
+    debug_assert!(
+        bindings
+            .iter()
+            .zip(&stabilized)
+            .all(|(binding, value)| binding.reference == *value),
+        "dynamic-unit lvalue identities must remain stable"
+    );
+
+    let entry = compiled.unit().entry;
+    let exports = native_include_exports(&compiled);
+    let unit = match register_native_dynamic_unit(context, compiled, exports) {
+        Ok(unit) => unit,
+        Err(error) => {
+            let _ = release_native_include_local_bindings(context, &bindings);
+            return Err(NativeIncludeFailure::Execution(error.into()));
+        }
+    };
+    if let Err(error) = prepare_dynamic_native_entry(context, unit, entry) {
+        let _ = release_native_include_local_bindings(context, &bindings);
+        return Err(NativeIncludeFailure::Execution(error.into()));
+    }
+    let slots = bindings
+        .iter()
+        .map(|binding| (binding.name.clone(), binding.reference))
+        .collect::<Vec<_>>();
+    if let Err(error) = context.with_active_dynamic_unit(unit, Some(&slots), |_| ()) {
+        let _ = release_native_include_local_bindings(context, &bindings);
+        return Err(NativeIncludeFailure::Execution(error.into()));
+    }
+
+    let package = context.dynamic_units.get(unit).ok_or_else(|| {
+        NativeIncludeFailure::Execution("published dynamic unit is missing".into())
+    })?;
+    let deployment = package.compiled.prepared_deployment_image();
+    let generic = deployment
+        .generic_function_entries
+        .get(entry.index())
+        .ok_or_else(|| {
+            NativeIncludeFailure::Execution("dynamic Generic entry cell is missing".into())
+        })?;
+    let preferred = deployment
+        .preferred_function_entries
+        .get(entry.index())
+        .ok_or_else(|| {
+            NativeIncludeFailure::Execution("dynamic preferred entry cell is missing".into())
+        })?;
+    if generic.load(std::sync::atomic::Ordering::Acquire) == 0
+        || preferred.load(std::sync::atomic::Ordering::Acquire) == 0
+        || package.published_runtime_view.abi_version != php_jit::JIT_RUNTIME_ABI_VERSION
+    {
+        let _ = release_native_include_local_bindings(context, &bindings);
+        return Err(NativeIncludeFailure::Execution(
+            "dynamic unit publication is incomplete".into(),
+        ));
+    }
+
+    // SAFETY: generated code owns this synchronous stack plan and advertises
+    // one record of capacity for every caller local.
+    #[allow(unsafe_code)]
+    unsafe {
+        let records =
+            resolution.include_binding_plan as usize as *mut php_jit::JitNativeDynamicBinding;
+        for (index, binding) in bindings.iter().enumerate() {
+            records.add(index).write(php_jit::JitNativeDynamicBinding {
+                caller_slot: binding.caller.map_or(u32::MAX, |(slot, _)| {
+                    u32::try_from(slot).unwrap_or(u32::MAX)
+                }),
+                flags: binding.caller.map_or(0, |(_, preserve)| {
+                    u32::from(preserve) * php_jit::JitNativeDynamicBinding::PRESERVE_REFERENCE
+                }),
+                reference: binding.reference,
+            });
+        }
+    }
+    resolution.abi_version = php_jit::JIT_RUNTIME_ABI_VERSION;
+    resolution.struct_size =
+        u32::try_from(std::mem::size_of::<php_jit::JitNativeDynamicUnitResolution>())
+            .unwrap_or(u32::MAX);
+    resolution.action = php_jit::JitNativeDynamicUnitAction::INVOKE;
+    resolution.flags = u32::from(implicit_include_return)
+        * php_jit::JitNativeDynamicUnitResolution::IMPLICIT_INCLUDE_RETURN;
+    resolution.unit_identity = package.compiled.artifact_identity();
+    resolution.generic_entry_cell = std::ptr::from_ref(generic) as usize as u64;
+    resolution.preferred_entry_cell = std::ptr::from_ref(preferred) as usize as u64;
+    resolution.runtime_view =
+        std::ptr::from_ref(package.published_runtime_view.as_ref()) as usize as u64;
+    resolution.include_binding_count = u32::try_from(bindings.len()).unwrap_or(u32::MAX);
+    resolution.export_generation = context.external_signature_epoch;
+    resolution.declaration_generation = context.external_signature_epoch;
+    release_native_include_local_bindings(context, &bindings)
+        .map_err(|error| NativeIncludeFailure::Execution(error.into()))
+}
+
+fn resolve_native_include_unit(
     context: &mut NativeRequestColdState<'_>,
     request: &php_jit::JitNativeDynamicCodeRequest,
-) -> Result<NativeDynamicCodeOutcome, NativeIncludeFailure> {
+    resolution: &mut php_jit::JitNativeDynamicUnitResolution,
+) -> Result<(), NativeIncludeFailure> {
     let path = String::from_utf8_lossy(
         &native_string(
             context
@@ -214,27 +338,33 @@ fn execute_native_include(
         .get(request.caller_function_id as usize)
         .and_then(|function| context.unit.files.get(function.span.file.index()))
         .map(|file| std::path::PathBuf::from(&file.path));
-    let include_path = context.include_path.clone();
-    let cwd = context.cwd.clone();
     let resolved = if let Some(cache) = &cache {
-        cache
-            .resolve_with_include_path(
-                &loader,
-                including_file.as_deref(),
-                &path,
-                &include_path,
-                Some(&cwd),
-            )
-            .map_err(|error| NativeIncludeFailure::Resolution(error.to_string()))?
+        cache.resolve_with_include_path(
+            &loader,
+            including_file.as_deref(),
+            &path,
+            &context.include_path,
+            Some(&context.cwd),
+        )
     } else {
-        loader
-            .resolve_with_include_path(including_file.as_deref(), &path, &include_path, Some(&cwd))
-            .map_err(|error| NativeIncludeFailure::Resolution(error.to_string()))?
-    };
-    let once = request.kind == php_jit::JitNativeDynamicCodeKind::INCLUDE_ONCE
-        || request.kind == php_jit::JitNativeDynamicCodeKind::REQUIRE_ONCE;
+        loader.resolve_with_include_path(
+            including_file.as_deref(),
+            &path,
+            &context.include_path,
+            Some(&context.cwd),
+        )
+    }
+    .map_err(|error| NativeIncludeFailure::Resolution(error.to_string()))?;
+    let once = matches!(
+        request.kind,
+        php_jit::JitNativeDynamicCodeKind::INCLUDE_ONCE
+            | php_jit::JitNativeDynamicCodeKind::REQUIRE_ONCE
+    );
     if once && context.included_files.contains(&resolved.canonical_path) {
-        return Ok(NativeDynamicCodeOutcome::Returned(1));
+        resolution.action = php_jit::JitNativeDynamicUnitAction::COMPLETE;
+        resolution.control_status = php_jit::JitCallStatus::RETURN;
+        resolution.control_value = 1;
+        return Ok(());
     }
     let compiled = if let Some(cache) = &cache {
         cache
@@ -251,364 +381,52 @@ fn execute_native_include(
                 .unit,
         )
     };
-    if compiled
-        .unit()
-        .linked_entry_autoload_declarations
-        .iter()
-        .any(Option::is_some)
-    {
-        let source = context
-            .instruction_for_continuation(request.caller_function_id, request.continuation_id)
-            .ok_or_else(|| {
-                NativeIncludeFailure::Execution("native include call metadata is missing".into())
-            })?;
-        for declaration in compiled
-            .unit()
-            .linked_entry_autoload_declarations
-            .iter()
-            .flatten()
-        {
-            if native_external_class_exists(context, declaration) {
-                continue;
-            }
-            let normalized = normalize_class_name(declaration);
-            if !context.autoload_in_progress.insert(normalized.clone()) {
-                continue;
-            }
-            let result = invoke_registered_autoload_callbacks_until(
-                context,
-                declaration.as_bytes(),
-                &source,
-                |context| native_external_class_exists(context, declaration),
-            );
-            context.autoload_in_progress.remove(&normalized);
-            if let Err(error) = result {
-                return Err(NativeIncludeFailure::Execution(error.into()));
-            }
-        }
-    }
-    // PHP records every successfully resolved include target. A later
-    // include_once/require_once must therefore skip a file that was first
-    // loaded through plain include/require as well.
-    context
-        .included_files
-        .insert(resolved.canonical_path.clone());
-    let bindings = prepare_native_include_local_bindings(context, &compiled, request)
-        .map_err(|error| NativeIncludeFailure::Execution(error.into()))?;
-    let mut stabilized_bindings = bindings
-        .iter()
-        .map(|binding| binding.reference)
-        .collect::<Vec<_>>();
-    if let Err(error) =
-        context.stabilize_owned_native_values_for_cross_unit(&mut stabilized_bindings)
-    {
-        let _ = release_native_include_local_bindings(context, &bindings);
-        return Err(NativeIncludeFailure::Execution(error.into()));
-    }
-    debug_assert!(
-        bindings
-            .iter()
-            .zip(&stabilized_bindings)
-            .all(|(binding, stabilized)| binding.reference == *stabilized),
-        "include lvalue identities must remain stable across unit activation"
-    );
-    let exports = native_include_exports(&compiled);
-    let owner_unit = match register_native_dynamic_unit(context, (*compiled).clone(), exports) {
-        Ok(unit) => unit,
-        Err(error) => {
-            let _ = release_native_include_local_bindings(context, &bindings);
-            return Err(NativeIncludeFailure::Execution(error.into()));
-        }
-    };
-    if let Err(error) = prepare_dynamic_native_entry(context, owner_unit, compiled.unit().entry) {
-        let _ = release_native_include_local_bindings(context, &bindings);
-        return Err(NativeIncludeFailure::Execution(error.into()));
-    }
-    let implicit_return = native_include_uses_implicit_return(compiled.unit());
-    let binding_slots = bindings
-        .iter()
-        .map(|binding| (binding.name.clone(), binding.reference))
-        .collect::<Vec<_>>();
-    let active = context.with_active_dynamic_unit(
-        owner_unit,
-        Some(&binding_slots),
-        |context| -> Result<(NativeCallResult, Vec<(usize, i64)>), String> {
-            let result = match invoke_native_function(context, context.unit.entry, &[]) {
-                Ok(value)
-                    if implicit_return
-                        && context.native_encoded_value_kind(value)
-                            == Some(NativeEncodedValueKind::Null) =>
-                {
-                    context.release_if_live(value)?;
-                    Ok(1)
-                }
-                Ok(value) => Ok(context.transfer_external_return(value, owner_unit)?),
-                Err(NativeCallControl::Exit(value)) => Err(NativeCallControl::Exit(
-                    context.transfer_external_return(value, owner_unit)?,
-                )),
-                Err(NativeCallControl::Propagate { status, value }) => {
-                    Err(NativeCallControl::Propagate {
-                        status,
-                        value: context.transfer_external_return(value, owner_unit)?,
-                    })
-                }
-                Err(control) => Err(control),
-            };
-            let mut active_bindings = bindings
-                .iter()
-                .map(|binding| binding.reference)
-                .collect::<Vec<_>>();
-            context.stabilize_owned_native_values_for_cross_unit(&mut active_bindings)?;
-            let mut caller_values = Vec::new();
-            for binding in &bindings {
-                let Some((caller, preserve_reference)) = binding.caller else {
-                    continue;
-                };
-                let value = context
-                    .duplicate_active_entry_request_local(&binding.name, preserve_reference)?
-                    .ok_or_else(|| {
-                        format!(
-                            "native include local ${} has no authoritative value",
-                            binding.name
-                        )
-                    })?;
-                caller_values.push((caller, value));
-            }
-            Ok((result, caller_values))
-        },
-    );
-    let release_result = release_native_include_local_bindings(context, &bindings);
-    let (result, caller_values) = match active {
-        Ok(Ok(active)) => active,
-        Ok(Err(error)) | Err(error) => {
-            return Err(NativeIncludeFailure::Execution(error.into()));
-        }
-    };
-    if let Err(error) = release_result {
-        for (_, value) in caller_values {
-            let _ = context.release_if_live(value);
-        }
-        return Err(NativeIncludeFailure::Execution(error.into()));
-    }
-    if request.caller_frame != 0 {
-        let caller_frame = request.caller_frame as *mut i64;
-        for (index, value) in caller_values {
-            // SAFETY: this is the same live caller frame used to create the
-            // direct lvalue bindings above.
-            let previous = unsafe { caller_frame.add(index).read() };
-            unsafe { caller_frame.add(index).write(value) };
-            if let Err(error) = context.release_if_live(previous) {
-                return Err(NativeIncludeFailure::Execution(error.into()));
-            }
-        }
-    }
-    match result {
-        Ok(value) => Ok(NativeDynamicCodeOutcome::Returned(value)),
-        Err(NativeCallControl::Exit(value)) => Ok(NativeDynamicCodeOutcome::Exit(value)),
-        Err(control) => Err(NativeIncludeFailure::Execution(control)),
-    }
+    context.included_files.insert(resolved.canonical_path);
+    let implicit = native_include_uses_implicit_return(compiled.unit());
+    publish_native_dynamic_unit(context, (*compiled).clone(), request, resolution, implicit)
 }
 
-// SAFETY: audited native ABI pointer boundary; see the function-local safety notes.
-#[allow(unsafe_code)]
-fn execute_native_eval(
+fn resolve_native_eval_unit(
     context: &mut NativeRequestColdState<'_>,
     request: &php_jit::JitNativeDynamicCodeRequest,
-) -> Result<NativeDynamicCodeOutcome, String> {
-    let source = String::from_utf8_lossy(&native_string(
-        context.decode_baseline_value(request.source.payload as i64)?,
-    )?)
+    resolution: &mut php_jit::JitNativeDynamicUnitResolution,
+) -> Result<(), NativeIncludeFailure> {
+    let source = String::from_utf8_lossy(
+        &native_string(
+            context
+                .decode_baseline_value(request.source.payload as i64)
+                .map_err(|error| NativeIncludeFailure::Execution(error.into()))?,
+        )
+        .map_err(|error| NativeIncludeFailure::Execution(error.into()))?,
+    )
     .into_owned();
-    let compiler = context
-        .options
-        .include_compiler
-        .clone()
-        .ok_or_else(|| "E_PHP_VM_INCLUDE_COMPILER: eval compiler is unavailable".to_owned())?;
-    let (caller_locals, caller_file) = context
+    let compiler = context.options.include_compiler.clone().ok_or_else(|| {
+        NativeIncludeFailure::Resolution(
+            "E_PHP_VM_INCLUDE_COMPILER: eval compiler is unavailable".to_owned(),
+        )
+    })?;
+    let caller = context
         .unit
         .functions
         .get(request.caller_function_id as usize)
-        .map(|caller| (caller.locals.clone(), caller.span.file))
-        .ok_or_else(|| "native eval caller function is missing".to_owned())?;
-    let caller_instruction =
+        .ok_or_else(|| NativeIncludeFailure::Execution("native eval caller is missing".into()))?;
+    let instruction =
         context.instruction_for_continuation(request.caller_function_id, request.continuation_id);
-    let caller_line = caller_instruction
+    let line = instruction
         .as_ref()
         .map_or(1, |instruction| native_source_line(context, instruction));
-    let caller_file = caller_instruction
+    let file = instruction
         .as_ref()
         .map(|instruction| instruction.span.file)
-        .unwrap_or(caller_file);
-    let source_path = context.unit.files.get(caller_file.index()).map_or_else(
+        .unwrap_or(caller.span.file);
+    let path = context.unit.files.get(file.index()).map_or_else(
         || "<eval>".to_owned(),
-        |file| format!("{}({caller_line}) : eval()'d code", file.path),
+        |file| format!("{}({line}) : eval()'d code", file.path),
     );
     let compiled = compiler
-        .compile_eval(&source_path, &source)
-        .map_err(|error| error.to_string())?;
-    context.materialize_native_request_globals()?;
-    context.materialize_native_dynamic_constants()?;
-    let mut inherited_globals = std::mem::take(&mut context.baseline_values.inherited_globals);
-    if request.caller_frame != 0 {
-        let caller_frame = request.caller_frame as *const i64;
-        for (index, name) in caller_locals.iter().enumerate() {
-            // SAFETY: Generated code owns this synchronous caller-local frame.
-            let encoded = unsafe { caller_frame.add(index).read() };
-            let value = context.decode_baseline_value(encoded)?;
-            if matches!(value, Value::Uninitialized) {
-                continue;
-            }
-            match inherited_globals.get(name).cloned() {
-                Some(Value::Reference(reference)) => match value {
-                    Value::Reference(replacement) if reference.ptr_eq(&replacement) => {}
-                    Value::Reference(replacement) => {
-                        inherited_globals.insert(name.clone(), Value::Reference(replacement));
-                    }
-                    replacement => reference.set(replacement),
-                },
-                _ => {
-                    inherited_globals.insert(name.clone(), value);
-                }
-            }
-        }
-    }
-    BASELINE_INCLUDE_GLOBALS.with(|globals| {
-        globals.replace(Some(inherited_globals));
-    });
-    BASELINE_INCLUDE_CONSTANTS.with(|constants| {
-        constants.replace(Some(std::mem::take(
-            &mut context.baseline_values.cold_dynamic_constants,
-        )));
-    });
-    BASELINE_INCLUDE_INI.with(|ini| {
-        ini.replace(Some(std::mem::take(&mut context.ini_registry)));
-    });
-    BASELINE_INCLUDE_DEFAULT_TIMEZONE.with(|timezone| {
-        timezone.replace(Some(std::mem::take(&mut context.default_timezone)));
-    });
-    BASELINE_INCLUDE_HTTP_RESPONSE.with(|response| {
-        response.replace(Some(std::mem::take(&mut context.http_response)));
-    });
-    BASELINE_INCLUDE_FILES.with(|files| {
-        files.replace(Some(std::mem::take(&mut context.included_files)));
-    });
-    BASELINE_INCLUDE_MYSQL.with(|mysql| {
-        mysql.replace(Some(context.mysql_state.clone()));
-    });
-    BASELINE_INCLUDE_FILTER_INPUT_ARRAYS.with(|arrays| {
-        arrays.replace(Some(Rc::clone(
-            &context.baseline_values.filter_input_arrays,
-        )));
-    });
-    BASELINE_INCLUDE_FUNCTION_NAMES.with(|names| {
-        names.replace(Some(context.visible_include_function_names()));
-    });
-    let external_signatures = visible_external_function_signatures_for_unit(context, &compiled);
-    BASELINE_INCLUDE_SYMBOLS.with(|symbols| {
-        symbols.replace(Some(context.take_include_symbols()?));
-        Ok::<(), String>(())
-    })?;
-    BASELINE_INCLUDE_EXPORTS.with(|exports| {
-        exports.take();
-    });
-    let dynamic_unit = compiled.clone();
-    let nested_started_at = context
-        .options
-        .collect_counters
-        .then(std::time::Instant::now);
-    let result = super::super::Vm::with_options_and_worker_state(
-        context.options.clone(),
-        context.worker_state.clone(),
-    )
-    .execute_with_external_function_signatures(compiled, &external_signatures);
-    if let (Some(started_at), Some(counters)) = (nested_started_at, result.counters.as_deref()) {
-        context.merge_nested_runtime_counters(counters, started_at.elapsed());
-    }
-    let returned_globals =
-        BASELINE_INCLUDE_GLOBALS.with(|globals| globals.borrow_mut().take().unwrap_or_default());
-    context.baseline_values.cold_dynamic_constants = BASELINE_INCLUDE_CONSTANTS
-        .with(|constants| constants.borrow_mut().take().unwrap_or_default());
-    context.promote_cold_dynamic_constants()?;
-    context.prepare_trusted_constant_fetches();
-    if let Some(returned_ini) = BASELINE_INCLUDE_INI.with(|ini| ini.borrow_mut().take()) {
-        context.ini_registry = returned_ini;
-    }
-    if let Some(returned_timezone) =
-        BASELINE_INCLUDE_DEFAULT_TIMEZONE.with(|timezone| timezone.borrow_mut().take())
-    {
-        context.default_timezone = returned_timezone;
-    }
-    if let Some(returned_response) =
-        BASELINE_INCLUDE_HTTP_RESPONSE.with(|response| response.borrow_mut().take())
-    {
-        context.http_response = returned_response;
-    }
-    if let Some(returned_files) = BASELINE_INCLUDE_FILES.with(|files| files.borrow_mut().take()) {
-        context.included_files = returned_files;
-    }
-    if let Some(returned_mysql) = BASELINE_INCLUDE_MYSQL.with(|mysql| mysql.borrow_mut().take()) {
-        context.mysql_state = returned_mysql;
-    }
-    let returned_symbols =
-        BASELINE_INCLUDE_SYMBOLS.with(|symbols| symbols.borrow_mut().take().unwrap_or_default());
-    context.restore_include_symbols(returned_symbols)?;
-    let exports = BASELINE_INCLUDE_EXPORTS.with(|exports| exports.borrow_mut().take());
-    context.baseline_values.inherited_globals = returned_globals;
-    context.reconcile_trusted_global_references()?;
-    if request.caller_frame != 0 {
-        let caller_frame = request.caller_frame as *mut i64;
-        for (index, name) in caller_locals.iter().enumerate() {
-            let Some(value) = context.baseline_values.inherited_globals.get(name).cloned() else {
-                continue;
-            };
-            let encoded = context.encode_baseline_value(value)?;
-            // SAFETY: This is the same synchronous caller-local frame read above.
-            unsafe { caller_frame.add(index).write(encoded) };
-        }
-    }
-    context.output.write_bytes(result.output.as_bytes());
-    if let Some(exit_code) = result.process_exit_code {
-        let value = context.encode_baseline_value(Value::Int(i64::from(exit_code)))?;
-        return Ok(NativeDynamicCodeOutcome::Exit(value));
-    }
-    if !result.status.is_success() {
-        context.diagnostic = result.diagnostics.into_iter().next();
-        return Err(format!("evaluated native entry failed: {}", result.status));
-    }
-    let declaration_line = dynamic_unit
-        .unit()
-        .classes
-        .iter()
-        .filter(|class| class.span.file.index() < dynamic_unit.unit().files.len())
-        .filter_map(|class| dynamic_unit.source_display_line(class.span, false))
-        .min()
-        .unwrap_or(1);
-    let owner_unit = match exports {
-        Some(exports) => match register_native_dynamic_unit(context, dynamic_unit, exports) {
-            Ok(unit) => Some(unit),
-            Err(error) => {
-                context.output.write_bytes(format!(
-                    "\nFatal error: {error} in {source_path} on line {declaration_line}\n"
-                ));
-                context.diagnostic = Some(php_runtime::api::RuntimeDiagnostic::new(
-                    "E_PHP_EVAL_DECLARATION",
-                    php_runtime::api::RuntimeSeverity::FatalError,
-                    error.clone(),
-                    php_runtime::api::RuntimeSourceSpan::default(),
-                    Vec::new(),
-                    None,
-                ));
-                return Err(error);
-            }
-        },
-        None => None,
-    };
-    context
-        .encode_baseline_value(native_value_with_owner_unit(
-            result.return_value.unwrap_or(Value::Null),
-            owner_unit,
-        ))
-        .map(NativeDynamicCodeOutcome::Returned)
+        .compile_eval(&path, &source)
+        .map_err(|error| NativeIncludeFailure::Resolution(error.to_string()))?;
+    publish_native_dynamic_unit(context, compiled, request, resolution, false)
 }
 
 fn finish_native_dynamic_call_control(
@@ -711,41 +529,15 @@ fn render_native_include_failure(
     Err(fatal)
 }
 
-fn invoke_native_include(
-    runtime: *mut NativeRequestFastState,
-    request: &php_jit::JitNativeDynamicCodeRequest,
-) -> (php_jit::JitCallStatus, Option<i64>) {
-    with_baseline_native_context_for(runtime, "include", |context| {
-        match execute_native_include(context, request) {
-            Ok(NativeDynamicCodeOutcome::Returned(value)) => {
-                (php_jit::JitCallStatus::RETURN, Some(value))
-            }
-            Ok(NativeDynamicCodeOutcome::Exit(value)) => {
-                (php_jit::JitCallStatus::EXIT, Some(value))
-            }
-            Err(NativeIncludeFailure::Execution(control)) => {
-                finish_native_dynamic_call_control(context, control)
-            }
-            Err(NativeIncludeFailure::Resolution(message)) => {
-                match render_native_include_failure(context, request, &message) {
-                    Ok(value) => (php_jit::JitCallStatus::RETURN, Some(value)),
-                    Err(_) => (php_jit::JitCallStatus::RUNTIME_ERROR, None),
-                }
-            }
-        }
-    })
-    .unwrap_or((php_jit::JitCallStatus::RUNTIME_ERROR, None))
-}
-
-/// Native dynamic-code compiler boundary. Includes are resolved, compiled to
-/// Cranelift entries, published, and invoked without entering an interpreter.
+/// Native dynamic-code publication boundary. Includes and eval units are
+/// resolved, compiled, and published here; generated code invokes the entry.
 // SAFETY: audited native ABI pointer boundary; see the function-local safety notes.
 #[allow(unsafe_code)]
 pub(in crate::vm) extern "C" fn jit_native_dynamic_code_abi(
     runtime: *mut NativeRequestFastState,
     _vm_context: u64,
     request: *mut php_jit::JitNativeDynamicCodeRequest,
-    out: *mut php_jit::JitCallResult,
+    out: *mut php_jit::JitNativeDynamicUnitResolution,
 ) -> i32 {
     if request.is_null() || out.is_null() {
         return php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32;
@@ -754,8 +546,9 @@ pub(in crate::vm) extern "C" fn jit_native_dynamic_code_abi(
         context.mark_roots_dirty(RootMutationReason::GlobalOrStatic);
     });
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        // SAFETY: Generated code owns this request for the synchronous call.
+        // SAFETY: Generated code owns these records for the synchronous call.
         let request = unsafe { &*request };
+        let resolution = unsafe { &mut *out };
         if request.abi_version != php_jit::JIT_RUNTIME_ABI_VERSION
             || request.struct_size as usize
                 != std::mem::size_of::<php_jit::JitNativeDynamicCodeRequest>()
@@ -768,18 +561,36 @@ pub(in crate::vm) extern "C" fn jit_native_dynamic_code_abi(
                 | php_jit::JitNativeDynamicCodeKind::REQUIRE
                 | php_jit::JitNativeDynamicCodeKind::REQUIRE_ONCE
         ) {
-            invoke_native_include(runtime, request)
+            with_baseline_native_context_for(runtime, "dynamic_unit_resolve", |context| {
+                match resolve_native_include_unit(context, request, resolution) {
+                    Ok(()) => (php_jit::JitCallStatus::RETURN, None),
+                    Err(NativeIncludeFailure::Execution(control)) => {
+                        finish_native_dynamic_call_control(context, control)
+                    }
+                    Err(NativeIncludeFailure::Resolution(message)) => {
+                        match render_native_include_failure(context, request, &message) {
+                            Ok(value) => {
+                                resolution.action =
+                                    php_jit::JitNativeDynamicUnitAction::COMPLETE;
+                                (php_jit::JitCallStatus::RETURN, Some(value))
+                            }
+                            Err(_) => (php_jit::JitCallStatus::RUNTIME_ERROR, None),
+                        }
+                    }
+                }
+            })
+            .unwrap_or((php_jit::JitCallStatus::RUNTIME_ERROR, None))
         } else if request.kind == php_jit::JitNativeDynamicCodeKind::EVAL {
-            with_baseline_native_context_for(runtime, "dynamic_code", |context| match execute_native_eval(context, request) {
-                Ok(NativeDynamicCodeOutcome::Returned(value)) => {
-                    (php_jit::JitCallStatus::RETURN, Some(value))
-                }
-                Ok(NativeDynamicCodeOutcome::Exit(value)) => {
-                    (php_jit::JitCallStatus::EXIT, Some(value))
-                }
-                Err(message) => {
-                    publish_native_call_diagnostic(context, message);
-                    (php_jit::JitCallStatus::RUNTIME_ERROR, None)
+            with_baseline_native_context_for(runtime, "dynamic_unit_resolve", |context| {
+                match resolve_native_eval_unit(context, request, resolution) {
+                    Ok(()) => (php_jit::JitCallStatus::RETURN, None),
+                    Err(NativeIncludeFailure::Execution(control)) => {
+                        finish_native_dynamic_call_control(context, control)
+                    }
+                    Err(NativeIncludeFailure::Resolution(message)) => {
+                        publish_native_call_diagnostic(context, message);
+                        (php_jit::JitCallStatus::RUNTIME_ERROR, None)
+                    }
                 }
             })
             .unwrap_or((php_jit::JitCallStatus::RUNTIME_ERROR, None))
@@ -1153,17 +964,22 @@ pub(in crate::vm) extern "C" fn jit_native_dynamic_code_abi(
     }))
     .unwrap_or((php_jit::JitCallStatus::RUNTIME_ERROR, None));
     let (status, value) = outcome;
-    // SAFETY: `out` is a checked caller-owned result record.
-    unsafe {
-        out.write(php_jit::JitCallResult {
-            status,
-            detail: status.0,
-            value: value.map_or_else(php_jit::JitAbiSlot::default, |value| php_jit::JitAbiSlot {
-                tag: 3,
-                flags: 0,
-                payload: value as u64,
-            }),
-        });
+    // Include/eval resolution writes INVOKE itself. Other exact publication
+    // operations complete synchronously without executing a PHP body.
+    let resolution = unsafe { &mut *out };
+    resolution.abi_version = php_jit::JIT_RUNTIME_ABI_VERSION;
+    resolution.struct_size =
+        u32::try_from(std::mem::size_of::<php_jit::JitNativeDynamicUnitResolution>())
+            .unwrap_or(u32::MAX);
+    if resolution.action != php_jit::JitNativeDynamicUnitAction::INVOKE {
+        resolution.action = if status == php_jit::JitCallStatus::RETURN {
+            php_jit::JitNativeDynamicUnitAction::COMPLETE
+        } else {
+            php_jit::JitNativeDynamicUnitAction::CONTROL
+        };
+        resolution.control_status = status;
+        resolution.control_detail = status.0;
+        resolution.control_value = value.unwrap_or_default();
     }
     status.0 as i32
 }

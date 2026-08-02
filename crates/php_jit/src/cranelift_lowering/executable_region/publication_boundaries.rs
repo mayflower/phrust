@@ -3,17 +3,6 @@ fn reject_unpublished_optimizer_boundaries(
 ) -> Result<(), CraneliftLoweringError> {
     for instruction in region.blocks.iter().flat_map(|block| &block.instructions) {
         match &instruction.kind {
-            RegionInstructionKind::NativeDynamicCode(RegionNativeDynamicCode::Include {
-                ..
-            }) => {
-                return Err(CraneliftLoweringError::new(
-                    "JIT_CRANELIFT_REJECT_DYNAMIC_CODE_PUBLICATION",
-                    format!(
-                        "dynamic-code continuation {} must enter the Generic tier before optimizing execution",
-                        instruction.continuation_id,
-                    ),
-                ));
-            }
             RegionInstructionKind::NativeSuspend(RegionNativeSuspend::FiberSuspend { .. }) => {
                 return Err(CraneliftLoweringError::new(
                     "JIT_CRANELIFT_REJECT_FIBER_OWNERSHIP_PUBLICATION",

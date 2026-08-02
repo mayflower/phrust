@@ -2536,18 +2536,6 @@ fn optimizing_admission_for_region(
         }
         if matches!(
             &instruction.kind,
-            RegionInstructionKind::NativeDynamicCode(RegionNativeDynamicCode::Include { .. })
-        ) {
-            return Err(CraneliftLoweringError::new(
-                "JIT_CRANELIFT_REJECT_INCLUDE_PUBLICATION",
-                format!(
-                    "include at continuation {} is assigned to baseline before region entry",
-                    instruction.continuation_id,
-                ),
-            ));
-        }
-        if matches!(
-            &instruction.kind,
             RegionInstructionKind::FetchConst { .. }
                 | RegionInstructionKind::NativeCall(RegionNativeCall {
                     target: RegionCallTarget::Semantic {
@@ -3336,18 +3324,6 @@ fn optimizing_admission_for_region(
             admission
                 .total_array_instructions
                 .insert(instruction.continuation_id);
-        }
-        if matches!(
-            instruction.kind,
-            RegionInstructionKind::NativeDynamicCode(RegionNativeDynamicCode::Include { .. })
-        ) {
-            return Err(CraneliftLoweringError::new(
-                "JIT_CRANELIFT_REJECT_NON_TOTAL_OPTIMIZING_REGION",
-                format!(
-                    "dynamic-code continuation {} must enter the Generic tier before optimizing execution",
-                    instruction.continuation_id,
-                ),
-            ));
         }
         if let RegionInstructionKind::StoreLocal { local, .. }
         | RegionInstructionKind::AssignLocalResult { local, .. } = instruction.kind
@@ -8526,6 +8502,19 @@ fn optimizing_admission_for_region(
         ));
     }
     for block in &region.blocks {
+        let exits_to_generic_dynamic_continuation = block.instructions.iter().any(|instruction| {
+            matches!(
+                instruction.kind,
+                RegionInstructionKind::NativeDynamicCode(
+                    RegionNativeDynamicCode::Include { .. }
+                        | RegionNativeDynamicCode::Eval { .. }
+                        | RegionNativeDynamicCode::DeclareFunction { .. }
+                        | RegionNativeDynamicCode::DeclareClass { .. }
+                        | RegionNativeDynamicCode::RegisterConstant { .. }
+                        | RegionNativeDynamicCode::EmitDiagnostic
+                )
+            )
+        });
         let return_plan = region.return_type.as_ref().and_then(|return_type| {
             let (operand, fact) = match block.terminator {
                 RegionTerminator::Return {
@@ -8631,56 +8620,58 @@ fn optimizing_admission_for_region(
             }
             _ => true,
         };
-        let total = match block.terminator {
-            RegionTerminator::Jump { .. } => true,
-            RegionTerminator::JumpIfFalse { .. }
-            | RegionTerminator::JumpIfTrue { .. }
-            | RegionTerminator::JumpIf { .. } => branch_condition_total,
-            RegionTerminator::Return {
-                value,
-                finally: None,
-            } => {
-                let return_type_total = region.return_type.as_ref().is_none_or(|return_type| {
-                    optimizing_fact_satisfies_type(publication_operand_fact(value), return_type)
-                        || matches!(
-                            (value, return_type),
-                            (RegionOperand::Register(register), php_ir::IrReturnType::Int)
-                                if published_integer_results.contains(&register)
-                        )
-                        || matches!(return_type, php_ir::IrReturnType::Array)
-                            && operand_root_local(value)
-                                .is_some_and(|local| new_array_locals.contains(&local))
-                        || operand_root_local(value).is_some_and(|local| {
-                            local_store_sources.get(&local).is_some_and(|sources| {
-                                matches!(
-                                    sources.as_slice(),
-                                    [(_, source)]
-                                        if optimizing_fact_satisfies_type(
-                                            publication_operand_fact(*source),
-                                            return_type,
-                                        )
-                                )
+        let total = exits_to_generic_dynamic_continuation
+            || match block.terminator {
+                RegionTerminator::Jump { .. } => true,
+                RegionTerminator::JumpIfFalse { .. }
+                | RegionTerminator::JumpIfTrue { .. }
+                | RegionTerminator::JumpIf { .. } => branch_condition_total,
+                RegionTerminator::Return {
+                    value,
+                    finally: None,
+                } => {
+                    let return_type_total = region.return_type.as_ref().is_none_or(|return_type| {
+                        optimizing_fact_satisfies_type(publication_operand_fact(value), return_type)
+                            || matches!(
+                                (value, return_type),
+                                (RegionOperand::Register(register), php_ir::IrReturnType::Int)
+                                    if published_integer_results.contains(&register)
+                            )
+                            || matches!(return_type, php_ir::IrReturnType::Array)
+                                && operand_root_local(value)
+                                    .is_some_and(|local| new_array_locals.contains(&local))
+                            || operand_root_local(value).is_some_and(|local| {
+                                local_store_sources.get(&local).is_some_and(|sources| {
+                                    matches!(
+                                        sources.as_slice(),
+                                        [(_, source)]
+                                            if optimizing_fact_satisfies_type(
+                                                publication_operand_fact(*source),
+                                                return_type,
+                                            )
+                                    )
+                                })
                             })
-                        })
-                        || admission
-                            .return_plans
-                            .contains_key(&block.terminator_continuation_id)
-                        || admission
-                            .total_terminators
-                            .contains(&block.terminator_continuation_id)
-                });
-                return_type_total && cleanup_total
-            }
-            RegionTerminator::ReturnReference {
-                local,
-                finally: None,
-            } => {
-                let reference_total = value_flow.local_storage(local).is_reference_slot()
-                    && (admission.total_reference_locals.contains(&local)
-                        || by_ref_parameters.contains(&local)
-                        || admission.total_return_reference_locals.contains(&local));
-                let return_type_total = region.return_type.as_ref().is_none_or(|return_type| {
-                    optimizing_fact_satisfies_type(
+                            || admission
+                                .return_plans
+                                .contains_key(&block.terminator_continuation_id)
+                            || admission
+                                .total_terminators
+                                .contains(&block.terminator_continuation_id)
+                    });
+                    return_type_total && cleanup_total
+                }
+                RegionTerminator::ReturnReference {
+                    local,
+                    finally: None,
+                } => {
+                    let reference_total = value_flow.local_storage(local).is_reference_slot()
+                        && (admission.total_reference_locals.contains(&local)
+                            || by_ref_parameters.contains(&local)
+                            || admission.total_return_reference_locals.contains(&local));
+                    let return_type_total =
+                        region.return_type.as_ref().is_none_or(|return_type| {
+                            optimizing_fact_satisfies_type(
                         lowering_operand_fact(value_flow, constants, RegionOperand::Local(local)),
                         return_type,
                     ) || admission
@@ -8701,37 +8692,37 @@ fn optimizing_admission_for_region(
                                 && parameter.by_ref
                                 && parameter.type_.as_ref() == Some(return_type)
                         })
-                });
-                reference_total && return_type_total && cleanup_total
-            }
-            RegionTerminator::Exit {
-                value,
-                finally: None,
-            } => {
-                let value_total = value.is_none_or(|value| match value {
-                    RegionOperand::Local(local)
-                        if value_flow.local_storage(local).is_reference_slot() =>
-                    {
-                        admission.total_reference_locals.contains(&local)
-                            || by_ref_parameters.contains(&local)
-                    }
-                    _ => {
-                        lowering_operand_fact(value_flow, constants, value).certainty
-                            != crate::region_ir::SsaCertainty::Unknown
-                    }
-                });
-                value_total && cleanup_total
-            }
-            RegionTerminator::Return {
-                finally: Some(_), ..
-            }
-            | RegionTerminator::ReturnReference {
-                finally: Some(_), ..
-            }
-            | RegionTerminator::Exit {
-                finally: Some(_), ..
-            } => false,
-        };
+                        });
+                    reference_total && return_type_total && cleanup_total
+                }
+                RegionTerminator::Exit {
+                    value,
+                    finally: None,
+                } => {
+                    let value_total = value.is_none_or(|value| match value {
+                        RegionOperand::Local(local)
+                            if value_flow.local_storage(local).is_reference_slot() =>
+                        {
+                            admission.total_reference_locals.contains(&local)
+                                || by_ref_parameters.contains(&local)
+                        }
+                        _ => {
+                            lowering_operand_fact(value_flow, constants, value).certainty
+                                != crate::region_ir::SsaCertainty::Unknown
+                        }
+                    });
+                    value_total && cleanup_total
+                }
+                RegionTerminator::Return {
+                    finally: Some(_), ..
+                }
+                | RegionTerminator::ReturnReference {
+                    finally: Some(_), ..
+                }
+                | RegionTerminator::Exit {
+                    finally: Some(_), ..
+                } => false,
+            };
         if !total {
             let non_total_cleanup_locals = block
                 .terminator_live_locals
