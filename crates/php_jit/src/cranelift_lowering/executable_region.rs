@@ -283,7 +283,7 @@ struct NativeFixedBuiltinPublicationPlan {
 }
 
 impl NativeFixedBuiltinPublicationPlan {
-    fn is_total(&self) -> bool {
+    fn is_proven(&self) -> bool {
         !self.capability_family.is_empty()
             && self.defaults_published
             && self.native_arity >= self.provided_arity
@@ -324,30 +324,31 @@ impl NativeFixedBuiltinPublicationPlan {
 }
 
 #[derive(Clone, Debug, Default)]
-struct NativeOptimizingAdmission {
-    total_array_calls: BTreeSet<u32>,
-    total_fixed_builtin_calls: BTreeSet<u32>,
+struct NativeOptimizingAssumptions {
+    proven_array_calls: BTreeSet<u32>,
+    proven_fixed_builtin_calls: BTreeSet<u32>,
     fixed_builtin_plans: BTreeMap<u32, NativeFixedBuiltinPublicationPlan>,
-    total_array_instructions: BTreeSet<u32>,
-    total_binary_instructions: BTreeSet<u32>,
+    proven_array_instructions: BTreeSet<u32>,
+    proven_binary_instructions: BTreeSet<u32>,
     binary_operand_classes: BTreeMap<u32, (SsaValueClass, SsaValueClass)>,
-    total_scalar_control_instructions: BTreeSet<u32>,
+    proven_scalar_control_instructions: BTreeSet<u32>,
     fresh_array_instructions: BTreeSet<u32>,
     fresh_array_capacities: BTreeMap<u32, u32>,
-    total_local_loads: BTreeSet<u32>,
-    total_request_local_stores: BTreeSet<u32>,
-    total_return_reference_stores: BTreeSet<u32>,
-    total_return_reference_locals: BTreeSet<LocalId>,
-    total_terminators: BTreeSet<u32>,
+    proven_local_loads: BTreeSet<u32>,
+    proven_request_local_stores: BTreeSet<u32>,
+    proven_return_reference_stores: BTreeSet<u32>,
+    proven_return_reference_locals: BTreeSet<LocalId>,
+    proven_terminators: BTreeSet<u32>,
     return_plans: BTreeMap<u32, NativeOptimizingReturnPlan>,
-    total_reference_locals: BTreeSet<LocalId>,
+    proven_reference_locals: BTreeSet<LocalId>,
     array_requirements: BTreeMap<NativeEntryArraySource, NativeEntryArrayRequirement>,
     initialized_request_locals: BTreeSet<LocalId>,
     releasable_request_locals: BTreeSet<LocalId>,
     initialized_globals: BTreeSet<u32>,
     releasable_globals: BTreeSet<u32>,
     plain_globals: BTreeSet<u32>,
-    total_value_parameters: BTreeSet<usize>,
+    proven_value_parameters: BTreeSet<usize>,
+    generated_variadic_parameters: BTreeSet<usize>,
     by_ref_array_parameters: BTreeSet<usize>,
     by_ref_array_instructions: BTreeSet<u32>,
     property_requirements: Vec<NativeEntryPropertyRequirement>,
@@ -371,36 +372,36 @@ struct NativeOptimizingAdmission {
     fixed_string_bytes: usize,
     fixed_lvalue_insertions: usize,
     require_non_fiber_scope: bool,
-    reference_payloads_are_total: bool,
+    reference_payloads_are_proven: bool,
 }
 
-impl NativeOptimizingAdmission {
+impl NativeOptimizingAssumptions {
     fn reference_payload_proof(&self) -> Option<NativeReferencePayloadProof> {
-        self.reference_payloads_are_total
+        self.reference_payloads_are_proven
             .then_some(NativeReferencePayloadProof(()))
     }
 
-    fn array_call_is_total(&self, continuation_id: u32) -> bool {
-        self.total_array_calls.contains(&continuation_id)
+    fn array_call_is_proven(&self, continuation_id: u32) -> bool {
+        self.proven_array_calls.contains(&continuation_id)
     }
 
-    fn fixed_builtin_call_is_total(&self, continuation_id: u32) -> bool {
+    fn fixed_builtin_call_is_proven(&self, continuation_id: u32) -> bool {
         self.fixed_builtin_plans
             .get(&continuation_id)
-            .is_some_and(NativeFixedBuiltinPublicationPlan::is_total)
-            || self.total_fixed_builtin_calls.contains(&continuation_id)
+            .is_some_and(NativeFixedBuiltinPublicationPlan::is_proven)
+            || self.proven_fixed_builtin_calls.contains(&continuation_id)
     }
 
-    fn array_instruction_is_total(&self, continuation_id: u32) -> bool {
-        self.total_array_instructions.contains(&continuation_id)
+    fn array_instruction_is_proven(&self, continuation_id: u32) -> bool {
+        self.proven_array_instructions.contains(&continuation_id)
     }
 
     fn array_instruction_root_is_by_reference(&self, continuation_id: u32) -> bool {
         self.by_ref_array_instructions.contains(&continuation_id)
     }
 
-    fn binary_instruction_is_total(&self, continuation_id: u32) -> bool {
-        self.total_binary_instructions.contains(&continuation_id)
+    fn binary_instruction_is_proven(&self, continuation_id: u32) -> bool {
+        self.proven_binary_instructions.contains(&continuation_id)
     }
 
     fn binary_instruction_operand_classes(
@@ -410,8 +411,8 @@ impl NativeOptimizingAdmission {
         self.binary_operand_classes.get(&continuation_id).copied()
     }
 
-    fn scalar_control_instruction_is_total(&self, continuation_id: u32) -> bool {
-        self.total_scalar_control_instructions
+    fn scalar_control_instruction_is_proven(&self, continuation_id: u32) -> bool {
+        self.proven_scalar_control_instructions
             .contains(&continuation_id)
     }
 
@@ -423,25 +424,25 @@ impl NativeOptimizingAdmission {
         self.fresh_array_capacities.get(&continuation_id).copied()
     }
 
-    fn local_load_is_total(&self, continuation_id: u32) -> bool {
-        self.total_local_loads.contains(&continuation_id)
+    fn local_load_is_proven(&self, continuation_id: u32) -> bool {
+        self.proven_local_loads.contains(&continuation_id)
     }
 
-    fn request_local_store_is_total(&self, continuation_id: u32) -> bool {
-        self.total_request_local_stores.contains(&continuation_id)
+    fn request_local_store_is_proven(&self, continuation_id: u32) -> bool {
+        self.proven_request_local_stores.contains(&continuation_id)
     }
 
-    fn return_reference_store_is_total(&self, continuation_id: u32) -> bool {
-        self.total_return_reference_stores
+    fn return_reference_store_is_proven(&self, continuation_id: u32) -> bool {
+        self.proven_return_reference_stores
             .contains(&continuation_id)
     }
 
     fn return_reference_is_prebound(&self, local: LocalId) -> bool {
-        self.total_reference_locals.contains(&local)
+        self.proven_reference_locals.contains(&local)
     }
 
-    fn terminator_is_total(&self, continuation_id: u32) -> bool {
-        self.total_terminators.contains(&continuation_id)
+    fn terminator_is_proven(&self, continuation_id: u32) -> bool {
+        self.proven_terminators.contains(&continuation_id)
     }
 
     fn return_plan(&self, continuation_id: u32) -> Option<NativeOptimizingReturnPlan> {
@@ -606,8 +607,6 @@ fn entry_array_source(
 }
 
 include!("executable_region/array_source_publication.rs");
-include!("executable_region/publication_boundaries.rs");
-
 fn publication_integer_array_key(constants: &[IrConstant], key: RegionOperand) -> Option<i64> {
     match key {
         RegionOperand::Constant(index) => match constants.get(index as usize) {
@@ -713,7 +712,7 @@ fn publication_entry_parameter(
 
 #[allow(clippy::too_many_arguments)]
 fn admit_publication_scalar_class(
-    admission: &mut NativeOptimizingAdmission,
+    admission: &mut NativeOptimizingAssumptions,
     value_flow: &ExecutableValueFlow,
     constants: &[IrConstant],
     definitions: &BTreeMap<RegId, RegionOperand>,
@@ -746,7 +745,7 @@ fn admit_publication_scalar_class(
 
 #[allow(clippy::too_many_arguments)]
 fn admit_publication_string(
-    admission: &mut NativeOptimizingAdmission,
+    admission: &mut NativeOptimizingAssumptions,
     value_flow: &ExecutableValueFlow,
     constants: &[IrConstant],
     definitions: &BTreeMap<RegId, RegionOperand>,
@@ -815,7 +814,7 @@ fn admit_publication_string(
 
 #[allow(clippy::too_many_arguments)]
 fn admit_publication_string_with_internal_source(
-    admission: &mut NativeOptimizingAdmission,
+    admission: &mut NativeOptimizingAssumptions,
     internal_sources: &BTreeMap<RegId, usize>,
     value_flow: &ExecutableValueFlow,
     constants: &[IrConstant],
@@ -875,7 +874,7 @@ fn admit_publication_string_with_internal_source(
 
 #[allow(clippy::too_many_arguments)]
 fn admit_publication_integer(
-    admission: &mut NativeOptimizingAdmission,
+    admission: &mut NativeOptimizingAssumptions,
     value_flow: &ExecutableValueFlow,
     constants: &[IrConstant],
     definitions: &BTreeMap<RegId, RegionOperand>,
@@ -956,8 +955,8 @@ fn publication_native_array_key(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn publish_total_fixed_builtin_plan(
-    admission: &mut NativeOptimizingAdmission,
+fn publish_fixed_builtin_assumptions(
+    admission: &mut NativeOptimizingAssumptions,
     call: &RegionNativeCall,
     continuation_id: u32,
     family: &'static str,
@@ -1170,23 +1169,21 @@ fn publish_total_fixed_builtin_plan(
     Ok(())
 }
 
-fn optimizing_admission_for_region(
+fn collect_optimizing_assumptions(
     region: &RegionGraph,
     constants: &[IrConstant],
     value_flow: &ExecutableValueFlow,
     function_params: &BTreeMap<FunctionId, NativeFunctionMetadata>,
     external_function_signatures: &[crate::JitExternalFunctionSignature],
-) -> Result<NativeOptimizingAdmission, CraneliftLoweringError> {
+) -> Result<NativeOptimizingAssumptions, CraneliftLoweringError> {
     if region.compile_metadata.tier != NativeCompilerTier::Optimizing {
-        return Ok(NativeOptimizingAdmission::default());
+        return Ok(NativeOptimizingAssumptions::default());
     }
-    reject_unpublished_optimizer_boundaries(region)?;
-    // Every allocation is charged by the family classifier that publishes
-    // its total output plan below. A graph-wide per-instruction allowance
-    // made immediate-only regions depend on allocator state and concealed
-    // missing family plans behind an arbitrary warm-path budget.
-    let mut admission = NativeOptimizingAdmission::default();
-    admission.total_value_parameters = (0..region.parameter_locals.len()).collect();
+    // This pass records optional entry facts and exact-family plans. Failure
+    // to prove one is handled by a generated Generic continuation; it never
+    // decides whether the Optimizing artifact is published.
+    let mut admission = NativeOptimizingAssumptions::default();
+    admission.proven_value_parameters = (0..region.parameter_locals.len()).collect();
     let parameter_indices = region
         .parameter_locals
         .iter()
@@ -1204,6 +1201,12 @@ fn optimizing_admission_for_region(
         .iter()
         .filter_map(|parameter| parameter.variadic.then_some(parameter.local))
         .collect::<BTreeSet<_>>();
+    admission.generated_variadic_parameters = region
+        .parameter_locals
+        .iter()
+        .enumerate()
+        .filter_map(|(index, local)| variadic_parameters.contains(local).then_some(index))
+        .collect();
     let definitions = region
         .blocks
         .iter()
@@ -1732,7 +1735,7 @@ fn optimizing_admission_for_region(
                 );
         }
     }
-    admission.total_reference_locals = region
+    admission.proven_reference_locals = region
         .blocks
         .iter()
         .flat_map(|block| &block.instructions)
@@ -2246,7 +2249,7 @@ fn optimizing_admission_for_region(
             admission
                 .binary_operand_classes
                 .insert(continuation, (lhs_fact.class, rhs_fact.class));
-            admission.total_binary_instructions.insert(continuation);
+            admission.proven_binary_instructions.insert(continuation);
         }
         if let RegionInstructionKind::Echo { src } = instruction.kind {
             let fact = lowering_operand_fact(value_flow, constants, src);
@@ -2318,7 +2321,7 @@ fn optimizing_admission_for_region(
                         .extend(guarded.map(|_| instruction.continuation_id));
                 }
                 admission
-                    .total_scalar_control_instructions
+                    .proven_scalar_control_instructions
                     .insert(instruction.continuation_id);
             }
             RegionInstructionKind::Unary { op, src, .. } => {
@@ -2376,7 +2379,7 @@ fn optimizing_admission_for_region(
                         .extend(guarded.map(|_| instruction.continuation_id));
                 }
                 admission
-                    .total_scalar_control_instructions
+                    .proven_scalar_control_instructions
                     .insert(instruction.continuation_id);
             }
             RegionInstructionKind::Cast { op, src, .. } => {
@@ -2458,7 +2461,7 @@ fn optimizing_admission_for_region(
                 )?;
                 entry_dependent_continuations.extend(guarded.map(|_| instruction.continuation_id));
                 admission
-                    .total_scalar_control_instructions
+                    .proven_scalar_control_instructions
                     .insert(instruction.continuation_id);
             }
             _ => {}
@@ -2516,7 +2519,7 @@ fn optimizing_admission_for_region(
             )?;
             entry_dependent_continuations.extend(guarded.map(|_| instruction.continuation_id));
             admission
-                .total_scalar_control_instructions
+                .proven_scalar_control_instructions
                 .insert(instruction.continuation_id);
         }
         if let RegionInstructionKind::UnsetLocal { local } = instruction.kind {
@@ -2560,7 +2563,7 @@ fn optimizing_admission_for_region(
         }
         if let RegionInstructionKind::NewArray { dst } = instruction.kind {
             admission
-                .total_array_instructions
+                .proven_array_instructions
                 .insert(instruction.continuation_id);
             admission
                 .fresh_array_instructions
@@ -2682,7 +2685,7 @@ fn optimizing_admission_for_region(
                 ));
             }
             admission
-                .total_array_instructions
+                .proven_array_instructions
                 .insert(instruction.continuation_id);
             admission
                 .fresh_array_instructions
@@ -2728,7 +2731,7 @@ fn optimizing_admission_for_region(
             requirement.require_supported_keys = true;
             requirement.require_plain_values = true;
             admission
-                .total_array_instructions
+                .proven_array_instructions
                 .insert(instruction.continuation_id);
             admission
                 .fresh_array_instructions
@@ -2742,7 +2745,7 @@ fn optimizing_admission_for_region(
                     || internal_array_sources.contains_key(&register))
             {
                 admission
-                    .total_array_instructions
+                    .proven_array_instructions
                     .insert(instruction.continuation_id);
                 admission.fixed_value_allocations =
                     admission.fixed_value_allocations.saturating_add(1);
@@ -2776,7 +2779,7 @@ fn optimizing_admission_for_region(
             requirement.require_plain_values = true;
             admission.fixed_value_allocations = admission.fixed_value_allocations.saturating_add(1);
             admission
-                .total_array_instructions
+                .proven_array_instructions
                 .insert(instruction.continuation_id);
             entry_dependent_continuations.insert(instruction.continuation_id);
             debug_assert!(foreach_sources.contains_key(&iterator));
@@ -2792,7 +2795,7 @@ fn optimizing_admission_for_region(
                 ));
             }
             admission
-                .total_array_instructions
+                .proven_array_instructions
                 .insert(instruction.continuation_id);
         }
         if let RegionInstructionKind::ForeachCleanup { iterator } = instruction.kind {
@@ -2808,7 +2811,7 @@ fn optimizing_admission_for_region(
                 ));
             }
             admission
-                .total_array_instructions
+                .proven_array_instructions
                 .insert(instruction.continuation_id);
         }
         if let RegionInstructionKind::ForeachInitRef { iterator, local } = instruction.kind {
@@ -2844,8 +2847,8 @@ fn optimizing_admission_for_region(
                 .fixed_value_allocations
                 .saturating_add(entry_count.saturating_add(2));
             if storage.is_reference_slot() {
-                admission.total_reference_locals.insert(local);
-                admission.total_array_instructions.insert(
+                admission.proven_reference_locals.insert(local);
+                admission.proven_array_instructions.insert(
                     new_array_local_store_continuations
                         .get(&local)
                         .copied()
@@ -2853,7 +2856,7 @@ fn optimizing_admission_for_region(
                 );
             }
             admission
-                .total_array_instructions
+                .proven_array_instructions
                 .insert(instruction.continuation_id);
             debug_assert_eq!(foreach_reference_sources.get(&iterator), Some(&local));
         }
@@ -2874,12 +2877,12 @@ fn optimizing_admission_for_region(
                     ),
                 ));
             }
-            admission.total_reference_locals.insert(value_local);
+            admission.proven_reference_locals.insert(value_local);
             admission
-                .total_array_instructions
+                .proven_array_instructions
                 .insert(instruction.continuation_id);
             admission
-                .total_array_instructions
+                .proven_array_instructions
                 .extend(foreach_reference_local_writes.iter().copied());
         }
         if let RegionInstructionKind::AppendDim {
@@ -2906,7 +2909,7 @@ fn optimizing_admission_for_region(
                 ));
             }
             admission
-                .total_array_instructions
+                .proven_array_instructions
                 .insert(instruction.continuation_id);
             admission
                 .fresh_array_instructions
@@ -2954,7 +2957,7 @@ fn optimizing_admission_for_region(
                     .saturating_mul(crate::JIT_NATIVE_DIRECT_ARRAY_INITIAL_CAPACITY as usize),
             );
             admission
-                .total_array_instructions
+                .proven_array_instructions
                 .insert(instruction.continuation_id);
             admission
                 .fresh_array_instructions
@@ -2998,7 +3001,7 @@ fn optimizing_admission_for_region(
                 ));
             }
             admission
-                .total_array_instructions
+                .proven_array_instructions
                 .insert(instruction.continuation_id);
             admission
                 .fresh_array_instructions
@@ -3051,7 +3054,7 @@ fn optimizing_admission_for_region(
                     .saturating_mul(crate::JIT_NATIVE_DIRECT_ARRAY_INITIAL_CAPACITY as usize),
             );
             admission
-                .total_array_instructions
+                .proven_array_instructions
                 .insert(instruction.continuation_id);
             admission
                 .fresh_array_instructions
@@ -3072,7 +3075,7 @@ fn optimizing_admission_for_region(
                 ));
             }
             admission
-                .total_array_instructions
+                .proven_array_instructions
                 .insert(instruction.continuation_id);
             admission
                 .fresh_array_instructions
@@ -3097,7 +3100,7 @@ fn optimizing_admission_for_region(
                 ));
             }
             admission
-                .total_array_instructions
+                .proven_array_instructions
                 .insert(instruction.continuation_id);
             admission
                 .fresh_array_instructions
@@ -3180,7 +3183,7 @@ fn optimizing_admission_for_region(
                 admission.by_ref_array_parameters.insert(source_index);
             }
             admission
-                .total_array_instructions
+                .proven_array_instructions
                 .insert(instruction.continuation_id);
         }
         if let RegionInstructionKind::AppendDim {
@@ -3245,7 +3248,7 @@ fn optimizing_admission_for_region(
                 .mutations
                 .push(NativeEntryArrayMutationRequirement::Append { parents });
             admission
-                .total_array_instructions
+                .proven_array_instructions
                 .insert(instruction.continuation_id);
         }
         if let RegionInstructionKind::UnsetDim { local, ref keys } = instruction.kind
@@ -3300,7 +3303,7 @@ fn optimizing_admission_for_region(
                     key,
                 });
             admission
-                .total_array_instructions
+                .proven_array_instructions
                 .insert(instruction.continuation_id);
         }
         if let RegionInstructionKind::UnsetDim { local, ref keys } = instruction.kind
@@ -3322,7 +3325,7 @@ fn optimizing_admission_for_region(
                 ));
             }
             admission
-                .total_array_instructions
+                .proven_array_instructions
                 .insert(instruction.continuation_id);
         }
         if let RegionInstructionKind::StoreLocal { local, .. }
@@ -3345,7 +3348,7 @@ fn optimizing_admission_for_region(
                 ));
             }
             admission
-                .total_request_local_stores
+                .proven_request_local_stores
                 .insert(instruction.continuation_id);
             if let Some(global_continuation) = bound_global_continuations.get(&local).copied() {
                 // `global $name` installs the canonical trusted reference
@@ -3375,7 +3378,7 @@ fn optimizing_admission_for_region(
                 // global continuation instead of requiring a pre-existing
                 // request-local entry slot for this cross-unit frame.
                 admission
-                    .total_local_loads
+                    .proven_local_loads
                     .insert(instruction.continuation_id);
                 admission.initialized_globals.insert(global_continuation);
             } else if handler_exception_local {
@@ -3384,11 +3387,11 @@ fn optimizing_admission_for_region(
                 // otherwise classified as request-global storage, but it must
                 // not become an initial-entry initialization requirement.
                 admission
-                    .total_local_loads
+                    .proven_local_loads
                     .insert(instruction.continuation_id);
             } else if storage == crate::region_ir::LocalStorageClass::SsaPlain {
                 admission
-                    .total_local_loads
+                    .proven_local_loads
                     .insert(instruction.continuation_id);
             } else if matches!(
                 storage,
@@ -3406,12 +3409,12 @@ fn optimizing_admission_for_region(
                     ));
                 }
                 admission
-                    .total_local_loads
+                    .proven_local_loads
                     .insert(instruction.continuation_id);
                 admission.initialized_request_locals.insert(local);
             } else if instruction.live_locals.contains(&local) {
                 admission
-                    .total_local_loads
+                    .proven_local_loads
                     .insert(instruction.continuation_id);
             } else {
                 return Err(CraneliftLoweringError::new(
@@ -3470,7 +3473,7 @@ fn optimizing_admission_for_region(
                     ));
                 }
                 admission
-                    .total_array_instructions
+                    .proven_array_instructions
                     .insert(instruction.continuation_id);
                 continue;
             }
@@ -3502,7 +3505,7 @@ fn optimizing_admission_for_region(
                     ));
                 }
                 admission
-                    .total_array_instructions
+                    .proven_array_instructions
                     .insert(instruction.continuation_id);
                 continue;
             }
@@ -3529,7 +3532,7 @@ fn optimizing_admission_for_region(
                         leaf: NativeEntryArrayProbeLeaf::PlainValue,
                     });
                 admission
-                    .total_array_instructions
+                    .proven_array_instructions
                     .insert(instruction.continuation_id);
                 entry_dependent_continuations.insert(instruction.continuation_id);
                 continue;
@@ -3594,7 +3597,7 @@ fn optimizing_admission_for_region(
                 ));
             }
             admission
-                .total_array_instructions
+                .proven_array_instructions
                 .insert(instruction.continuation_id);
             entry_dependent_continuations.insert(instruction.continuation_id);
             admitted_array_fetches.insert(dst, (source, key));
@@ -3677,7 +3680,7 @@ fn optimizing_admission_for_region(
                     });
             }
             admission
-                .total_array_instructions
+                .proven_array_instructions
                 .insert(instruction.continuation_id);
             entry_dependent_continuations.insert(instruction.continuation_id);
         }
@@ -3692,7 +3695,7 @@ fn optimizing_admission_for_region(
                     | RegionInstructionKind::EmptyDim { .. }
             )
             && !admission
-                .total_array_instructions
+                .proven_array_instructions
                 .contains(&instruction.continuation_id)
         {
             return Err(CraneliftLoweringError::new(
@@ -3729,7 +3732,7 @@ fn optimizing_admission_for_region(
                             .insert(instruction.continuation_id);
                     }
                     admission
-                        .total_array_instructions
+                        .proven_array_instructions
                         .insert(instruction.continuation_id);
                 }
                 RegionInstructionKind::AssignDim { keys, value, .. } if keys.len() == 1 => {
@@ -3758,7 +3761,7 @@ fn optimizing_admission_for_region(
                         .insert(instruction.continuation_id);
                     admission.plain_globals.insert(instruction.continuation_id);
                     admission
-                        .total_array_instructions
+                        .proven_array_instructions
                         .insert(instruction.continuation_id);
                 }
                 RegionInstructionKind::AssignDim { keys, value, .. } if keys.len() > 1 => {
@@ -3803,7 +3806,7 @@ fn optimizing_admission_for_region(
                             key,
                         });
                     admission
-                        .total_array_instructions
+                        .proven_array_instructions
                         .insert(instruction.continuation_id);
                 }
                 RegionInstructionKind::AppendDim { keys, value, .. } if !keys.is_empty() => {
@@ -3839,7 +3842,7 @@ fn optimizing_admission_for_region(
                         .mutations
                         .push(NativeEntryArrayMutationRequirement::Append { parents });
                     admission
-                        .total_array_instructions
+                        .proven_array_instructions
                         .insert(instruction.continuation_id);
                 }
                 RegionInstructionKind::UnsetDim { keys, .. } if keys.len() == 1 => {
@@ -3878,7 +3881,7 @@ fn optimizing_admission_for_region(
                             key,
                         });
                     admission
-                        .total_array_instructions
+                        .proven_array_instructions
                         .insert(instruction.continuation_id);
                 }
                 RegionInstructionKind::FetchDim { .. }
@@ -3896,7 +3899,7 @@ fn optimizing_admission_for_region(
                 _ => {}
             }
             if admission
-                .total_array_instructions
+                .proven_array_instructions
                 .contains(&instruction.continuation_id)
             {
                 entry_dependent_continuations.insert(instruction.continuation_id);
@@ -4211,7 +4214,7 @@ fn optimizing_admission_for_region(
                     admission.fixed_value_allocations.saturating_add(4);
                 admission.require_non_fiber_scope = true;
                 admission
-                    .total_array_instructions
+                    .proven_array_instructions
                     .insert(instruction.continuation_id);
                 entry_dependent_continuations.insert(instruction.continuation_id);
                 continue;
@@ -4323,7 +4326,7 @@ fn optimizing_admission_for_region(
             }
             admission.require_non_fiber_scope = true;
             admission
-                .total_array_instructions
+                .proven_array_instructions
                 .insert(instruction.continuation_id);
             entry_dependent_continuations.insert(instruction.continuation_id);
             continue;
@@ -4414,7 +4417,7 @@ fn optimizing_admission_for_region(
                 .saturating_add(4usize.saturating_mul(call.entries.len()));
             admission.require_non_fiber_scope = true;
             admission
-                .total_array_instructions
+                .proven_array_instructions
                 .insert(instruction.continuation_id);
             entry_dependent_continuations.insert(instruction.continuation_id);
             continue;
@@ -4532,7 +4535,7 @@ fn optimizing_admission_for_region(
                 admission.fixed_value_allocations =
                     admission.fixed_value_allocations.saturating_add(1);
                 admission
-                    .total_array_instructions
+                    .proven_array_instructions
                     .insert(instruction.continuation_id);
                 entry_dependent_continuations.insert(instruction.continuation_id);
                 continue;
@@ -4614,7 +4617,7 @@ fn optimizing_admission_for_region(
                 admission.fixed_value_allocations =
                     admission.fixed_value_allocations.saturating_add(1);
                 admission
-                    .total_array_instructions
+                    .proven_array_instructions
                     .insert(instruction.continuation_id);
                 entry_dependent_continuations.insert(instruction.continuation_id);
                 continue;
@@ -4665,7 +4668,7 @@ fn optimizing_admission_for_region(
                 admission.fixed_value_allocations =
                     admission.fixed_value_allocations.saturating_add(1);
                 admission
-                    .total_array_instructions
+                    .proven_array_instructions
                     .insert(instruction.continuation_id);
                 entry_dependent_continuations.insert(instruction.continuation_id);
                 continue;
@@ -4696,7 +4699,7 @@ fn optimizing_admission_for_region(
                 admission.fixed_value_allocations =
                     admission.fixed_value_allocations.saturating_add(1);
                 admission
-                    .total_array_instructions
+                    .proven_array_instructions
                     .insert(instruction.continuation_id);
                 entry_dependent_continuations.insert(instruction.continuation_id);
                 continue;
@@ -4727,7 +4730,7 @@ fn optimizing_admission_for_region(
                 admission.fixed_value_allocations =
                     admission.fixed_value_allocations.saturating_add(1);
                 admission
-                    .total_array_instructions
+                    .proven_array_instructions
                     .insert(instruction.continuation_id);
                 entry_dependent_continuations.insert(instruction.continuation_id);
                 continue;
@@ -4782,7 +4785,7 @@ fn optimizing_admission_for_region(
                 admission.fixed_value_allocations =
                     admission.fixed_value_allocations.saturating_add(1);
                 admission
-                    .total_array_instructions
+                    .proven_array_instructions
                     .insert(instruction.continuation_id);
                 entry_dependent_continuations.insert(instruction.continuation_id);
                 continue;
@@ -4819,7 +4822,7 @@ fn optimizing_admission_for_region(
                 admission.fixed_value_allocations =
                     admission.fixed_value_allocations.saturating_add(1);
                 admission
-                    .total_array_instructions
+                    .proven_array_instructions
                     .insert(instruction.continuation_id);
                 entry_dependent_continuations.insert(instruction.continuation_id);
                 continue;
@@ -4872,7 +4875,7 @@ fn optimizing_admission_for_region(
                         mutations: Vec::new(),
                     });
                 admission
-                    .total_array_instructions
+                    .proven_array_instructions
                     .insert(instruction.continuation_id);
                 entry_dependent_continuations.insert(instruction.continuation_id);
                 continue;
@@ -5393,7 +5396,7 @@ fn optimizing_admission_for_region(
                 });
             admission.fixed_value_allocations = admission.fixed_value_allocations.saturating_add(1);
             admission
-                .total_array_calls
+                .proven_array_calls
                 .insert(instruction.continuation_id);
             entry_dependent_continuations.insert(instruction.continuation_id);
             continue;
@@ -5568,7 +5571,7 @@ fn optimizing_admission_for_region(
                 _ => unreachable!("property dimension mutation was filtered above"),
             }
             admission
-                .total_array_calls
+                .proven_array_calls
                 .insert(instruction.continuation_id);
             entry_dependent_continuations.insert(instruction.continuation_id);
             continue;
@@ -5712,7 +5715,7 @@ fn optimizing_admission_for_region(
                 _ => unreachable!("property dimension probe was filtered above"),
             }
             admission
-                .total_array_calls
+                .proven_array_calls
                 .insert(instruction.continuation_id);
             entry_dependent_continuations.insert(instruction.continuation_id);
             continue;
@@ -5743,7 +5746,7 @@ fn optimizing_admission_for_region(
                 entry_dependent_continuations.extend(guarded.map(|_| instruction.continuation_id));
             }
             admission
-                .total_fixed_builtin_calls
+                .proven_fixed_builtin_calls
                 .insert(instruction.continuation_id);
             continue;
         }
@@ -5770,7 +5773,7 @@ fn optimizing_admission_for_region(
             )?;
             entry_dependent_continuations.extend(guarded.map(|_| instruction.continuation_id));
             admission
-                .total_fixed_builtin_calls
+                .proven_fixed_builtin_calls
                 .insert(instruction.continuation_id);
             continue;
         }
@@ -5887,7 +5890,7 @@ fn optimizing_admission_for_region(
                 }
             }
             admission
-                .total_fixed_builtin_calls
+                .proven_fixed_builtin_calls
                 .insert(instruction.continuation_id);
             continue;
         }
@@ -5953,7 +5956,7 @@ fn optimizing_admission_for_region(
                             .push(NativeEntryResourceTypeRequirement { parameter_index });
                     }
                     admission
-                        .total_fixed_builtin_calls
+                        .proven_fixed_builtin_calls
                         .insert(instruction.continuation_id);
                     continue;
                 }
@@ -5996,7 +5999,7 @@ fn optimizing_admission_for_region(
                 entry_dependent_continuations.extend(guarded.map(|_| instruction.continuation_id));
             }
             admission
-                .total_fixed_builtin_calls
+                .proven_fixed_builtin_calls
                 .insert(instruction.continuation_id);
             continue;
         }
@@ -6064,7 +6067,7 @@ fn optimizing_admission_for_region(
                 }
             }
             admission
-                .total_fixed_builtin_calls
+                .proven_fixed_builtin_calls
                 .insert(instruction.continuation_id);
             continue;
         }
@@ -6223,7 +6226,7 @@ fn optimizing_admission_for_region(
                     });
             }
             admission
-                .total_fixed_builtin_calls
+                .proven_fixed_builtin_calls
                 .insert(instruction.continuation_id);
             continue;
         }
@@ -6305,7 +6308,7 @@ fn optimizing_admission_for_region(
                     leaf: NativeEntryArrayProbeLeaf::ExistsOnly,
                 });
             admission
-                .total_array_calls
+                .proven_array_calls
                 .insert(instruction.continuation_id);
             entry_dependent_continuations.insert(instruction.continuation_id);
             continue;
@@ -6397,7 +6400,7 @@ fn optimizing_admission_for_region(
                     tail_by_reference: variadic_parameter.is_some_and(|parameter| parameter.by_ref),
                 });
             admission
-                .total_array_calls
+                .proven_array_calls
                 .insert(instruction.continuation_id);
             entry_dependent_continuations.insert(instruction.continuation_id);
             continue;
@@ -6790,7 +6793,7 @@ fn optimizing_admission_for_region(
                         .fixed_string_bytes
                         .saturating_add(php_runtime::api::PHP_FLOAT_STRING_BUFFER_CAPACITY);
                 }
-                admission.total_fixed_builtin_calls.insert(continuation);
+                admission.proven_fixed_builtin_calls.insert(continuation);
             }
 
             if stable_builtin_is_numeric(&call.target) {
@@ -6823,7 +6826,7 @@ fn optimizing_admission_for_region(
                     continuation,
                     "is_numeric",
                 )?;
-                admission.total_fixed_builtin_calls.insert(continuation);
+                admission.proven_fixed_builtin_calls.insert(continuation);
             }
 
             if stable_builtin_ctype(&call.target).is_some() {
@@ -6853,7 +6856,7 @@ fn optimizing_admission_for_region(
                     continuation,
                     "ctype predicate",
                 )?;
-                admission.total_fixed_builtin_calls.insert(continuation);
+                admission.proven_fixed_builtin_calls.insert(continuation);
             }
 
             if let Some(operation) = stable_builtin_numeric_operator(&call.target) {
@@ -7577,7 +7580,7 @@ fn optimizing_admission_for_region(
                 }
             }
             admission
-                .total_array_calls
+                .proven_array_calls
                 .insert(instruction.continuation_id);
             entry_dependent_continuations.insert(instruction.continuation_id);
             continue;
@@ -7751,7 +7754,7 @@ fn optimizing_admission_for_region(
                 }
             }
             admission
-                .total_array_calls
+                .proven_array_calls
                 .insert(instruction.continuation_id);
             entry_dependent_continuations.insert(instruction.continuation_id);
             continue;
@@ -7789,7 +7792,7 @@ fn optimizing_admission_for_region(
                 }
             }
             admission
-                .total_array_calls
+                .proven_array_calls
                 .insert(instruction.continuation_id);
             entry_dependent_continuations.insert(instruction.continuation_id);
             continue;
@@ -7872,7 +7875,7 @@ fn optimizing_admission_for_region(
                 }
             }
             admission
-                .total_array_calls
+                .proven_array_calls
                 .insert(instruction.continuation_id);
             entry_dependent_continuations.insert(instruction.continuation_id);
             continue;
@@ -7951,7 +7954,7 @@ fn optimizing_admission_for_region(
                 }
             }
             admission
-                .total_array_calls
+                .proven_array_calls
                 .insert(instruction.continuation_id);
             entry_dependent_continuations.insert(instruction.continuation_id);
             continue;
@@ -7986,7 +7989,7 @@ fn optimizing_admission_for_region(
                 requirement.require_scalar_values = true;
             }
             admission
-                .total_array_calls
+                .proven_array_calls
                 .insert(instruction.continuation_id);
             entry_dependent_continuations.insert(instruction.continuation_id);
             continue;
@@ -8066,7 +8069,7 @@ fn optimizing_admission_for_region(
                 }
             }
             admission
-                .total_array_calls
+                .proven_array_calls
                 .insert(instruction.continuation_id);
             if !matches!(operand, RegionOperand::Local(local) if new_array_locals.contains(&local))
             {
@@ -8158,7 +8161,7 @@ fn optimizing_admission_for_region(
                     .saturating_mul(crate::JIT_NATIVE_DIRECT_ARRAY_INITIAL_CAPACITY as usize),
             );
             admission
-                .total_array_calls
+                .proven_array_calls
                 .insert(instruction.continuation_id);
             entry_dependent_continuations.insert(instruction.continuation_id);
             continue;
@@ -8258,7 +8261,7 @@ fn optimizing_admission_for_region(
                     replacement.projection_allocations.saturating_add(1);
             }
             admission
-                .total_array_calls
+                .proven_array_calls
                 .insert(instruction.continuation_id);
             entry_dependent_continuations.insert(instruction.continuation_id);
             continue;
@@ -8351,7 +8354,7 @@ fn optimizing_admission_for_region(
             false,
         )?;
         admission
-            .total_array_calls
+            .proven_array_calls
             .insert(instruction.continuation_id);
         if !sources.is_empty() {
             entry_dependent_continuations.insert(instruction.continuation_id);
@@ -8403,11 +8406,11 @@ fn optimizing_admission_for_region(
                 .required_value_types
                 .push((key, return_type.clone()));
             admission
-                .total_terminators
+                .proven_terminators
                 .insert(block.terminator_continuation_id);
         }
     }
-    let cleanup_total_reference_locals = admission.total_reference_locals.clone();
+    let cleanup_proven_reference_locals = admission.proven_reference_locals.clone();
     let cleanup_total_array_parameters = admission
         .array_requirements
         .keys()
@@ -8424,7 +8427,7 @@ fn optimizing_admission_for_region(
         }
         let storage = value_flow.local_storage(local);
         let fact = publication_operand_fact(RegionOperand::Local(local));
-        cleanup_total_reference_locals.contains(&local)
+        cleanup_proven_reference_locals.contains(&local)
             || by_ref_parameters.contains(&local)
             || cleanup_total_array_parameters.contains(&local)
             || fact.certainty != crate::region_ir::SsaCertainty::Unknown
@@ -8561,7 +8564,7 @@ fn optimizing_admission_for_region(
             local,
             finally: None,
         } = block.terminator
-            && !admission.total_reference_locals.contains(&local)
+            && !admission.proven_reference_locals.contains(&local)
             && let Some([(store, source)]) = local_store_sources.get(&local).map(Vec::as_slice)
         {
             let fact = lowering_operand_fact(value_flow, constants, *source);
@@ -8571,8 +8574,8 @@ fn optimizing_admission_for_region(
                     SsaValueClass::ReferenceHandle | SsaValueClass::MixedHandle
                 )
             {
-                admission.total_return_reference_stores.insert(*store);
-                admission.total_return_reference_locals.insert(local);
+                admission.proven_return_reference_stores.insert(*store);
+                admission.proven_return_reference_locals.insert(local);
                 admission.fixed_value_allocations =
                     admission.fixed_value_allocations.saturating_add(1);
             }
@@ -8656,7 +8659,7 @@ fn optimizing_admission_for_region(
                                 .return_plans
                                 .contains_key(&block.terminator_continuation_id)
                             || admission
-                                .total_terminators
+                                .proven_terminators
                                 .contains(&block.terminator_continuation_id)
                     });
                     return_type_total && cleanup_total
@@ -8666,9 +8669,9 @@ fn optimizing_admission_for_region(
                     finally: None,
                 } => {
                     let reference_total = value_flow.local_storage(local).is_reference_slot()
-                        && (admission.total_reference_locals.contains(&local)
+                        && (admission.proven_reference_locals.contains(&local)
                             || by_ref_parameters.contains(&local)
-                            || admission.total_return_reference_locals.contains(&local));
+                            || admission.proven_return_reference_locals.contains(&local));
                     let return_type_total =
                         region.return_type.as_ref().is_none_or(|return_type| {
                             optimizing_fact_satisfies_type(
@@ -8703,7 +8706,7 @@ fn optimizing_admission_for_region(
                         RegionOperand::Local(local)
                             if value_flow.local_storage(local).is_reference_slot() =>
                         {
-                            admission.total_reference_locals.contains(&local)
+                            admission.proven_reference_locals.contains(&local)
                                 || by_ref_parameters.contains(&local)
                         }
                         _ => {
@@ -8740,7 +8743,7 @@ fn optimizing_admission_for_region(
             ));
         }
         admission
-            .total_terminators
+            .proven_terminators
             .insert(block.terminator_continuation_id);
     }
     if let Some(continuation_id) = entry_dependent_continuations
@@ -8762,7 +8765,7 @@ fn optimizing_admission_for_region(
         let Some(family) = stable_exact_control_builtin_family(&call.target) else {
             continue;
         };
-        publish_total_fixed_builtin_plan(
+        publish_fixed_builtin_assumptions(
             &mut admission,
             call,
             instruction.continuation_id,
@@ -8799,7 +8802,7 @@ fn optimizing_admission_for_region(
     for requirement in admission.array_requirements.values_mut() {
         requirement.require_total_values = true;
     }
-    admission.reference_payloads_are_total = true;
+    admission.reference_payloads_are_proven = true;
     Ok(admission)
 }
 
@@ -9518,6 +9521,9 @@ pub(super) fn instruction_has_native_transition(
     // code produced a state the corresponding Generic artifact could not
     // enter.
     if instruction.optimizer_transition_entry {
+        return true;
+    }
+    if crate::region_ir::generic_instruction_lowering(&instruction.source_kind).requires_safepoint {
         return true;
     }
     // Checked binary operations can request a baseline retry. A userland call
@@ -16599,11 +16605,13 @@ pub(super) fn select_native_region_tier(
         let _ = crate::region_ir::opt::optimize_executable_region(candidate);
         for block in &mut candidate.blocks {
             for instruction in &mut block.instructions {
-                // Optimizing publication is now all-or-nothing. Unsupported
-                // semantic shapes reject the complete optimizing artifact
-                // before publication, so no instruction is a local
-                // fast/slow-island entry.
-                instruction.optimizer_transition_entry = false;
+                // Every PHP-visible safepoint is also a precise generated
+                // Generic continuation. Optional optimizing admission may
+                // specialize through it; missing publication data selects
+                // this local continuation instead of rejecting the function.
+                instruction.optimizer_transition_entry =
+                    crate::region_ir::generic_instruction_lowering(&instruction.source_kind)
+                        .requires_safepoint;
                 instruction.transition_live_registers = None;
             }
         }
@@ -17850,7 +17858,7 @@ fn lower_entry_array_source(
                 continuation_id,
                 deopt_out,
             );
-            emit_optimizing_entry_total_direct_reference(builder, reference, deopt_out, rejected);
+            emit_optimizing_entry_direct_reference_guard(builder, reference, deopt_out, rejected);
             let slot = lower_optimizing_slot_address(builder, reference, deopt_out);
             let value = builder.ins().load(
                 types::I64,
@@ -17999,7 +18007,7 @@ fn emit_optimizing_entry_array_probe_paths(
             let found_block = builder.create_block();
             builder.ins().brif(found, found_block, &[], path_done, &[]);
             builder.switch_to_block(found_block);
-            emit_optimizing_entry_total_native_value(builder, value, deopt_out, rejected);
+            emit_optimizing_entry_native_value_guard(builder, value, deopt_out, rejected);
             if index + 1 < path.keys.len() {
                 let (_, child_length, child_entries) =
                     emit_optimizing_entry_direct_array_descriptor(
@@ -18326,7 +18334,7 @@ fn emit_optimizing_entry_property_slot(
         property_slot,
         std::mem::offset_of!(php_runtime::api::NativeDeclaredPropertySlot, value) as i32,
     );
-    emit_optimizing_entry_total_native_value(builder, value, deopt_out, rejected);
+    emit_optimizing_entry_native_value_guard(builder, value, deopt_out, rejected);
     let initialized = builder.ins().icmp_imm(IntCC::NotEqual, initialized, 0);
     let reference = lower_value_has_tag(builder, value, crate::JIT_VALUE_RUNTIME_REFERENCE_TAG);
     let plain = builder.ins().icmp_imm(IntCC::Equal, reference, 0);
@@ -18523,7 +18531,7 @@ fn emit_optimizing_entry_static_property(
         slot,
         std::mem::offset_of!(crate::JitNativeStaticPropertySlot, value) as i32,
     );
-    emit_optimizing_entry_total_native_value(builder, value, deopt_out, rejected);
+    emit_optimizing_entry_native_value_guard(builder, value, deopt_out, rejected);
     let reference = lower_value_has_tag(builder, value, crate::JIT_VALUE_RUNTIME_REFERENCE_TAG);
     let plain = builder.ins().icmp_imm(IntCC::Equal, reference, 0);
     let reference_shape = if requirement.require_reference {
@@ -19175,7 +19183,7 @@ fn emit_optimizing_entry_callable(
     let capture = builder
         .ins()
         .load(types::I64, MemFlagsData::new(), capture_pointer, 0);
-    emit_optimizing_entry_total_native_value(builder, capture, deopt_out, rejected);
+    emit_optimizing_entry_native_value_guard(builder, capture, deopt_out, rejected);
     let capture_index = builder.ins().iadd_imm(capture_index, 1);
     builder.ins().jump(scan, &[capture_index.into()]);
     builder.switch_to_block(captures_accepted);
@@ -19186,7 +19194,7 @@ fn emit_optimizing_entry_callable(
 /// are complete native descriptors. This guard is emitted once in the entry
 /// publication region; optimizing operations consume the resulting compile-
 /// time witness and never reconstruct a local slow path.
-fn emit_optimizing_entry_total_native_value(
+fn emit_optimizing_entry_native_value_guard(
     builder: &mut FunctionBuilder<'_>,
     value: ir::Value,
     deopt_out: ir::Value,
@@ -19456,7 +19464,7 @@ fn emit_optimizing_entry_total_native_value(
     builder.switch_to_block(accepted);
 }
 
-fn emit_optimizing_entry_total_direct_reference(
+fn emit_optimizing_entry_direct_reference_guard(
     builder: &mut FunctionBuilder<'_>,
     reference: ir::Value,
     deopt_out: ir::Value,
@@ -19473,17 +19481,17 @@ fn emit_optimizing_entry_total_direct_reference(
     let admitted = builder.ins().band(tagged, direct);
     builder.ins().brif(admitted, inspect, &[], rejected, &[]);
     builder.switch_to_block(inspect);
-    emit_optimizing_entry_total_native_value(builder, reference, deopt_out, rejected);
+    emit_optimizing_entry_native_value_guard(builder, reference, deopt_out, rejected);
 }
 
-fn emit_optimizing_entry_admission(
+fn emit_optimizing_entry_guards(
     builder: &mut FunctionBuilder<'_>,
-    admission: &NativeOptimizingAdmission,
+    admission: &NativeOptimizingAssumptions,
     arguments: ir::Value,
-    result_out: ir::Value,
     deopt_out: ir::Value,
     function: FunctionId,
     accepted: ir::Block,
+    rejected: ir::Block,
 ) -> Result<(), CraneliftLoweringError> {
     if admission.array_requirements.is_empty()
         && admission.initialized_request_locals.is_empty()
@@ -19491,7 +19499,7 @@ fn emit_optimizing_entry_admission(
         && admission.initialized_globals.is_empty()
         && admission.releasable_globals.is_empty()
         && admission.plain_globals.is_empty()
-        && admission.total_value_parameters.is_empty()
+        && admission.proven_value_parameters.is_empty()
         && admission.property_requirements.is_empty()
         && admission.static_property_requirements.is_empty()
         && admission.object_layout_requirements.is_empty()
@@ -19515,17 +19523,19 @@ fn emit_optimizing_entry_admission(
         builder.ins().jump(accepted, &[]);
         return Ok(());
     }
-    let rejected = builder.create_block();
-    builder.set_cold_block(rejected);
     let pointer_type = builder.func.dfg.value_type(deopt_out);
-    for parameter_index in admission.total_value_parameters.iter().copied() {
+    for parameter_index in admission
+        .proven_value_parameters
+        .difference(&admission.generated_variadic_parameters)
+        .copied()
+    {
         let value = builder.ins().load(
             types::I64,
             MemFlagsData::new(),
             arguments,
             i32::try_from(parameter_index.saturating_mul(8)).unwrap_or(i32::MAX),
         );
-        emit_optimizing_entry_total_native_value(builder, value, deopt_out, rejected);
+        emit_optimizing_entry_native_value_guard(builder, value, deopt_out, rejected);
     }
     if admission.require_non_fiber_scope {
         let view = lower_active_runtime_view(builder, deopt_out);
@@ -20152,7 +20162,7 @@ fn emit_optimizing_entry_admission(
     }
     for local in admission.initialized_request_locals.iter().copied() {
         let reference = lower_trusted_request_local_reference(builder, deopt_out, function, local);
-        emit_optimizing_entry_total_direct_reference(builder, reference, deopt_out, rejected);
+        emit_optimizing_entry_direct_reference_guard(builder, reference, deopt_out, rejected);
         let slot = lower_optimizing_slot_address(builder, reference, deopt_out);
         let payload = builder.ins().load(
             types::I64,
@@ -20176,7 +20186,7 @@ fn emit_optimizing_entry_admission(
             continuation_id,
             deopt_out,
         );
-        emit_optimizing_entry_total_direct_reference(builder, reference, deopt_out, rejected);
+        emit_optimizing_entry_direct_reference_guard(builder, reference, deopt_out, rejected);
         let slot = lower_optimizing_slot_address(builder, reference, deopt_out);
         let payload = builder.ins().load(
             types::I64,
@@ -20200,7 +20210,7 @@ fn emit_optimizing_entry_admission(
             continuation_id,
             deopt_out,
         );
-        emit_optimizing_entry_total_direct_reference(builder, reference, deopt_out, rejected);
+        emit_optimizing_entry_direct_reference_guard(builder, reference, deopt_out, rejected);
         let slot = lower_optimizing_slot_address(builder, reference, deopt_out);
         let payload = builder.ins().load(
             types::I64,
@@ -20217,7 +20227,7 @@ fn emit_optimizing_entry_admission(
     }
     for local in admission.releasable_request_locals.iter().copied() {
         let reference = lower_trusted_request_local_reference(builder, deopt_out, function, local);
-        emit_optimizing_entry_total_direct_reference(builder, reference, deopt_out, rejected);
+        emit_optimizing_entry_direct_reference_guard(builder, reference, deopt_out, rejected);
         let slot = lower_optimizing_slot_address(builder, reference, deopt_out);
         let payload = builder.ins().load(
             types::I64,
@@ -20250,7 +20260,7 @@ fn emit_optimizing_entry_admission(
             continuation_id,
             deopt_out,
         );
-        emit_optimizing_entry_total_direct_reference(builder, reference, deopt_out, rejected);
+        emit_optimizing_entry_direct_reference_guard(builder, reference, deopt_out, rejected);
         let slot = lower_optimizing_slot_address(builder, reference, deopt_out);
         let payload = builder.ins().load(
             types::I64,
@@ -20319,11 +20329,6 @@ fn emit_optimizing_entry_admission(
             .all(|requirement| requirement.allocation_multiplier == 0)
     {
         builder.ins().jump(accepted, &[]);
-        builder.switch_to_block(rejected);
-        let contract_violation = builder
-            .ins()
-            .iconst(types::I32, i64::from(crate::JitCallStatus::ABI_MISMATCH.0));
-        return_native_php_control(builder, contract_violation, result_out);
         return Ok(());
     }
     let mut required_entries = builder.ins().iconst(
@@ -20394,6 +20399,13 @@ fn emit_optimizing_entry_admission(
     }
     let mut admitted_array_lengths = BTreeMap::new();
     for (source, requirement) in &admission.array_requirements {
+        if matches!(
+            source,
+            NativeEntryArraySource::Parameter(index)
+                if admission.generated_variadic_parameters.contains(index)
+        ) {
+            continue;
+        }
         let inspect = builder.create_block();
         let inspect_slot = builder.create_block();
         let source_accepted = builder.create_block();
@@ -20571,7 +20583,7 @@ fn emit_optimizing_entry_admission(
                 entry,
                 std::mem::offset_of!(crate::JitNativeDirectArrayEntry, value) as i32,
             );
-            emit_optimizing_entry_total_native_value(builder, value, deopt_out, rejected);
+            emit_optimizing_entry_native_value_guard(builder, value, deopt_out, rejected);
             let reference =
                 lower_value_has_tag(builder, value, crate::JIT_VALUE_RUNTIME_REFERENCE_TAG);
             let plain = builder.ins().icmp_imm(IntCC::Equal, reference, 0);
@@ -21084,11 +21096,6 @@ fn emit_optimizing_entry_admission(
         });
     if !requires_resource_budget {
         builder.ins().jump(accepted, &[]);
-        builder.switch_to_block(rejected);
-        let contract_violation = builder
-            .ins()
-            .iconst(types::I32, i64::from(crate::JitCallStatus::ABI_MISMATCH.0));
-        return_native_php_control(builder, contract_violation, result_out);
         return Ok(());
     }
 
@@ -21176,12 +21183,124 @@ fn emit_optimizing_entry_admission(
     builder
         .ins()
         .brif(resources_fit, accepted, &[], rejected, &[]);
+    Ok(())
+}
 
-    builder.switch_to_block(rejected);
-    let contract_violation = builder
+fn lower_optimizing_generic_entry(
+    module: &JITModule,
+    builder: &mut FunctionBuilder<'_>,
+    runtime: ir::Value,
+    arguments: ir::Value,
+    deopt_out: ir::Value,
+    function: FunctionId,
+) {
+    let pointer_type = module.target_config().pointer_type();
+    let runtime_view = lower_active_runtime_view(builder, deopt_out);
+    let generic_entries = builder.ins().load(
+        pointer_type,
+        MemFlagsData::new(),
+        runtime_view,
+        std::mem::offset_of!(
+            crate::JitNativeRuntimeView,
+            trusted_generic_function_entries
+        ) as i32,
+    );
+    let entry_offset = i64::try_from(
+        function
+            .index()
+            .saturating_mul(pointer_type.bytes() as usize),
+    )
+    .unwrap_or(i64::MAX);
+    let entry_cell = builder.ins().iadd_imm(generic_entries, entry_offset);
+    let address = builder
         .ins()
-        .iconst(types::I32, i64::from(crate::JitCallStatus::ABI_MISMATCH.0));
-    return_native_php_control(builder, contract_violation, result_out);
+        .atomic_load(pointer_type, MemFlagsData::new(), entry_cell);
+    let normal_entry = builder.ins().iconst(types::I32, -1);
+    let no_resume_state = builder.ins().iconst(pointer_type, 0);
+    let signature = builder.import_signature(native_php_entry_signature(module));
+    let call = builder.ins().call_indirect(
+        signature,
+        address,
+        &[runtime, arguments, deopt_out, normal_entry, no_resume_state],
+    );
+    let results = builder.inst_results(call).to_vec();
+    builder.ins().return_(&results);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_optimizing_generic_continuation(
+    module: &JITModule,
+    builder: &mut FunctionBuilder<'_>,
+    runtime: ir::Value,
+    arguments: ir::Value,
+    result_out: ir::Value,
+    deopt_out: ir::Value,
+    function: FunctionId,
+    local_count: u32,
+    continuation_id: u32,
+    live_locals: &[LocalId],
+    locals: &NativeLocalMap,
+    registers: &NativeRegisterMap,
+    live_registers: &[RegId],
+    native_version: u32,
+    canonical_entry: bool,
+) -> Result<(), CraneliftLoweringError> {
+    publish_native_continuation_state(
+        builder,
+        deopt_out,
+        function,
+        local_count,
+        continuation_id,
+        live_locals,
+        locals,
+        native_version,
+    )?;
+    publish_native_register_state(builder, deopt_out, registers, live_registers)?;
+
+    let pointer_type = module.target_config().pointer_type();
+    let runtime_view = lower_active_runtime_view(builder, deopt_out);
+    let generic_entries = builder.ins().load(
+        pointer_type,
+        MemFlagsData::new(),
+        runtime_view,
+        std::mem::offset_of!(
+            crate::JitNativeRuntimeView,
+            trusted_generic_function_entries
+        ) as i32,
+    );
+    let entry_offset = i64::try_from(
+        function
+            .index()
+            .saturating_mul(pointer_type.bytes() as usize),
+    )
+    .unwrap_or(i64::MAX);
+    let entry_cell = builder.ins().iadd_imm(generic_entries, entry_offset);
+    let address = builder
+        .ins()
+        .atomic_load(pointer_type, MemFlagsData::new(), entry_cell);
+    let resume_id = builder.ins().iconst(
+        types::I32,
+        i64::from(crate::native_transition_resume_id(continuation_id)),
+    );
+    let signature = builder.import_signature(native_php_entry_signature(module));
+    let call = builder.ins().call_indirect(
+        signature,
+        address,
+        &[runtime, arguments, deopt_out, resume_id, deopt_out],
+    );
+    if canonical_entry {
+        let results = builder.inst_results(call).to_vec();
+        builder.ins().return_(&results);
+    } else {
+        let status = unpack_native_php_control(builder, call, result_out);
+        builder.ins().return_(&[status]);
+    }
+    // Keep later CFG-owned transition blocks structurally defined even
+    // though the live path tail-exited through Generic. They remain
+    // unreachable and are removed by Cranelift.
+    let unreachable = builder.create_block();
+    builder.set_cold_block(unreachable);
+    builder.switch_to_block(unreachable);
     Ok(())
 }
 
@@ -21208,17 +21327,21 @@ fn define_region_graph_function(
     preflight_only: bool,
 ) -> Result<DefinedRegionFunction, CraneliftLoweringError> {
     let pointer_type = module.target_config().pointer_type();
-    let optimizing_admission = if region.compile_metadata.tier == NativeCompilerTier::Optimizing {
-        optimizing_admission_for_region(
-            region,
-            constants,
-            value_flow,
-            function_params,
-            external_function_signatures,
-        )?
-    } else {
-        NativeOptimizingAdmission::default()
-    };
+    let (optimizing_assumptions, needs_local_generic_continuation) =
+        if region.compile_metadata.tier == NativeCompilerTier::Optimizing {
+            match collect_optimizing_assumptions(
+                region,
+                constants,
+                value_flow,
+                function_params,
+                external_function_signatures,
+            ) {
+                Ok(admission) => (admission, false),
+                Err(_) => (NativeOptimizingAssumptions::default(), true),
+            }
+        } else {
+            (NativeOptimizingAssumptions::default(), false)
+        };
     let mut maximum_temporary_cache_entries = 0_usize;
     let mut production_lowering = Vec::new();
     ctx.func.signature = if fragment.is_some() && !inline_fragment_entry {
@@ -21227,9 +21350,8 @@ fn define_region_graph_function(
         region_graph_signature(module, region)?
     };
     ctx.func.name = UserFuncName::user(0, func_id.as_u32());
-    // A rejected optimizing preflight can return while a builder is still
-    // live. Keep its SSA context invocation-local so the following baseline
-    // compilation cannot inherit partially constructed frontend state.
+    // Keep the SSA context invocation-local so a failed optional-assumption
+    // collection cannot leak partially constructed frontend state.
     let mut builder_context = FunctionBuilderContext::new();
     {
         let mut builder = FunctionBuilder::new(&mut ctx.func, &mut builder_context);
@@ -21725,20 +21847,31 @@ fn define_region_graph_function(
         {
             let admission = builder.create_block();
             let bind_parameters = builder.create_block();
+            let generic_entry = builder.create_block();
+            builder.set_cold_block(generic_entry);
             let normal_invocation = builder.ins().icmp_imm(IntCC::Equal, resume_id, -1);
             builder
                 .ins()
                 .brif(normal_invocation, admission, &[], bind_parameters, &[]);
             builder.switch_to_block(admission);
-            emit_optimizing_entry_admission(
+            emit_optimizing_entry_guards(
                 &mut builder,
-                &optimizing_admission,
+                &optimizing_assumptions,
                 arguments,
-                result_out,
                 deopt_out,
                 region.function,
                 bind_parameters,
+                generic_entry,
             )?;
+            builder.switch_to_block(generic_entry);
+            lower_optimizing_generic_entry(
+                module,
+                &mut builder,
+                runtime,
+                arguments,
+                deopt_out,
+                region.function,
+            );
             builder.switch_to_block(bind_parameters);
         }
         if fragment.is_none() {
@@ -22488,6 +22621,61 @@ fn define_region_graph_function(
                     .get(&instruction.continuation_id)
                     .map(Vec::as_slice)
                     .unwrap_or_default();
+                if matches!(tier_operations, NativeTierOperations::Optimizing { .. })
+                    && (matches!(
+                        instruction.kind,
+                        RegionInstructionKind::NativeDynamicCode(_)
+                    ) || matches!(
+                        &instruction.kind,
+                        RegionInstructionKind::NativeCall(call)
+                            if (call.direct_compiled_target().is_none()
+                                && !matches!(call.target, RegionCallTarget::Semantic { .. })
+                                && baseline_builtin_helper_id(&call.target).is_none()
+                                    && direct_linked_signature(
+                                        call,
+                                        external_function_signatures,
+                                    )
+                                    .is_none())
+                                || (baseline_builtin_helper_id(&call.target).is_some()
+                                    && !optimizing_assumptions.fixed_builtin_call_is_proven(
+                                        instruction.continuation_id,
+                                    ))
+                    ) || needs_local_generic_continuation
+                        && instruction.optimizer_transition_entry)
+                {
+                    lower_optimizing_generic_continuation(
+                        module,
+                        &mut builder,
+                        runtime,
+                        arguments,
+                        result_out,
+                        deopt_out,
+                        region.function,
+                        region.local_count,
+                        instruction.continuation_id,
+                        &instruction.live_locals,
+                        &locals,
+                        &registers,
+                        transition_live_registers,
+                        native_version,
+                        canonical_entry,
+                    )?;
+                    production_lowering.push(crate::JitProductionLoweringMetadata {
+                        function: region.function,
+                        continuation_id: instruction.continuation_id,
+                        operation: crate::region_ir::generic_instruction_lowering(
+                            &instruction.source_kind,
+                        )
+                        .variant
+                        .to_owned(),
+                        class: crate::JitProductionLoweringClass::CompiledNativeCall,
+                    });
+                    // Continue structurally so later resume-entry blocks are
+                    // defined. The current block is unreachable after the
+                    // generated tail transfer, so no later instruction runs
+                    // on this path.
+                    continue;
+                }
                 match tier_operations {
                     NativeTierOperations::Optimizing { operations } => {
                         lower_optimizing_region_instruction(
@@ -22500,34 +22688,40 @@ fn define_region_graph_function(
                             &mut registers,
                             instruction,
                             transition_live_registers,
-                            optimizing_admission.array_call_is_total(instruction.continuation_id),
-                            optimizing_admission
-                                .fixed_builtin_call_is_total(instruction.continuation_id),
-                            optimizing_admission
-                                .array_instruction_is_total(instruction.continuation_id),
-                            optimizing_admission.array_instruction_root_is_by_reference(
+                            optimizing_assumptions.array_call_is_proven(instruction.continuation_id),
+                            optimizing_assumptions
+                                .fixed_builtin_call_is_proven(instruction.continuation_id),
+                            optimizing_assumptions
+                                .array_instruction_is_proven(instruction.continuation_id),
+                            optimizing_assumptions.array_instruction_root_is_by_reference(
                                 instruction.continuation_id,
                             ),
-                            optimizing_admission
-                                .binary_instruction_is_total(instruction.continuation_id),
-                            optimizing_admission
+                            optimizing_assumptions
+                                .binary_instruction_is_proven(instruction.continuation_id),
+                            optimizing_assumptions
                                 .binary_instruction_operand_classes(instruction.continuation_id),
-                            optimizing_admission
-                                .scalar_control_instruction_is_total(instruction.continuation_id),
-                            optimizing_admission
+                            optimizing_assumptions
+                                .scalar_control_instruction_is_proven(instruction.continuation_id),
+                            optimizing_assumptions
                                 .array_instruction_is_fresh(instruction.continuation_id),
-                            optimizing_admission.fresh_array_capacity(instruction.continuation_id),
-                            optimizing_admission.local_load_is_total(instruction.continuation_id),
-                            optimizing_admission
-                                .request_local_store_is_total(instruction.continuation_id),
-                            optimizing_admission
-                                .return_reference_store_is_total(instruction.continuation_id),
-                            optimizing_admission.reference_payload_proof().ok_or_else(|| {
-                                CraneliftLoweringError::new(
-                                    "JIT_CRANELIFT_REFERENCE_PAYLOAD_PUBLICATION",
-                                    "optimizing lowering requires total reference payload publication",
-                                )
-                            })?,
+                            optimizing_assumptions.fresh_array_capacity(instruction.continuation_id),
+                            optimizing_assumptions.local_load_is_proven(instruction.continuation_id),
+                            optimizing_assumptions
+                                .request_local_store_is_proven(instruction.continuation_id),
+                            optimizing_assumptions
+                                .return_reference_store_is_proven(instruction.continuation_id),
+                            optimizing_assumptions
+                                .reference_payload_proof()
+                                .or_else(|| {
+                                    needs_local_generic_continuation
+                                        .then_some(NativeReferencePayloadProof(()))
+                                })
+                                .ok_or_else(|| {
+                                    CraneliftLoweringError::new(
+                                        "JIT_CRANELIFT_REFERENCE_PAYLOAD_PUBLICATION",
+                                        "optimizing lowering requires total reference payload publication",
+                                    )
+                                })?,
                             constants,
                             value_flow,
                             inline_constants,
@@ -22579,30 +22773,30 @@ fn define_region_graph_function(
                             transition_live_registers,
                             true,
                             true,
-                            optimizing_admission
-                                .array_instruction_is_total(instruction.continuation_id),
-                            optimizing_admission.array_instruction_root_is_by_reference(
+                            optimizing_assumptions
+                                .array_instruction_is_proven(instruction.continuation_id),
+                            optimizing_assumptions.array_instruction_root_is_by_reference(
                                 instruction.continuation_id,
                             ),
-                            optimizing_admission
-                                .binary_instruction_is_total(instruction.continuation_id),
-                            optimizing_admission.binary_instruction_operand_classes(
+                            optimizing_assumptions
+                                .binary_instruction_is_proven(instruction.continuation_id),
+                            optimizing_assumptions.binary_instruction_operand_classes(
                                 instruction.continuation_id,
                             ),
-                            optimizing_admission
-                                .scalar_control_instruction_is_total(instruction.continuation_id),
-                            optimizing_admission
+                            optimizing_assumptions
+                                .scalar_control_instruction_is_proven(instruction.continuation_id),
+                            optimizing_assumptions
                                 .array_instruction_is_fresh(instruction.continuation_id),
-                            optimizing_admission.fresh_array_capacity(
+                            optimizing_assumptions.fresh_array_capacity(
                                 instruction.continuation_id,
                             ),
-                            optimizing_admission.local_load_is_total(
+                            optimizing_assumptions.local_load_is_proven(
                                 instruction.continuation_id,
                             ),
-                            optimizing_admission.request_local_store_is_total(
+                            optimizing_assumptions.request_local_store_is_proven(
                                 instruction.continuation_id,
                             ),
-                            optimizing_admission.return_reference_store_is_total(
+                            optimizing_assumptions.return_reference_store_is_proven(
                                 instruction.continuation_id,
                             ),
                             NativeReferencePayloadProof(()),
@@ -22717,6 +22911,42 @@ fn define_region_graph_function(
             builder.set_srcloc(ir::SourceLoc::new(
                 region_block.terminator_continuation_id.saturating_add(1),
             ));
+            if needs_local_generic_continuation
+                && matches!(tier_operations, NativeTierOperations::Optimizing { .. })
+            {
+                let live_registers = transition_register_liveness
+                    .get(&region_block.terminator_continuation_id)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
+                lower_optimizing_generic_continuation(
+                    module,
+                    &mut builder,
+                    runtime,
+                    arguments,
+                    result_out,
+                    deopt_out,
+                    region.function,
+                    region.local_count,
+                    region_block.terminator_continuation_id,
+                    &region_block.terminator_live_locals,
+                    &locals,
+                    &registers,
+                    live_registers,
+                    native_version,
+                    canonical_entry,
+                )?;
+                production_lowering.push(crate::JitProductionLoweringMetadata {
+                    function: region.function,
+                    continuation_id: region_block.terminator_continuation_id,
+                    operation: crate::region_ir::generic_terminator_lowering(
+                        &region_block.source_terminator,
+                    )
+                    .variant
+                    .to_owned(),
+                    class: crate::JitProductionLoweringClass::CompiledNativeCall,
+                });
+                continue;
+            }
             // Streaming definitions store through to every externally live
             // frame slot immediately. Re-emitting all successor live-ins here
             // duplicated stores on every CFG edge and inflated both baseline
@@ -22727,8 +22957,8 @@ fn define_region_graph_function(
                     let value_release_commit =
                         module.declare_func_in_func(operations.value_release_commit, builder.func);
                     debug_assert!(
-                        optimizing_admission
-                            .terminator_is_total(region_block.terminator_continuation_id),
+                        optimizing_assumptions
+                            .terminator_is_proven(region_block.terminator_continuation_id),
                         "optimizing terminators are total before lowering"
                     );
                     lower_optimizing_region_terminator(
@@ -22739,17 +22969,17 @@ fn define_region_graph_function(
                         result_out,
                         deopt_out,
                         value_release_commit,
-                        optimizing_admission.return_plan(region_block.terminator_continuation_id),
+                        optimizing_assumptions.return_plan(region_block.terminator_continuation_id),
                         match region_block.terminator {
                             RegionTerminator::ReturnReference { local, .. } => {
-                                optimizing_admission.return_reference_is_prebound(local)
+                                optimizing_assumptions.return_reference_is_prebound(local)
                                     || region.params.iter().any(|parameter| {
                                         parameter.local == local && parameter.by_ref
                                     })
                             }
                             _ => false,
                         },
-                        optimizing_admission.reference_payload_proof().ok_or_else(|| {
+                        optimizing_assumptions.reference_payload_proof().ok_or_else(|| {
                             CraneliftLoweringError::new(
                                 "JIT_CRANELIFT_REFERENCE_PAYLOAD_PUBLICATION",
                                 "optimizing terminator requires total reference payload publication",

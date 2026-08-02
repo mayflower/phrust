@@ -6599,7 +6599,7 @@ fn optimizing_gc_family_imports_only_fixed_native_handlers() {
 }
 
 #[test]
-fn optimizing_resource_query_family_imports_only_fixed_native_handlers() {
+fn optimizing_resource_query_family_publishes_exact_or_generic_native_paths() {
     for (ordinal, builtin) in StableResourceQueryBuiltin::all().into_iter().enumerate() {
         let name = builtin.symbol().trim_start_matches("phrust_native_");
         let mut builder = IrBuilder::new(UnitId::new(4_325 + ordinal as u32));
@@ -6659,15 +6659,12 @@ fn optimizing_resource_query_family_imports_only_fixed_native_handlers() {
             },
         });
         if builtin == StableResourceQueryBuiltin::All {
-            assert!(
-                matches!(
-                    &outcome.status,
-                    JitCompileStatus::Rejected { reason }
-                        if reason == "JIT_CRANELIFT_REJECT_RESOURCE_INVENTORY_PUBLICATION"
-                ),
-                "{outcome:?}"
-            );
-            assert!(outcome.handle.is_none());
+            assert_eq!(outcome.status, JitCompileStatus::Compiled, "{outcome:?}");
+            let handle = outcome
+                .handle
+                .expect("resource inventory retains an Optimizing artifact");
+            assert_optimizing_artifact(&handle);
+            assert!(handle.ssa_metrics().0 > 0);
             continue;
         }
         assert_eq!(outcome.status, JitCompileStatus::Compiled, "{outcome:?}");
@@ -7524,7 +7521,7 @@ fn optimizing_request_query_family_imports_only_fixed_native_handlers() {
 }
 
 #[test]
-fn optimizing_fixed_builtin_without_exact_family_is_rejected_before_codegen() {
+fn optimizing_fixed_builtin_without_exact_family_publishes_a_generic_continuation() {
     let mut builder = IrBuilder::new(UnitId::new(4_329));
     let file = builder.add_file("optimizing-reject-generic-builtin.php");
     let span = IrSpan::new(file, 0, 1);
@@ -7582,19 +7579,18 @@ fn optimizing_fixed_builtin_without_exact_family_is_rejected_before_codegen() {
             ..crate::JitRuntimeHelperAddresses::default()
         },
     });
-    assert!(
-        matches!(
-            &outcome.status,
-            JitCompileStatus::Rejected { reason }
-                if reason.contains("JIT_CRANELIFT_REJECT_GENERIC_OPTIMIZING_BUILTIN")
-        ),
-        "{outcome:?}"
-    );
-    assert!(outcome.handle.is_none());
+    assert_eq!(outcome.status, JitCompileStatus::Compiled, "{outcome:?}");
+    let handle = outcome
+        .handle
+        .expect("unsupported fixed builtin should retain an Optimizing artifact");
+    assert_optimizing_artifact(&handle);
+    let (promoted_locals, promoted_registers, _) = handle.ssa_metrics();
+    assert!(promoted_locals > 0);
+    assert!(promoted_registers > 0);
 }
 
 #[test]
-fn optimizing_fixed_cold_builtin_families_are_rejected_before_entry() {
+fn optimizing_fixed_cold_builtin_families_publish_generic_continuations() {
     for (ordinal, name) in [
         "chgrp",
         "chown",
@@ -7666,15 +7662,18 @@ fn optimizing_fixed_cold_builtin_families_are_rejected_before_entry() {
                 ..crate::JitRuntimeHelperAddresses::default()
             },
         });
-        assert!(
-            matches!(
-                outcome.status,
-                JitCompileStatus::Rejected { ref reason }
-                    if reason.starts_with("JIT_CRANELIFT_REJECT_")
-            ),
-            "{name}: {outcome:?}",
+        assert_eq!(
+            outcome.status,
+            JitCompileStatus::Compiled,
+            "{name}: {outcome:?}"
         );
-        assert!(outcome.handle.is_none());
+        let handle = outcome
+            .handle
+            .expect("cold fixed builtin should retain an Optimizing artifact");
+        assert_optimizing_artifact(&handle);
+        let (promoted_locals, promoted_registers, _) = handle.ssa_metrics();
+        assert!(promoted_locals > 0, "{name}");
+        assert!(promoted_registers > 0, "{name}");
     }
 }
 
@@ -13053,11 +13052,12 @@ fn native_unwind_resumes_compiled_catch_without_interpreter_frame() {
     });
     assert_eq!(
         optimizing_outcome.status,
-        JitCompileStatus::Rejected {
-            reason: "JIT_CRANELIFT_REJECT_NON_TOTAL_CALL_PUBLICATION".to_owned(),
-        },
-        "an unprepared dynamic throw target must be rejected before optimizer entry: {optimizing_outcome:?}"
+        JitCompileStatus::Compiled,
+        "unprepared throw targets use a local Generic continuation: {optimizing_outcome:?}"
     );
+    let optimizing = optimizing_outcome
+        .handle
+        .expect("Optimizing catch with Generic call continuation");
     let mut baseline_entries = (0..unit.functions.len())
         .map(|_| std::sync::atomic::AtomicUsize::new(0))
         .collect::<Vec<_>>();
@@ -13078,6 +13078,12 @@ fn native_unwind_resumes_compiled_catch_without_interpreter_frame() {
             value == 33 && types == ["runtimeexception"]
         })
         .expect("explicit native unwind");
+    assert_eq!(native, crate::JitI64InvokeOutcome::Returned(33));
+    let native = optimizing
+        .invoke_i64_with_native_unwind(&[], JIT_RUNTIME_ABI_HASH, |types, value| {
+            value == 33 && types == ["runtimeexception"]
+        })
+        .expect("Optimizing-to-Generic explicit native unwind");
     assert_eq!(native, crate::JitI64InvokeOutcome::Returned(33));
 }
 
@@ -15889,6 +15895,17 @@ fn generated_include_caller_invokes_resolver_published_entry_and_restores_view()
 fn optimizing_include_uses_one_generic_continuation_without_a_cold_helper() {
     let (unit, function) = scalar_native_include_fixture();
     let mut backend = CraneliftNativeCompiler;
+    let generic = backend.compile_region(&NativeCompileRequest {
+        compile: &JitCompileRequest::new("cl.region.generic-native-include").with_opt_level(0),
+        unit: Some(&unit),
+        function: Some(function),
+        runtime_helpers: crate::JitRuntimeHelperAddresses {
+            native_dynamic_code: test_native_dynamic_code as *const () as usize,
+            ..crate::JitRuntimeHelperAddresses::default()
+        },
+    });
+    assert_eq!(generic.status, JitCompileStatus::Compiled, "{generic:?}");
+    let generic = generic.handle.expect("Generic include continuation");
     let outcome = backend.compile_region(&NativeCompileRequest {
         compile: &JitCompileRequest::new("cl.region.optimizing-native-include").with_opt_level(2),
         unit: Some(&unit),
@@ -15899,14 +15916,27 @@ fn optimizing_include_uses_one_generic_continuation_without_a_cold_helper() {
         },
     });
     assert_eq!(outcome.status, JitCompileStatus::Compiled, "{outcome:?}");
-    let error = outcome
-        .handle
-        .expect("optimizing include should compile")
-        .invoke_i64(&[], JIT_RUNTIME_ABI_HASH)
-        .expect_err("standalone optimizing entry requests its Generic continuation");
+    let optimizing = outcome.handle.expect("optimizing include should compile");
+    let mut entries = (0..unit.functions.len())
+        .map(|_| std::sync::atomic::AtomicUsize::new(0))
+        .collect::<Vec<_>>();
+    entries[function.index()].store(
+        generic
+            .native_entry_address()
+            .expect("Generic include entry address"),
+        std::sync::atomic::Ordering::Release,
+    );
+    let _view = crate::activate_native_runtime_view(crate::JitNativeRuntimeView {
+        abi_version: crate::JIT_RUNTIME_ABI_VERSION,
+        trusted_generic_function_entries: entries.as_mut_ptr() as usize as u64,
+        trusted_generic_function_entry_count: entries.len() as u32,
+        ..crate::JitNativeRuntimeView::default()
+    });
     assert_eq!(
-        error,
-        crate::JitInvokeError::NativeStatus(crate::JitCallStatus::RECOMPILE_REQUESTED.0 as i32,)
+        optimizing
+            .invoke_i64(&[], JIT_RUNTIME_ABI_HASH)
+            .expect("Optimizing include enters its Generic Cranelift continuation"),
+        123,
     );
 }
 
@@ -26201,7 +26231,7 @@ fn optimizing_runtime_guarded_function_cell_calls_native_callee_without_dispatch
 }
 
 #[test]
-fn optimizing_direct_call_rejects_a_callee_with_dynamic_code_before_entry() {
+fn optimizing_dynamic_code_callee_enters_its_generated_generic_continuation() {
     NESTED_NATIVE_DYNAMIC_EFFECTS.store(0, Ordering::SeqCst);
     SSA_FORBIDDEN_HELPER_CALLS.store(0, Ordering::SeqCst);
     let mut builder = IrBuilder::new(UnitId::new(4_232));
@@ -26303,23 +26333,49 @@ fn optimizing_direct_call_rejects_a_callee_with_dynamic_code_before_entry() {
         function: Some(callee),
         runtime_helpers: helpers,
     });
-    let _optimizing_caller = backend.compile_region(&NativeCompileRequest {
+    let optimizing_caller = backend.compile_region(&NativeCompileRequest {
         compile: &JitCompileRequest::new("cl.optimizing.transition-caller").with_opt_level(2),
         unit: Some(&unit),
         function: Some(caller),
         runtime_helpers: helpers,
     });
     assert_eq!(baseline_callee.status, JitCompileStatus::Compiled);
-    assert!(
-        matches!(
-            optimizing_callee.status,
-            JitCompileStatus::Rejected { ref reason }
-                if reason == "JIT_CRANELIFT_REJECT_NON_TOTAL_OPTIMIZING_REGION"
-        ),
+    assert_eq!(
+        optimizing_callee.status,
+        JitCompileStatus::Compiled,
         "{optimizing_callee:?}"
     );
-    assert!(optimizing_callee.handle.is_none());
-    assert_eq!(NESTED_NATIVE_DYNAMIC_EFFECTS.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        optimizing_caller.status,
+        JitCompileStatus::Compiled,
+        "{optimizing_caller:?}"
+    );
+    let baseline_callee = baseline_callee.handle.expect("Generic dynamic-code callee");
+    let optimizing_callee = optimizing_callee
+        .handle
+        .expect("Optimizing dynamic-code callee");
+    let mut entries = (0..unit.functions.len())
+        .map(|_| std::sync::atomic::AtomicUsize::new(0))
+        .collect::<Vec<_>>();
+    entries[callee.index()].store(
+        baseline_callee
+            .native_entry_address()
+            .expect("Generic dynamic-code callee address"),
+        std::sync::atomic::Ordering::Release,
+    );
+    let _view = crate::activate_native_runtime_view(crate::JitNativeRuntimeView {
+        abi_version: crate::JIT_RUNTIME_ABI_VERSION,
+        trusted_generic_function_entries: entries.as_mut_ptr() as usize as u64,
+        trusted_generic_function_entry_count: entries.len() as u32,
+        ..crate::JitNativeRuntimeView::default()
+    });
+    assert_eq!(
+        optimizing_callee
+            .invoke_i64(&[], JIT_RUNTIME_ABI_HASH)
+            .expect("Optimizing dynamic code resumes in Generic Cranelift"),
+        42,
+    );
+    assert_eq!(NESTED_NATIVE_DYNAMIC_EFFECTS.load(Ordering::SeqCst), 1);
     assert_eq!(SSA_FORBIDDEN_HELPER_CALLS.load(Ordering::SeqCst), 0);
 }
 
@@ -26405,6 +26461,21 @@ fn optimizing_variadic_call_packs_one_authoritative_native_array() {
     let unit = builder.finish();
 
     let mut backend = CraneliftNativeCompiler;
+    let generic_callee_outcome = backend.compile_region(&NativeCompileRequest {
+        compile: &JitCompileRequest::new("cl.generic.variadic-callee"),
+        unit: Some(&unit),
+        function: Some(callee),
+        runtime_helpers: crate::JitRuntimeHelperAddresses::default(),
+    });
+    let generic_caller_outcome = backend.compile_region(&NativeCompileRequest {
+        compile: &JitCompileRequest::new("cl.generic.variadic-caller"),
+        unit: Some(&unit),
+        function: Some(caller),
+        runtime_helpers: crate::JitRuntimeHelperAddresses {
+            native_function_resolve: forbidden_call_dispatch as *const () as usize,
+            ..crate::JitRuntimeHelperAddresses::default()
+        },
+    });
     let callee_outcome = backend.compile_region(&NativeCompileRequest {
         compile: &JitCompileRequest::new("cl.optimizing.variadic-callee").with_opt_level(2),
         unit: Some(&unit),
@@ -26424,6 +26495,16 @@ fn optimizing_variadic_call_packs_one_authoritative_native_array() {
         },
     });
     assert_eq!(
+        generic_callee_outcome.status,
+        JitCompileStatus::Compiled,
+        "{generic_callee_outcome:?}"
+    );
+    assert_eq!(
+        generic_caller_outcome.status,
+        JitCompileStatus::Compiled,
+        "{generic_caller_outcome:?}"
+    );
+    assert_eq!(
         callee_outcome.status,
         JitCompileStatus::Compiled,
         "{callee_outcome:?}"
@@ -26433,6 +26514,12 @@ fn optimizing_variadic_call_packs_one_authoritative_native_array() {
         JitCompileStatus::Compiled,
         "{caller_outcome:?}"
     );
+    let generic_callee_handle = generic_callee_outcome
+        .handle
+        .expect("Generic variadic callee handle");
+    let generic_caller_handle = generic_caller_outcome
+        .handle
+        .expect("Generic variadic caller handle");
     let callee_handle = callee_outcome.handle.expect("variadic callee handle");
     let caller_handle = caller_outcome.handle.expect("variadic caller handle");
     assert_optimizing_artifact(&callee_handle);
@@ -26447,7 +26534,18 @@ fn optimizing_variadic_call_packs_one_authoritative_native_array() {
     let callee_address = callee_handle
         .native_entry_address()
         .expect("variadic callee executable address");
-    entries[callee.index()].store(callee_address, std::sync::atomic::Ordering::Release);
+    entries[callee.index()].store(
+        generic_callee_handle
+            .native_entry_address()
+            .expect("Generic variadic callee executable address"),
+        std::sync::atomic::Ordering::Release,
+    );
+    entries[caller.index()].store(
+        generic_caller_handle
+            .native_entry_address()
+            .expect("Generic variadic caller executable address"),
+        std::sync::atomic::Ordering::Release,
+    );
     optimizing_entries[callee.index()].store(callee_address, std::sync::atomic::Ordering::Release);
     let mut direct_slots =
         vec![crate::JitNativeValueSlot::default(); crate::JIT_NATIVE_DIRECT_VALUE_CAPACITY];
@@ -27683,7 +27781,7 @@ fn optimizing_prepared_method_default_calls_native_callee_without_dispatch() {
 }
 
 #[test]
-fn profiled_virtual_method_layout_guards_are_rejected_before_entry() {
+fn profiled_virtual_method_layout_guards_publish_optimizing_bodies() {
     let mut builder = IrBuilder::new(UnitId::new(42_340));
     let file = builder.add_file("optimizing-profiled-virtual-method.php");
     let span = IrSpan::new(file, 0, 1);
@@ -27822,12 +27920,8 @@ fn profiled_virtual_method_layout_guards_are_rejected_before_entry() {
             ..crate::JitRuntimeHelperAddresses::default()
         },
     });
-    assert!(matches!(
-        outcome.status,
-        JitCompileStatus::Rejected { ref reason }
-            if reason.starts_with("JIT_CRANELIFT_REJECT_")
-    ));
-    assert!(outcome.handle.is_none());
+    assert_eq!(outcome.status, JitCompileStatus::Compiled, "{outcome:?}");
+    assert!(outcome.handle.is_some());
 
     let linked_signature = crate::JitExternalFunctionSignature {
         name: "ProfiledReceiver::value".to_owned(),
@@ -27891,10 +27985,10 @@ fn profiled_virtual_method_layout_guards_are_rejected_before_entry() {
             ..crate::JitRuntimeHelperAddresses::default()
         },
     });
-    assert!(matches!(
+    assert_eq!(
         linked_outcome.status,
-        JitCompileStatus::Rejected { ref reason }
-            if reason.starts_with("JIT_CRANELIFT_REJECT_")
-    ));
-    assert!(linked_outcome.handle.is_none());
+        JitCompileStatus::Compiled,
+        "{linked_outcome:?}"
+    );
+    assert!(linked_outcome.handle.is_some());
 }
