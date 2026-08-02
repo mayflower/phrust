@@ -5006,7 +5006,7 @@ fn optimizing_get_class_reuses_exact_native_object_class_name_handler() {
 }
 
 #[test]
-fn optimizing_bound_closure_creation_leaves_before_region_entry() {
+fn optimizing_bound_closure_creation_and_invoke_stay_generated() {
     let mut builder = IrBuilder::new(UnitId::new(4_295));
     let file = builder.add_file("optimizing-exact-bound-closure-class.php");
     let span = IrSpan::new(file, 0, 1);
@@ -5114,15 +5114,36 @@ fn optimizing_bound_closure_creation_leaves_before_region_entry() {
             ..crate::JitRuntimeHelperAddresses::default()
         },
     });
-    assert!(
-        matches!(
-            outcome.status,
-            JitCompileStatus::Rejected { ref reason }
-                if reason == "JIT_CRANELIFT_REJECT_NON_TOTAL_OPTIMIZING_REGION"
-        ),
-        "{outcome:?}"
-    );
-    assert!(outcome.handle.is_none());
+    assert_eq!(outcome.status, JitCompileStatus::Compiled, "{outcome:?}");
+    let handle = outcome.handle.expect("generated bound-closure caller");
+    assert_optimizing_artifact(&handle);
+    let metadata = handle
+        .region_state_metadata()
+        .expect("bound-closure lowering metadata");
+    assert!(metadata.production_lowering.iter().any(|entry| {
+        entry.operation == "MakeClosure"
+            && entry.class == crate::JitProductionLoweringClass::CompiledNativeCall
+    }));
+    assert!(metadata.production_lowering.iter().any(|entry| {
+        entry.operation == "CallCallable"
+            && entry.class == crate::JitProductionLoweringClass::CompiledNativeCall
+    }));
+    let helpers = handle
+        .relocatable_code()
+        .expect("bound-closure relocatable artifact")
+        .relocations
+        .iter()
+        .filter_map(|relocation| match &relocation.target {
+            crate::JitRelocatableTarget::Helper(symbol) => Some(symbol.as_str()),
+            crate::JitRelocatableTarget::InternalFunction(_) => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(!helpers.iter().any(|symbol| {
+        symbol.contains("call_dispatch")
+            || symbol.contains("call_callable")
+            || symbol.contains("call_method")
+            || symbol.contains("call_constructor")
+    }));
 }
 
 #[test]
@@ -14532,7 +14553,7 @@ fn optimizing_local_external_parent_uses_prepared_object_relocation() {
 }
 
 #[test]
-fn optimizing_closure_creation_for_call_user_func_array_leaves_before_entry() {
+fn optimizing_closure_call_user_func_array_stays_generated() {
     let (unit, function, closure) = closure_call_user_func_array_fixture();
     let region = GenericRegionBuilder::build(
         &unit,
@@ -14573,15 +14594,35 @@ fn optimizing_closure_creation_for_call_user_func_array_leaves_before_entry() {
             ..crate::JitRuntimeHelperAddresses::default()
         },
     });
-    assert!(
-        matches!(
-            outcome.status,
-            JitCompileStatus::Rejected { ref reason }
-                if reason == "JIT_CRANELIFT_REJECT_NON_TOTAL_OPTIMIZING_REGION"
-        ),
-        "{outcome:?}"
-    );
-    assert!(outcome.handle.is_none());
+    assert_eq!(outcome.status, JitCompileStatus::Compiled, "{outcome:?}");
+    let handle = outcome.handle.expect("generated closure unpack caller");
+    assert_optimizing_artifact(&handle);
+    let metadata = handle
+        .region_state_metadata()
+        .expect("closure unpack lowering metadata");
+    assert!(metadata.production_lowering.iter().any(|entry| {
+        entry.operation == "MakeClosure"
+            && entry.class == crate::JitProductionLoweringClass::CompiledNativeCall
+    }));
+    assert!(metadata.production_lowering.iter().any(|entry| {
+        entry.operation == "CallFunction"
+            && entry.class == crate::JitProductionLoweringClass::CompiledNativeCall
+    }));
+    let helpers = handle
+        .relocatable_code()
+        .expect("closure unpack relocatable artifact")
+        .relocations
+        .iter()
+        .filter_map(|relocation| match &relocation.target {
+            crate::JitRelocatableTarget::Helper(symbol) => Some(symbol.as_str()),
+            crate::JitRelocatableTarget::InternalFunction(_) => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(!helpers.iter().any(|symbol| {
+        symbol.contains("call_dispatch")
+            || symbol.contains("builtin_dispatch")
+            || symbol.contains("call_callable")
+    }));
 }
 
 #[test]

@@ -3,7 +3,9 @@ fn reject_unpublished_optimizer_boundaries(
 ) -> Result<(), CraneliftLoweringError> {
     for instruction in region.blocks.iter().flat_map(|block| &block.instructions) {
         match &instruction.kind {
-            RegionInstructionKind::NativeDynamicCode(_) => {
+            RegionInstructionKind::NativeDynamicCode(RegionNativeDynamicCode::Include {
+                ..
+            }) => {
                 return Err(CraneliftLoweringError::new(
                     "JIT_CRANELIFT_REJECT_DYNAMIC_CODE_PUBLICATION",
                     format!(
@@ -22,20 +24,6 @@ fn reject_unpublished_optimizer_boundaries(
                 ));
             }
             RegionInstructionKind::NativeCall(call) => {
-                if matches!(
-                    call.target,
-                    RegionCallTarget::Callable { .. }
-                        | RegionCallTarget::Closure { function: None, .. }
-                        | RegionCallTarget::Pipe { .. }
-                ) {
-                    return Err(CraneliftLoweringError::new(
-                        "JIT_CRANELIFT_REJECT_DYNAMIC_CALLABLE_PUBLICATION",
-                        format!(
-                            "dynamic callable at continuation {} has no publication-fixed target/signature",
-                            instruction.continuation_id,
-                        ),
-                    ));
-                }
                 if stable_builtin_format(&call.target).is_some()
                     || stable_builtin_compression_codec(&call.target).is_some()
                     || stable_builtin_callable_query(&call.target).is_some()

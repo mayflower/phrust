@@ -55,7 +55,7 @@ struct NativeEntryArrayProbeRequirement {
 #[derive(Clone, Debug)]
 struct NativeEntryArrayUnpackRequirement {
     required_length: usize,
-    fixed_parameters: Vec<(usize, Option<php_ir::IrReturnType>, bool)>,
+    fixed_parameters: Vec<(usize, Option<php_ir::IrReturnType>, bool, bool)>,
     tail_start: usize,
     tail_type: Option<php_ir::IrReturnType>,
     tail_by_reference: bool,
@@ -1708,9 +1708,16 @@ fn optimizing_admission_for_region(
                         matches!(entry.callback, RegionArrayCallbackTarget::Stable(_))
                     })
             );
+            let planned_closure_allocation = matches!(
+                instruction.kind,
+                RegionInstructionKind::NativeDynamicCode(
+                    RegionNativeDynamicCode::MakeClosure { .. }
+                )
+            );
             external_effect_seen |= !planned_lvalue_effect
                 && !planned_publication_total_query
                 && !planned_total_callback
+                && !planned_closure_allocation
                 && matches!(
                     instruction.kind,
                     RegionInstructionKind::NativeCall(_)
@@ -3332,7 +3339,7 @@ fn optimizing_admission_for_region(
         }
         if matches!(
             instruction.kind,
-            RegionInstructionKind::NativeDynamicCode(_)
+            RegionInstructionKind::NativeDynamicCode(RegionNativeDynamicCode::Include { .. })
         ) {
             return Err(CraneliftLoweringError::new(
                 "JIT_CRANELIFT_REJECT_NON_TOTAL_OPTIMIZING_REGION",
@@ -6384,22 +6391,19 @@ fn optimizing_admission_for_region(
                 .take(fixed_count)
                 .skip(unpack)
                 .enumerate()
-                .map(|(index, parameter)| (index, parameter.type_.clone(), parameter.by_ref))
+                .map(|(index, parameter)| {
+                    (
+                        index,
+                        parameter.type_.clone(),
+                        parameter.by_ref,
+                        parameter.required,
+                    )
+                })
                 .collect::<Vec<_>>();
-            if fixed_parameters
+            let required_length = fixed_parameters
                 .iter()
-                .enumerate()
-                .any(|(index, _)| parameters[unpack + index].default.is_some())
-            {
-                return Err(CraneliftLoweringError::new(
-                    "JIT_CRANELIFT_REJECT_ARRAY_UNPACK_DEFAULT_OWNERSHIP",
-                    format!(
-                        "compiled unpack call at continuation {} still needs a conditional default owner",
-                        instruction.continuation_id,
-                    ),
-                ));
-            }
-            let required_length = fixed_parameters.len();
+                .filter(|(_, _, _, required)| *required)
+                .count();
             let variadic_parameter = call
                 .variadic
                 .then(|| parameters.last().filter(|parameter| parameter.variadic))
@@ -10147,9 +10151,6 @@ pub(super) fn compile_region_graph_native(
                 matches!(
                     kind,
                     RegionInstructionKind::NativeControl(RegionNativeControl::Throw { .. })
-                        | RegionInstructionKind::NativeDynamicCode(
-                            RegionNativeDynamicCode::MakeClosure { .. }
-                        )
                 )
             }) || region.attributes.iter().any(|attribute| {
                 attribute
@@ -20554,7 +20555,23 @@ fn emit_optimizing_entry_admission(
                 .ins()
                 .brif(enough, length_accepted, &[], rejected, &[]);
             builder.switch_to_block(length_accepted);
-            for (index, type_, by_reference) in &unpack.fixed_parameters {
+            for (index, type_, by_reference, required) in &unpack.fixed_parameters {
+                let next = builder.create_block();
+                if !required {
+                    let inspect = builder.create_block();
+                    let supplied = builder.ins().icmp_imm(
+                        IntCC::UnsignedGreaterThan,
+                        length,
+                        i64::try_from(*index).map_err(|_| {
+                            CraneliftLoweringError::new(
+                                "JIT_CRANELIFT_REJECT_ARRAY_UNPACK_OFFSET",
+                                "optional unpack entry offset does not fit the native ABI",
+                            )
+                        })?,
+                    );
+                    builder.ins().brif(supplied, inspect, &[], next, &[]);
+                    builder.switch_to_block(inspect);
+                }
                 let entry =
                     builder.ins().iadd_imm(
                         entries,
@@ -20593,7 +20610,6 @@ fn emit_optimizing_entry_admission(
                         .expect("publication admitted only directly guardable unpack types");
                     admitted = builder.ins().band(admitted, typed);
                 }
-                let next = builder.create_block();
                 builder.ins().brif(admitted, next, &[], rejected, &[]);
                 builder.switch_to_block(next);
             }

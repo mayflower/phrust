@@ -514,11 +514,11 @@ pub(super) fn invoke_native_resolved_function_with_metadata_strict(
     )
 }
 
-/// Baseline-only userland binder and invocation boundary.
+/// Baseline-native compatibility binder and invocation boundary.
 ///
-/// Optimizing same-unit and linked-unit calls pack their prepared frames in
-/// CLIF and invoke the compiled entry directly; they must never import this
-/// materializing binder.
+/// Generic and Optimizing ordinary calls pack their prepared frames in CLIF
+/// and invoke the compiled entry directly. This materializing binder is
+/// retained only for explicitly cold generator/introspection compatibility.
 pub(super) fn invoke_baseline_bound_function_with_metadata_strict(
     context: &mut NativeRequestColdState<'_>,
     function: php_ir::FunctionId,

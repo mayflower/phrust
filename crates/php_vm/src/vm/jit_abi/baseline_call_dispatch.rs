@@ -1109,20 +1109,34 @@ unsafe fn jit_baseline_native_call_dispatch_impl<const DIAGNOSTIC: bool>(
                     | php_ir::InstructionKind::CallCallable { .. }
                     | php_ir::InstructionKind::CallClosure { .. }
                     | php_ir::InstructionKind::Pipe { .. }
+                    | php_ir::InstructionKind::CallMethod { .. }
+                    | php_ir::InstructionKind::CallStaticMethod { .. }
+                    | php_ir::InstructionKind::NewObject { .. }
+                    | php_ir::InstructionKind::BindReferenceFromMethodCall { .. }
             ) && !direct_builtin
                 && frame.target.function_id != u32::MAX
             {
                 let function = php_ir::FunctionId::new(frame.target.function_id);
+                let method_or_constructor = matches!(
+                    descriptor.kind,
+                    crate::compiled_unit::NativeCallSiteKind::Method
+                        | crate::compiled_unit::NativeCallSiteKind::StaticMethod
+                        | crate::compiled_unit::NativeCallSiteKind::Constructor
+                );
                 let requires_cold_compatibility = context
                     .unit
                     .functions
                     .get(function.index())
                     .is_some_and(|definition| {
-                        native_function_requires_non_reference_trampoline(definition, false)
+                        native_function_is_generator(context, function)
+                            || (!method_or_constructor
+                                && native_function_requires_non_reference_trampoline(
+                                    definition, false,
+                                ))
                     });
                 if !requires_cold_compatibility {
                     return Err(format!(
-                        "E_PHP_VM_NATIVE_CALLSITE_MISMATCH: stable function {} reached the cold compatibility dispatcher instead of its generated entry cell",
+                        "E_PHP_VM_NATIVE_CALLSITE_MISMATCH: stable function/method/constructor {} reached the cold compatibility dispatcher instead of its generated entry cell",
                         function.raw()
                     )
                     .into());

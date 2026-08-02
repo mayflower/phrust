@@ -19492,10 +19492,10 @@ fn lower_optimizing_prepare_stable_callback(
     }
 }
 
-/// Resolves one already-acquired same-unit callable to its immutable baseline
-/// native entry. Acquisition publishes the fixed by-value binding contract in
-/// the callable view, so this operation performs one semantic admission before
-/// the call and never enters the dynamic Rust dispatcher.
+/// Resolves one already-acquired same-unit callable to its published native
+/// entries. Acquisition publishes the fixed binding contract in the callable
+/// view, so this operation performs one semantic admission before the call and
+/// never enters the dynamic Rust dispatcher.
 // architecture: typed callable-admission boundary
 #[allow(clippy::too_many_arguments)]
 fn lower_optimizing_prepare_dynamic_callable(
@@ -19661,7 +19661,7 @@ fn lower_optimizing_prepare_dynamic_callable(
         .ins()
         .imul_imm(function, i64::from(pointer_type.bytes()));
     let runtime_view = lower_active_runtime_view(builder, transition.deopt_out);
-    let baseline_entries = builder.ins().load(
+    let generic_entries = builder.ins().load(
         pointer_type,
         MemFlagsData::new(),
         runtime_view,
@@ -19670,14 +19670,29 @@ fn lower_optimizing_prepare_dynamic_callable(
             trusted_generic_function_entries
         ) as i32,
     );
-    let entry = builder.ins().iadd(baseline_entries, entry_offset);
-    let address = builder
-        .ins()
-        .atomic_load(pointer_type, MemFlagsData::new(), entry);
+    let preferred_entries = builder.ins().load(
+        pointer_type,
+        MemFlagsData::new(),
+        runtime_view,
+        std::mem::offset_of!(
+            crate::JitNativeRuntimeView,
+            trusted_preferred_function_entries
+        ) as i32,
+    );
+    let generic_entry = builder.ins().iadd(generic_entries, entry_offset);
+    let preferred_entry = builder.ins().iadd(preferred_entries, entry_offset);
+    let generic_address =
+        builder
+            .ins()
+            .atomic_load(pointer_type, MemFlagsData::new(), generic_entry);
+    let preferred_address =
+        builder
+            .ins()
+            .atomic_load(pointer_type, MemFlagsData::new(), preferred_entry);
     Ok(OptimizingPreparedDynamicCallable {
         callback: OptimizingPreparedCallback {
-            preferred_address: address,
-            baseline_address: address,
+            preferred_address,
+            baseline_address: generic_address,
             linked_runtime_view: None,
             initial_resume_id: if caller_strict_types {
                 crate::JIT_NATIVE_BIND_STRICT_ENTRY_RESUME_ID
