@@ -126,28 +126,24 @@ fn publish_dynamic_unit_entry(
 /// itself through the uniform packed-argument ABI. This keeps the cold
 /// single-flight compile path in Rust while removing the full call dispatcher
 /// from every warm invocation.
-// SAFETY: audited native ABI pointer boundary; `out` is a synchronous
-// caller-owned machine-word slot checked before it is written.
+// SAFETY: audited native ABI pointer boundary. The helper publishes into the
+// live entry cells; it never returns or invokes a raw code address.
 #[allow(unsafe_code)] // Safety: the active cold request owns the raw VM state for this synchronous continuation.
 pub(in crate::vm) extern "C" fn jit_native_function_resolve_abi(
     runtime: *mut NativeRequestFastState,
     _vm_context: u64,
     function: u64,
-    out: *mut usize,
 ) -> i32 {
-    let Some(out) = std::ptr::NonNull::new(out) else {
-        return php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32;
-    };
     let Ok(function) = u32::try_from(function) else {
         return php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32;
     };
     let resolved = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         with_baseline_native_context_for(runtime, "function_resolve", |context| {
             let function = php_ir::FunctionId::new(function);
-            // This helper is imported exclusively by streaming-baseline
+            // This helper is imported exclusively by streaming-Generic
             // artifacts. Keep the tier boundary physical: the current call
-            // always enters the baseline callee. Background workers select
-            // optimizing products later from direct baseline-entry counts;
+            // always publishes the Generic callee. Background workers select
+            // Optimizing products later from direct Generic-entry counts;
             // merely reaching a declaration is no longer sufficient.
             let handle = ensure_native_generic_entry(context, function)?;
             let address = handle.native_entry_address().ok_or_else(|| {
@@ -175,24 +171,20 @@ pub(in crate::vm) extern "C" fn jit_native_function_resolve_abi(
                     &external_signatures,
                 )?;
             }
-            // The current streaming-baseline call enters `address`, while
-            // later optimizing callers use `preferred`. Both artifacts consume
+            // The generated caller reloads the preferred cell after this
+            // resolver publishes `address`; later callers may use `preferred`.
+            // Both artifacts consume
             // the same function-scoped native metadata, so publish the reached
             // function before returning either executable address. Previously
             // this resolver bypassed the active-entry installation boundary;
             // demand-zero request-local slots therefore remained empty and
             // generated code interpreted encoded zero as a direct-slot handle.
             install_active_native_entry(context, function, preferred)?;
-            Ok(address)
+            Ok(())
         })
     }));
     match resolved {
-        Ok(Some(Ok(address))) if address != 0 => {
-            // SAFETY: `out` was validated above and generated code retains the
-            // stack slot for the complete synchronous helper call.
-            unsafe { out.as_ptr().write(address) };
-            0
-        }
+        Ok(Some(Ok(()))) => 0,
         Ok(Some(Err(message))) => {
             let _ = with_baseline_native_context_for(runtime, "function_resolve", |context| {
                 publish_native_call_diagnostic(context, message)
@@ -200,7 +192,7 @@ pub(in crate::vm) extern "C" fn jit_native_function_resolve_abi(
             php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32
         }
         Ok(None) => php_jit::JitCallStatus::COMPILE_REQUIRED.0 as i32,
-        Ok(Some(Ok(_))) | Err(_) => php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32,
+        Err(_) => php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32,
     }
 }
 

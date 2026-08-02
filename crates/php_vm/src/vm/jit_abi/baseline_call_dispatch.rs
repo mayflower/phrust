@@ -1113,6 +1113,26 @@ unsafe fn jit_baseline_native_call_dispatch_impl<const DIAGNOSTIC: bool>(
                 && frame.target.function_id != u32::MAX
             {
                 let function = php_ir::FunctionId::new(frame.target.function_id);
+                let requires_cold_compatibility = context
+                    .unit
+                    .functions
+                    .get(function.index())
+                    .is_some_and(|definition| {
+                        definition.params.iter().any(|parameter| parameter.by_ref)
+                            || definition.returns_by_ref
+                            || native_function_requires_non_reference_trampoline(definition, false)
+                    });
+                if !requires_cold_compatibility {
+                    return Err(format!(
+                        "E_PHP_VM_NATIVE_CALLSITE_MISMATCH: stable function {} reached the cold compatibility dispatcher instead of its generated entry cell",
+                        function.raw()
+                    )
+                    .into());
+                }
+                // Retained only for reference/generator/introspection shapes
+                // until the generated binding tranche replaces them. Stable
+                // ordinary calls are rejected above and cannot execute a PHP
+                // body in this Rust boundary.
                 emit_native_deprecated_call(context, function, instruction);
                 let visible_arguments = encoded
                     .get(descriptor.argument_operand_offset..)

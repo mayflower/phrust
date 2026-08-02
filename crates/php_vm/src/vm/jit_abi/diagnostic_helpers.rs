@@ -52,7 +52,7 @@ macro_rules! diagnostic_helper {
 diagnostic_helper!(
     jit_native_function_resolve_diagnostic_abi => jit_native_function_resolve_abi,
     "function_resolve",
-    (_vm_context: u64, function: u64, out: *mut usize) -> i32
+    (_vm_context: u64, function: u64) -> i32
 );
 
 diagnostic_helper!(

@@ -1052,10 +1052,6 @@ fn call_native_pure_handler(
 fn native_php_entry_signature(module: &JITModule) -> Signature {
     let pointer_type = module.target_config().pointer_type();
     let mut signature = module.make_signature();
-    #[cfg(target_arch = "x86_64")]
-    {
-        signature.call_conv = CallConv::Tail;
-    }
     signature.params.push(AbiParam::new(pointer_type));
     signature.params.push(AbiParam::new(pointer_type));
     signature.params.push(AbiParam::new(pointer_type));
@@ -31519,11 +31515,7 @@ fn lower_generic_region_instruction(
                         .get(&target)
                         .copied()
                         .map(NativeDirectCallee::Local)
-                        .or_else(|| {
-                            native_operations
-                                .function_resolve
-                                .map(|_| NativeDirectCallee::Resolved(target))
-                        })
+                        .or(Some(NativeDirectCallee::Resolved(target)))
                         .map(|callee| {
                             let metadata = function_params
                                 .get(&target)
@@ -31902,26 +31894,23 @@ fn lower_generic_region_instruction(
                         .brif(published, address_ready, &[address.into()], resolve, &[]);
 
                     builder.switch_to_block(resolve);
-                    let address_slot = builder.create_sized_stack_slot(StackSlotData::new(
-                        StackSlotKind::ExplicitSlot,
-                        pointer_type.bytes(),
-                        3,
-                    ));
-                    let address_out = builder.ins().stack_addr(pointer_type, address_slot, 0);
                     let vm_context = builder.ins().iconst(types::I64, 0);
                     let function_id = builder.ins().iconst(types::I64, i64::from(target.raw()));
-                    let resolve = call_native_helper(
-                        module,
-                        builder,
-                        helper,
-                        &[vm_context, function_id, address_out],
-                    );
+                    let resolve =
+                        call_native_helper(module, builder, helper, &[vm_context, function_id]);
                     require_native_operation_ok(
                         builder,
                         builder.inst_results(resolve)[0],
                         helper.terminal_exit()?,
                     )?;
-                    let address = builder.ins().stack_load(pointer_type, address_slot, 0);
+                    // Resolution only compiles and publishes. Reload through
+                    // the generation-safe preferred cell so the generated
+                    // caller is always the component that selects and invokes
+                    // the callee address.
+                    let address =
+                        builder
+                            .ins()
+                            .atomic_load(pointer_type, MemFlagsData::new(), entry);
                     builder.ins().jump(address_ready, &[address.into()]);
 
                     builder.switch_to_block(address_ready);

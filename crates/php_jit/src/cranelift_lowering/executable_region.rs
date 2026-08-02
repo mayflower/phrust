@@ -10186,8 +10186,7 @@ pub(super) fn compile_region_graph_native(
         }
     }
     let resolver_target = |target: FunctionId| {
-        runtime_helpers.native_function_resolve != 0
-            && !regions.contains_key(&target)
+        !regions.contains_key(&target)
             && unit
                 .functions
                 .get(target.index())
@@ -14734,7 +14733,6 @@ pub(super) fn compile_region_graph_native(
                 let mut signature = module.make_signature();
                 signature.params.push(AbiParam::new(types::I64));
                 signature.params.push(AbiParam::new(types::I64));
-                signature.params.push(AbiParam::new(pointer_type));
                 signature.returns.push(AbiParam::new(types::I32));
                 native_operations.function_resolve = Some(declare_native_helper(
                     module,
