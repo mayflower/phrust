@@ -2121,6 +2121,20 @@ fn instruction_result_fact(
                 {
                     return ordinary;
                 }
+                // PHP arithmetic coerces null and an unset local to `0`, so
+                // the other operand decides the result class. Reporting the
+                // dynamic class instead also locks every loop-carried
+                // counter: the local is seeded uninitialized, its load
+                // publishes null, the increment reading that load reports a
+                // dynamic result, and joining `Int` with a dynamic class
+                // yields the absorbing UNKNOWN that later rounds never leave.
+                if matches!(
+                    ordinary.class,
+                    SsaValueClass::Null | SsaValueClass::Uninitialized
+                ) {
+                    return SsaValueFact::exact(SsaValueClass::Int, SsaOwnership::ImmortalConstant)
+                        .with_integer_range(SsaIntegerRange::exact(0));
+                }
                 let RegionOperand::Constant(index) = operand else {
                     return ordinary;
                 };
