@@ -6,52 +6,52 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 
-mod baseline_call_dispatch;
-mod baseline_call_support;
-mod baseline_callables;
-mod baseline_class_constants;
-mod baseline_context;
-mod baseline_dynamic_code;
-mod baseline_fibers;
-mod baseline_internal_classes;
-mod baseline_iterators;
-mod baseline_native_builtins;
-mod baseline_object_materialization;
-mod baseline_object_support;
-mod baseline_properties;
-mod baseline_reference_ownership;
-mod baseline_request_boundaries;
-mod baseline_root_index;
-mod baseline_runtime_ops;
-mod baseline_semantic_dispatch;
-mod baseline_static_properties;
-mod baseline_value_plane;
-mod baseline_value_semantics;
+mod cold_class_metadata;
 mod cold_diagnostics;
+mod cold_fiber_materialization;
+mod cold_object_materialization;
+mod cold_request_boundaries;
+mod cold_root_index;
+mod cold_value_materialization;
+mod cold_value_plane;
+mod native_context;
+mod native_reference_ownership;
+pub(super) use cold_diagnostics::publish_explicit_native_runtime_fatal;
+mod cold_dynamic_code;
 mod cold_dynamic_units;
 mod cold_publication;
+mod cold_services;
+mod native_call_contract;
+mod native_object_lifecycle;
 pub(in crate::vm) use cold_publication::resume_native_optimizing_exit;
 use cold_publication::*;
 mod cold_request_state;
+mod debug_materialization;
 mod diagnostic_helpers;
 mod diagnostic_telemetry;
+pub(super) use debug_materialization::jit_native_debug_backtrace_abi;
 mod frame_arena;
 mod request_state;
 
 use crate::native_exact::{
-    NATIVE_TEMPNAM_SEQUENCE, NativeBcmathCapability, NativeConfigurationCapability,
-    NativeExecutionDeadlineCapability, NativeFilterCapability, NativeFixedCallablePlan,
-    NativeFrameArenaCapability, NativeHttpResponseCapability, NativeMbstringCapability,
-    NativeRandomCapability, NativeRegisteredAutoloadCallback, NativeRegisteredCallbackSource,
+    NativeBcmathCapability, NativeConfigurationCapability, NativeExecutionDeadlineCapability,
+    NativeFilterCapability, NativeFixedCallablePlan, NativeFrameArenaCapability,
+    NativeGlobalBindingCapability, NativeHttpResponseCapability, NativeMbstringCapability,
+    NativeMethodCallableResolution, NativeRandomCapability, NativeRegisteredAutoloadCallback,
     NativeRegisteredCallbackState, NativeRegisteredErrorHandler, NativeRegisteredShutdownCallback,
-    NativeRequestFastState, NativeRequestQueryCapability, NativeSessionCapability,
-    NativeStreamContextState, NativeSymbolQueryCapability, native_direct_string_hash,
-    native_fixed_callable_plan, php_constant_category, php_core_runtime_constant,
+    NativeRequestFastState, NativeRequestQueryCapability, NativeRuntimeDiagnosticCapability,
+    NativeSessionCapability, NativeStreamContextState, NativeSymbolQueryCapability,
+    native_direct_string_hash, native_fixed_callable_plan,
 };
+use cold_class_metadata::*;
 use cold_dynamic_units::*;
 pub(super) use cold_dynamic_units::{jit_native_function_resolve_abi, native_entries_from_records};
 pub(in crate::vm) use cold_request_state::NativeRequestColdState;
 pub(in crate::vm) use cold_request_state::NativeRequestOwner;
+pub(crate) use cold_request_state::unset_native_global_binding;
+pub(crate) use cold_request_state::{
+    prepare_native_session_start_transport, rebind_native_global_binding,
+};
 pub(crate) use frame_arena::NativeFrameArena;
 pub(super) use frame_arena::{jit_native_frame_alloc_abi, jit_native_frame_release_abi};
 
@@ -68,19 +68,22 @@ pub(super) use crate::native_exact::exact_call_dispatch::{
     jit_native_class_implements_abi, jit_native_clearstatcache_abi, jit_native_closedir_abi,
     jit_native_compact_abi, jit_native_constant_abi, jit_native_convert_uudecode_abi,
     jit_native_convert_uuencode_abi, jit_native_crc32_abi, jit_native_date_abi,
-    jit_native_date_default_timezone_get_abi, jit_native_date_default_timezone_set_abi,
-    jit_native_decbin_abi, jit_native_dechex_abi, jit_native_decoct_abi, jit_native_define_abi,
-    jit_native_defined_abi, jit_native_dirname_abi, jit_native_disk_free_space_abi,
-    jit_native_disk_total_space_abi, jit_native_enum_exists_abi, jit_native_error_clear_last_abi,
-    jit_native_error_get_last_abi, jit_native_extension_loaded_abi, jit_native_fclose_abi,
+    jit_native_date_create_abi, jit_native_date_default_timezone_get_abi,
+    jit_native_date_default_timezone_set_abi, jit_native_decbin_abi, jit_native_dechex_abi,
+    jit_native_decoct_abi, jit_native_define_abi, jit_native_defined_abi, jit_native_dirname_abi,
+    jit_native_disk_free_space_abi, jit_native_disk_total_space_abi, jit_native_enum_exists_abi,
+    jit_native_error_clear_last_abi, jit_native_error_get_last_abi, jit_native_error_log_abi,
+    jit_native_exif_imagetype_abi, jit_native_extension_loaded_abi, jit_native_fclose_abi,
     jit_native_feof_abi, jit_native_fflush_abi, jit_native_fgetc_abi, jit_native_fgets_abi,
     jit_native_file_abi, jit_native_file_exists_abi, jit_native_file_get_contents_abi,
     jit_native_file_put_contents_abi, jit_native_filegroup_abi, jit_native_filemtime_abi,
     jit_native_fileowner_abi, jit_native_fileperms_abi, jit_native_filesize_abi,
     jit_native_filetype_abi, jit_native_filter_has_var_abi, jit_native_filter_id_abi,
     jit_native_filter_input_abi, jit_native_filter_input_array_abi, jit_native_filter_list_abi,
-    jit_native_filter_var_abi, jit_native_filter_var_array_abi, jit_native_fopen_abi,
-    jit_native_fread_abi, jit_native_fseek_abi, jit_native_ftell_abi, jit_native_ftruncate_abi,
+    jit_native_filter_var_abi, jit_native_filter_var_array_abi, jit_native_finfo_buffer_abi,
+    jit_native_finfo_close_abi, jit_native_finfo_file_abi, jit_native_finfo_open_abi,
+    jit_native_finfo_set_flags_abi, jit_native_fopen_abi, jit_native_fread_abi,
+    jit_native_fseek_abi, jit_native_ftell_abi, jit_native_ftruncate_abi,
     jit_native_func_get_arg_abi, jit_native_func_get_args_abi, jit_native_func_num_args_abi,
     jit_native_function_exists_abi, jit_native_fwrite_abi, jit_native_gc_collect_cycles_abi,
     jit_native_gc_disable_abi, jit_native_gc_enable_abi, jit_native_gc_enabled_abi,
@@ -89,21 +92,22 @@ pub(super) use crate::native_exact::exact_call_dispatch::{
     jit_native_get_current_user_abi, jit_native_get_declared_classes_abi,
     jit_native_get_declared_interfaces_abi, jit_native_get_declared_traits_abi,
     jit_native_get_defined_constants_abi, jit_native_get_defined_functions_abi,
-    jit_native_get_exception_handler_abi, jit_native_get_include_path_abi,
-    jit_native_get_included_files_abi, jit_native_get_loaded_extensions_abi,
-    jit_native_get_mangled_object_vars_abi, jit_native_get_object_vars_abi,
-    jit_native_get_parent_class_abi, jit_native_get_resource_id_abi,
-    jit_native_get_resource_type_abi, jit_native_get_resources_abi, jit_native_getcwd_abi,
-    jit_native_getenv_abi, jit_native_getrandmax_abi, jit_native_glob_abi, jit_native_gmdate_abi,
-    jit_native_gmmktime_abi, jit_native_gzcompress_abi, jit_native_gzdecode_abi,
-    jit_native_gzdeflate_abi, jit_native_gzencode_abi, jit_native_gzinflate_abi,
-    jit_native_gzuncompress_abi, jit_native_hash_abi, jit_native_hash_equals_abi,
-    jit_native_hash_hmac_abi, jit_native_header_abi, jit_native_header_remove_abi,
-    jit_native_headers_list_abi, jit_native_headers_sent_abi, jit_native_hex2bin_abi,
-    jit_native_hexdec_abi, jit_native_hrtime_abi, jit_native_html_entity_decode_abi,
-    jit_native_htmlentities_abi, jit_native_htmlspecialchars_abi,
-    jit_native_htmlspecialchars_decode_abi, jit_native_http_build_query_abi,
-    jit_native_http_response_code_abi, jit_native_inet_ntop_abi, jit_native_inet_pton_abi,
+    jit_native_get_exception_handler_abi, jit_native_get_html_translation_table_abi,
+    jit_native_get_include_path_abi, jit_native_get_included_files_abi,
+    jit_native_get_loaded_extensions_abi, jit_native_get_mangled_object_vars_abi,
+    jit_native_get_object_vars_abi, jit_native_get_parent_class_abi,
+    jit_native_get_resource_id_abi, jit_native_get_resource_type_abi, jit_native_get_resources_abi,
+    jit_native_getcwd_abi, jit_native_getenv_abi, jit_native_getimagesize_abi,
+    jit_native_getrandmax_abi, jit_native_glob_abi, jit_native_gmdate_abi, jit_native_gmmktime_abi,
+    jit_native_gzcompress_abi, jit_native_gzdecode_abi, jit_native_gzdeflate_abi,
+    jit_native_gzencode_abi, jit_native_gzinflate_abi, jit_native_gzuncompress_abi,
+    jit_native_hash_abi, jit_native_hash_equals_abi, jit_native_hash_hmac_abi,
+    jit_native_header_abi, jit_native_header_remove_abi, jit_native_headers_list_abi,
+    jit_native_headers_sent_abi, jit_native_hex2bin_abi, jit_native_hexdec_abi,
+    jit_native_hrtime_abi, jit_native_html_entity_decode_abi, jit_native_htmlentities_abi,
+    jit_native_htmlspecialchars_abi, jit_native_htmlspecialchars_decode_abi,
+    jit_native_http_build_query_abi, jit_native_http_response_code_abi, jit_native_iconv_abi,
+    jit_native_image_type_to_mime_type_abi, jit_native_inet_ntop_abi, jit_native_inet_pton_abi,
     jit_native_ini_get_abi, jit_native_ini_get_all_abi, jit_native_ini_set_abi,
     jit_native_interface_exists_abi, jit_native_intval_base_abi, jit_native_ip2long_abi,
     jit_native_is_a_abi, jit_native_is_callable_abi, jit_native_is_dir_abi, jit_native_is_file_abi,
@@ -123,22 +127,36 @@ pub(super) use crate::native_exact::exact_call_dispatch::{
     jit_native_mb_substr_count_abi, jit_native_mb_ucfirst_abi, jit_native_md5_abi,
     jit_native_memory_get_peak_usage_abi, jit_native_memory_get_usage_abi,
     jit_native_method_exists_abi, jit_native_microtime_abi, jit_native_mkdir_abi,
-    jit_native_mktime_abi, jit_native_mt_getrandmax_abi, jit_native_mt_rand_abi,
-    jit_native_natcasesort_abi, jit_native_natsort_abi, jit_native_number_format_abi,
-    jit_native_ob_end_clean_abi, jit_native_ob_end_flush_abi, jit_native_ob_get_clean_abi,
-    jit_native_ob_get_contents_abi, jit_native_ob_get_flush_abi, jit_native_ob_get_length_abi,
-    jit_native_ob_get_level_abi, jit_native_ob_start_abi, jit_native_octdec_abi,
-    jit_native_opendir_abi, jit_native_pack_abi, jit_native_parse_str_abi,
+    jit_native_mktime_abi, jit_native_move_uploaded_file_abi, jit_native_mt_getrandmax_abi,
+    jit_native_mt_rand_abi, jit_native_mysqli_affected_rows_abi,
+    jit_native_mysqli_character_set_name_abi, jit_native_mysqli_close_abi,
+    jit_native_mysqli_connect_errno_abi, jit_native_mysqli_connect_error_abi,
+    jit_native_mysqli_errno_abi, jit_native_mysqli_error_abi, jit_native_mysqli_fetch_array_abi,
+    jit_native_mysqli_fetch_field_abi, jit_native_mysqli_fetch_object_abi,
+    jit_native_mysqli_field_count_abi, jit_native_mysqli_free_result_abi,
+    jit_native_mysqli_get_server_info_abi, jit_native_mysqli_init_abi,
+    jit_native_mysqli_insert_id_abi, jit_native_mysqli_more_results_abi,
+    jit_native_mysqli_next_result_abi, jit_native_mysqli_num_fields_abi,
+    jit_native_mysqli_num_rows_abi, jit_native_mysqli_options_abi, jit_native_mysqli_query_abi,
+    jit_native_mysqli_real_connect_abi, jit_native_mysqli_real_escape_string_abi,
+    jit_native_mysqli_report_abi, jit_native_mysqli_select_db_abi,
+    jit_native_mysqli_set_charset_abi, jit_native_natcasesort_abi, jit_native_natsort_abi,
+    jit_native_normalizer_is_normalized_abi, jit_native_normalizer_normalize_abi,
+    jit_native_number_format_abi, jit_native_ob_end_clean_abi, jit_native_ob_end_flush_abi,
+    jit_native_ob_get_clean_abi, jit_native_ob_get_contents_abi, jit_native_ob_get_flush_abi,
+    jit_native_ob_get_length_abi, jit_native_ob_get_level_abi, jit_native_ob_start_abi,
+    jit_native_octdec_abi, jit_native_opendir_abi, jit_native_pack_abi, jit_native_parse_str_abi,
     jit_native_parse_url_abi, jit_native_pathinfo_abi, jit_native_php_sapi_name_abi,
-    jit_native_php_uname_abi, jit_native_preg_callback_assemble_abi,
+    jit_native_php_uname_abi, jit_native_phpinfo_abi, jit_native_preg_callback_assemble_abi,
     jit_native_preg_callback_plan_abi, jit_native_preg_filter_abi, jit_native_preg_grep_abi,
     jit_native_preg_last_error_abi, jit_native_preg_last_error_msg_abi, jit_native_preg_match_abi,
     jit_native_preg_match_all_abi, jit_native_preg_quote_abi, jit_native_preg_replace_abi,
-    jit_native_preg_split_abi, jit_native_printf_abi, jit_native_property_exists_abi,
-    jit_native_quoted_printable_decode_abi, jit_native_quotemeta_abi, jit_native_rand_abi,
-    jit_native_random_bytes_abi, jit_native_random_int_abi, jit_native_rawurldecode_abi,
-    jit_native_rawurlencode_abi, jit_native_readdir_abi, jit_native_readfile_abi,
-    jit_native_realpath_abi, jit_native_register_shutdown_function_abi, jit_native_rename_abi,
+    jit_native_preg_split_abi, jit_native_print_abi, jit_native_print_r_abi, jit_native_printf_abi,
+    jit_native_property_exists_abi, jit_native_quoted_printable_decode_abi,
+    jit_native_quotemeta_abi, jit_native_rand_abi, jit_native_random_bytes_abi,
+    jit_native_random_int_abi, jit_native_rawurldecode_abi, jit_native_rawurlencode_abi,
+    jit_native_readdir_abi, jit_native_readfile_abi, jit_native_realpath_abi,
+    jit_native_register_shutdown_function_abi, jit_native_rename_abi,
     jit_native_restore_error_handler_abi, jit_native_restore_exception_handler_abi,
     jit_native_rewind_abi, jit_native_rewinddir_abi, jit_native_rmdir_abi, jit_native_rsort_abi,
     jit_native_scandir_abi, jit_native_serialize_abi, jit_native_session_abort_abi,
@@ -153,151 +171,115 @@ pub(super) use crate::native_exact::exact_call_dispatch::{
     jit_native_session_start_abi, jit_native_session_status_abi, jit_native_session_unset_abi,
     jit_native_session_write_close_abi, jit_native_set_error_handler_abi,
     jit_native_set_exception_handler_abi, jit_native_set_include_path_abi,
-    jit_native_setcookie_abi, jit_native_setrawcookie_abi, jit_native_settype_abi,
-    jit_native_sha1_abi, jit_native_shuffle_abi, jit_native_sort_abi,
-    jit_native_spl_autoload_functions_abi, jit_native_spl_autoload_register_abi,
-    jit_native_spl_autoload_unregister_abi, jit_native_spl_object_hash_abi,
-    jit_native_spl_object_id_abi, jit_native_sprintf_abi, jit_native_stat_abi,
-    jit_native_str_pad_abi, jit_native_str_split_abi, jit_native_stream_context_create_abi,
-    jit_native_stream_context_get_default_abi, jit_native_stream_context_get_options_abi,
-    jit_native_stream_context_set_default_abi, jit_native_stream_context_set_option_abi,
-    jit_native_stream_context_set_options_abi, jit_native_stream_copy_to_stream_abi,
-    jit_native_stream_filter_append_abi, jit_native_stream_filter_prepend_abi,
-    jit_native_stream_filter_remove_abi, jit_native_stream_get_contents_abi,
-    jit_native_stream_get_meta_data_abi, jit_native_stream_get_wrappers_abi,
-    jit_native_stream_is_local_abi, jit_native_stream_isatty_abi,
-    jit_native_stream_resolve_include_path_abi, jit_native_stream_set_timeout_abi,
-    jit_native_strip_tags_abi, jit_native_stripcslashes_abi, jit_native_stripslashes_abi,
-    jit_native_stristr_abi, jit_native_strnatcasecmp_abi, jit_native_strnatcmp_abi,
-    jit_native_strpbrk_abi, jit_native_strrchr_abi, jit_native_strstr_abi,
-    jit_native_strtotime_abi, jit_native_strtr_abi, jit_native_substr_compare_abi,
-    jit_native_substr_replace_abi, jit_native_symlink_abi, jit_native_sys_get_temp_dir_abi,
-    jit_native_tempnam_abi, jit_native_time_abi, jit_native_timezone_identifiers_list_abi,
-    jit_native_tmpfile_abi, jit_native_token_get_all_abi, jit_native_token_name_abi,
-    jit_native_touch_abi, jit_native_trait_exists_abi, jit_native_ucwords_abi,
-    jit_native_umask_abi, jit_native_unlink_abi, jit_native_unpack_abi, jit_native_unserialize_abi,
-    jit_native_urldecode_abi, jit_native_urlencode_abi, jit_native_version_compare_abi,
-    jit_native_vprintf_abi, jit_native_vsprintf_abi, jit_native_zlib_decode_abi,
-    jit_native_zlib_encode_abi,
+    jit_native_set_time_limit_abi, jit_native_setcookie_abi, jit_native_setrawcookie_abi,
+    jit_native_settype_abi, jit_native_sha1_abi, jit_native_shuffle_abi, jit_native_sleep_abi,
+    jit_native_sodium_bin2base64_abi, jit_native_sodium_crypto_generichash_abi,
+    jit_native_sort_abi, jit_native_spl_autoload_functions_abi,
+    jit_native_spl_autoload_register_abi, jit_native_spl_autoload_unregister_abi,
+    jit_native_spl_object_hash_abi, jit_native_spl_object_id_abi, jit_native_sprintf_abi,
+    jit_native_stat_abi, jit_native_str_pad_abi, jit_native_str_split_abi,
+    jit_native_stream_context_create_abi, jit_native_stream_context_get_default_abi,
+    jit_native_stream_context_get_options_abi, jit_native_stream_context_set_default_abi,
+    jit_native_stream_context_set_option_abi, jit_native_stream_context_set_options_abi,
+    jit_native_stream_copy_to_stream_abi, jit_native_stream_filter_append_abi,
+    jit_native_stream_filter_prepend_abi, jit_native_stream_filter_remove_abi,
+    jit_native_stream_get_contents_abi, jit_native_stream_get_meta_data_abi,
+    jit_native_stream_get_wrappers_abi, jit_native_stream_is_local_abi,
+    jit_native_stream_isatty_abi, jit_native_stream_resolve_include_path_abi,
+    jit_native_stream_set_timeout_abi, jit_native_strip_tags_abi, jit_native_stripcslashes_abi,
+    jit_native_stripslashes_abi, jit_native_stristr_abi, jit_native_strnatcasecmp_abi,
+    jit_native_strnatcmp_abi, jit_native_strpbrk_abi, jit_native_strrchr_abi,
+    jit_native_strstr_abi, jit_native_strtotime_abi, jit_native_strtr_abi,
+    jit_native_substr_compare_abi, jit_native_substr_replace_abi, jit_native_symlink_abi,
+    jit_native_sys_get_temp_dir_abi, jit_native_tempnam_abi, jit_native_time_abi,
+    jit_native_timezone_identifiers_list_abi, jit_native_timezone_open_abi, jit_native_tmpfile_abi,
+    jit_native_token_get_all_abi, jit_native_token_name_abi, jit_native_touch_abi,
+    jit_native_trait_exists_abi, jit_native_trigger_error_abi, jit_native_ucwords_abi,
+    jit_native_umask_abi, jit_native_uniqid_abi, jit_native_unlink_abi, jit_native_unpack_abi,
+    jit_native_unserialize_abi, jit_native_urldecode_abi, jit_native_urlencode_abi,
+    jit_native_usleep_abi, jit_native_var_dump_abi, jit_native_var_export_abi,
+    jit_native_version_compare_abi, jit_native_vprintf_abi, jit_native_vsprintf_abi,
+    jit_native_zlib_decode_abi, jit_native_zlib_encode_abi,
 };
 pub(super) use crate::native_exact::exact_runtime_ops::{
     jit_native_acos_f64_abi, jit_native_acosh_f64_abi, jit_native_acquire_callable_abi,
-    jit_native_array_cast_abi, jit_native_array_union_abi, jit_native_asin_f64_abi,
-    jit_native_asinh_f64_abi, jit_native_atan_f64_abi, jit_native_atan2_f64_abi,
-    jit_native_atanh_f64_abi, jit_native_bit_and_abi, jit_native_bit_not_abi,
-    jit_native_bit_or_abi, jit_native_bit_xor_abi, jit_native_callback_return_string_abi,
-    jit_native_concat_abi, jit_native_cos_f64_abi, jit_native_cosh_f64_abi, jit_native_count_abi,
-    jit_native_deg2rad_f64_abi, jit_native_dynamic_property_slot_abi,
+    jit_native_acquire_class_plan_abi, jit_native_acquire_method_callable_abi, jit_native_add_abi,
+    jit_native_array_cast_abi, jit_native_array_offset_warning_abi, jit_native_array_union_abi,
+    jit_native_asin_f64_abi, jit_native_asinh_f64_abi, jit_native_atan_f64_abi,
+    jit_native_atan2_f64_abi, jit_native_atanh_f64_abi, jit_native_bit_and_abi,
+    jit_native_bit_not_abi, jit_native_bit_or_abi, jit_native_bit_xor_abi,
+    jit_native_callback_return_string_abi, jit_native_concat_abi, jit_native_cos_f64_abi,
+    jit_native_cosh_f64_abi, jit_native_count_abi, jit_native_deg2rad_f64_abi,
+    jit_native_divide_abi, jit_native_dynamic_property_slot_abi,
     jit_native_dynamic_property_test_slot_abi, jit_native_echo_bytes_abi, jit_native_equal_abi,
+    jit_native_exact_bit_and_abi, jit_native_exact_bit_or_abi, jit_native_exact_bit_xor_abi,
     jit_native_exp_f64_abi, jit_native_expm1_f64_abi, jit_native_float_cast_abi,
     jit_native_float_to_string_abi, jit_native_fmod_f64_abi, jit_native_fpow_f64_abi,
+    jit_native_global_binding_rebind_abi, jit_native_global_binding_unset_abi,
     jit_native_greater_abi, jit_native_greater_equal_abi, jit_native_hypot_f64_abi,
     jit_native_identical_abi, jit_native_int_cast_abi, jit_native_less_abi,
     jit_native_less_equal_abi, jit_native_log_f64_abi, jit_native_log1p_f64_abi,
-    jit_native_log10_f64_abi, jit_native_not_equal_abi, jit_native_not_identical_abi,
-    jit_native_numeric_string_abi, jit_native_object_cast_abi, jit_native_object_class_name_abi,
-    jit_native_plain_object_clone_abi, jit_native_prepared_closure_new_abi,
-    jit_native_prepared_exception_new_abi, jit_native_prepared_object_new_abi,
-    jit_native_rad2deg_f64_abi, jit_native_resolve_callable_abi, jit_native_round_f64_abi,
-    jit_native_sin_f64_abi, jit_native_sinh_f64_abi, jit_native_sizeof_abi,
-    jit_native_spaceship_abi, jit_native_string_cast_abi, jit_native_tan_f64_abi,
-    jit_native_tanh_f64_abi, jit_native_unary_minus_abi, jit_native_unary_plus_abi,
+    jit_native_log10_f64_abi, jit_native_modulo_abi, jit_native_multiply_abi,
+    jit_native_named_dynamic_property_slot_abi, jit_native_not_equal_abi,
+    jit_native_not_identical_abi, jit_native_numeric_string_abi, jit_native_object_cast_abi,
+    jit_native_object_class_name_abi, jit_native_plain_object_clone_abi, jit_native_power_abi,
+    jit_native_prepared_closure_new_abi, jit_native_prepared_exception_new_abi,
+    jit_native_prepared_object_new_abi, jit_native_rad2deg_f64_abi,
+    jit_native_resolve_callable_abi, jit_native_round_f64_abi, jit_native_shift_left_abi,
+    jit_native_shift_right_abi, jit_native_sin_f64_abi, jit_native_sinh_f64_abi,
+    jit_native_sizeof_abi, jit_native_spaceship_abi, jit_native_static_property_contract_abi,
+    jit_native_string_cast_abi, jit_native_subtract_abi, jit_native_tan_f64_abi,
+    jit_native_tanh_f64_abi, jit_native_throwable_get_code_abi, jit_native_throwable_get_file_abi,
+    jit_native_throwable_get_line_abi, jit_native_throwable_get_message_abi,
+    jit_native_throwable_get_previous_abi, jit_native_throwable_get_trace_abi,
+    jit_native_type_name_abi, jit_native_typed_reference_array_init_abi,
+    jit_native_typed_reference_store_abi, jit_native_typed_static_reference_bind_abi,
+    jit_native_unary_minus_abi, jit_native_unary_plus_abi,
+    jit_native_undefined_array_key_warning_abi, jit_native_undefined_constant_abi,
+    jit_native_undefined_variable_warning_abi,
 };
-pub(super) use baseline_call_dispatch::{
-    jit_baseline_native_builtin_dispatch_abi, jit_baseline_native_builtin_dispatch_diagnostic_abi,
-    jit_baseline_native_call_dispatch_abi, jit_baseline_native_call_dispatch_diagnostic_abi,
-};
-use baseline_call_support::*;
-use baseline_callables::{
-    execute_baseline_acquire_callable, execute_baseline_resolve_callable,
-    rebind_baseline_materialized_closure,
-};
-use baseline_class_constants::{
-    baseline_class_constant_result_is_cacheable, execute_baseline_class_constant,
-};
-pub(in crate::vm) use baseline_context::activate_native_context;
-#[cfg(test)]
-use baseline_context::{
-    ACTIVE_BASELINE_CONTEXT, ActiveBaselineContext, NativeRequestActivationGuard,
-};
-use baseline_context::{
-    active_baseline_cold_context, with_baseline_native_context_for,
-    with_baseline_native_context_for_unit,
-};
-pub(super) use baseline_dynamic_code::jit_native_dynamic_code_abi;
-use baseline_dynamic_code::{
+pub(crate) use cold_diagnostics::*;
+pub(super) use cold_dynamic_code::jit_cold_dynamic_unit_resolve_abi;
+use cold_dynamic_code::{
     BASELINE_INCLUDE_CONSTANTS, BASELINE_INCLUDE_DEFAULT_TIMEZONE, BASELINE_INCLUDE_EXPORTS,
     BASELINE_INCLUDE_FILES, BASELINE_INCLUDE_FILTER_INPUT_ARRAYS, BASELINE_INCLUDE_FUNCTION_NAMES,
     BASELINE_INCLUDE_GLOBALS, BASELINE_INCLUDE_HTTP_RESPONSE, BASELINE_INCLUDE_INI,
     BASELINE_INCLUDE_MYSQL, BASELINE_INCLUDE_SYMBOLS,
 };
-use baseline_internal_classes::*;
-use baseline_iterators::{BaselineGeneratorDelegation, NativeColdIterator};
-use baseline_native_builtins::{
-    NativeDimensionOperation, emit_native_array_dimension_conversion_diagnostic,
-    emit_native_deprecated_call, emit_native_dimension_conversion_diagnostic,
-    emit_native_external_deprecated_call, emit_native_php_diagnostic, emit_native_php_warning,
-    execute_baseline_native_builtin, execute_baseline_native_builtin_control,
-    execute_baseline_prepared_runtime_builtin, native_source_line, native_source_line_for_span,
-    native_string,
-};
-use baseline_object_materialization::*;
-use baseline_object_support::*;
-use baseline_properties::execute_native_property_instruction;
-use baseline_root_index::{
+use cold_object_materialization::*;
+use cold_root_index::{
     RequestRootIndex, RootMutationReason, baseline_shared_array_storage_contains_object,
-    rooted_membership_may_change, values_contain_object,
+    values_contain_object,
 };
-pub(super) use baseline_runtime_ops::{
-    jit_baseline_native_binary_abi, jit_baseline_native_cast_abi, jit_baseline_native_compare_abi,
-    jit_baseline_native_unary_abi, jit_native_add_abi, jit_native_argument_check_abi,
-    jit_native_array_append_abi, jit_native_array_fetch_abi, jit_native_array_insert_abi,
-    jit_native_array_insert_local_abi, jit_native_array_key_exists_abi, jit_native_array_new_abi,
-    jit_native_array_quiet_read_abi, jit_native_array_read_abi, jit_native_array_spread_abi,
-    jit_native_array_unset_abi, jit_native_array_update_abi, jit_native_bitwise_and_abi,
-    jit_native_bitwise_or_abi, jit_native_bitwise_xor_abi, jit_native_cast_array_abi,
-    jit_native_cast_bool_abi, jit_native_cast_float_abi, jit_native_cast_int_abi,
-    jit_native_cast_object_abi, jit_native_cast_string_abi, jit_native_cast_void_abi,
-    jit_native_concatenate_abi, jit_native_constant_fetch_abi, jit_native_divide_abi,
-    jit_native_echo_abi, jit_native_exception_new_abi, jit_native_execution_poll_abi,
-    jit_native_foreach_cleanup_abi, jit_native_foreach_init_abi, jit_native_foreach_next_abi,
-    jit_native_local_array_append_abi, jit_native_local_array_update_abi,
-    jit_native_local_fetch_abi, jit_native_local_store_abi, jit_native_modulo_abi,
-    jit_native_multiply_abi, jit_native_object_clone_abi, jit_native_object_clone_with_abi,
-    jit_native_object_new_abi, jit_native_plain_local_copy_abi, jit_native_plain_local_move_abi,
-    jit_native_plain_local_quiet_read_abi, jit_native_plain_local_read_abi, jit_native_power_abi,
-    jit_native_property_assign_abi, jit_native_property_fetch_abi,
-    jit_native_reference_array_element_abi, jit_native_reference_bind_abi,
-    jit_native_reference_call_argument_abi, jit_native_reference_create_abi,
-    jit_native_reference_property_abi, jit_native_reference_property_element_abi,
-    jit_native_reference_publish_local_abi, jit_native_reference_unpublish_local_abi,
-    jit_native_return_check_abi, jit_native_runtime_fatal_abi, jit_native_scoped_local_copy_abi,
-    jit_native_scoped_local_move_abi, jit_native_scoped_local_quiet_read_abi,
-    jit_native_scoped_local_read_abi, jit_native_shift_left_abi, jit_native_shift_right_abi,
-    jit_native_stable_length_abi, jit_native_string_predicate_abi, jit_native_subtract_abi,
-    jit_native_truthy_abi, jit_native_type_predicate_abi, jit_native_value_release_abi,
-};
-pub(in crate::vm) use baseline_semantic_dispatch::*;
-pub(super) use baseline_semantic_dispatch::{
-    jit_baseline_native_semantic_dispatch_abi, jit_baseline_native_semantic_dispatch_diagnostic_abi,
-};
-use baseline_static_properties::execute_native_static_property;
-use baseline_value_plane::{
+use cold_services::*;
+use cold_value_materialization::*;
+use cold_value_plane::{
     BaselineValueState, NativeIncludeExports, NativeIncludeSymbols,
     NativeRegisteredCallbackTransfer, baseline_shared_array_storage_is_empty,
     release_baseline_shared_array_storage,
 };
-use baseline_value_semantics::*;
-pub(crate) use cold_diagnostics::*;
 pub(in crate::vm) use diagnostic_helpers::*;
 use diagnostic_telemetry::NativeRuntimeTelemetry;
+pub(super) use native_call_contract::{
+    jit_native_declared_argument_contract_abi, jit_native_declared_return_contract_abi,
+    jit_native_execution_poll_abi,
+};
+pub(in crate::vm) use native_context::activate_native_context;
+#[cfg(test)]
+use native_context::{
+    ACTIVE_BASELINE_CONTEXT, ActiveBaselineContext, NativeRequestActivationGuard,
+};
+use native_context::{
+    active_baseline_cold_context, try_active_baseline_cold_context,
+    with_baseline_native_context_for,
+};
+pub(super) use native_object_lifecycle::{
+    jit_native_object_release_children_drop_abi, jit_native_object_release_finalize_abi,
+    jit_native_object_release_prepare_abi,
+};
 use request_state::{NativeBacktraceFrame, NativeRegisteredExtensionRequestState};
 pub(crate) use request_state::{NativeFunctionNameScope, NativeLastError};
 
-// Real applications routinely cross dozens of PHP frames (for example,
-// WordPress metadata and hook dispatch). Keep a deterministic native-stack
-// guard, but leave enough headroom for those non-recursive call chains.
-const NATIVE_CALL_DEPTH_LIMIT: usize = 256;
 const NATIVE_RUNTIME_ERROR_MARKER: &str = "E_PHP_NATIVE_RUNTIME_ERROR";
 
 #[derive(Clone)]
@@ -309,37 +291,9 @@ struct NativeTypedStaticReferenceConstraint {
 
 #[derive(Clone, Copy)]
 pub(crate) struct NativeDynamicFunction {
-    unit: usize,
-    function: php_ir::FunctionId,
+    pub(crate) unit: usize,
+    pub(crate) function: php_ir::FunctionId,
 }
-
-#[derive(Clone, Copy)]
-enum NativeMethodPicTarget {
-    CurrentUnit {
-        function: php_ir::FunctionId,
-        is_static: bool,
-    },
-    DynamicUnit {
-        function: NativeDynamicFunction,
-        is_static: bool,
-    },
-}
-
-struct NativeMethodPicEntry {
-    receiver_class: std::sync::Arc<str>,
-    method: std::sync::Arc<str>,
-    class_layout_epoch: u64,
-    method_table_epoch: u64,
-    target: NativeMethodPicTarget,
-}
-
-#[derive(Default)]
-struct NativeMethodPic {
-    entries: Vec<NativeMethodPicEntry>,
-    megamorphic: bool,
-}
-
-const NATIVE_METHOD_PIC_LIMIT: usize = 4;
 
 pub(crate) struct NativeDynamicUnit {
     pub(crate) compiled: crate::compiled_unit::CompiledUnit,
@@ -350,10 +304,17 @@ pub(crate) struct NativeDynamicUnit {
     native_entry_signature_epochs: std::collections::BTreeMap<php_ir::FunctionId, u64>,
     runtime_state: NativeUnitRuntimeState,
     linked_functions: Box<[php_jit::JitNativeLinkedFunction]>,
-    published_runtime_view: Box<php_jit::JitNativeRuntimeView>,
+    pub(crate) published_runtime_view: Box<php_jit::JitNativeRuntimeView>,
 }
 
 impl NativeDynamicUnit {
+    pub(crate) fn trusted_dynamic_constant_sites(&self, name: &str) -> Option<&[usize]> {
+        self.runtime_state
+            .trusted_dynamic_constant_sites
+            .get(name)
+            .map(Vec::as_slice)
+    }
+
     /// Rebind one transferred unit to the new request owner's native arenas.
     ///
     /// Include/eval execution moves symbol packages between separately owned
@@ -387,8 +348,7 @@ struct NativeUnitRuntimeState {
         php_runtime::api::StableNativeArena<php_jit::JitNativeTrustedPropertySlot>,
     trusted_closure_plans: php_runtime::api::StableNativeArena<u64>,
     trusted_exception_plans: php_runtime::api::StableNativeArena<u64>,
-    trusted_exception_plan_owners:
-        std::collections::BTreeMap<usize, Box<PreparedNativeThrowableSite>>,
+    trusted_exception_plan_owners: std::collections::BTreeMap<usize, PreparedNativeThrowableOwner>,
     trusted_constant_slots:
         php_runtime::api::StableNativeArena<php_jit::JitNativeTrustedConstantSlot>,
     trusted_dynamic_constant_sites: std::collections::BTreeMap<String, Vec<usize>>,
@@ -898,8 +858,12 @@ impl NativePreparedCallableOwner {
             | php_jit::JIT_NATIVE_PREPARED_CALLABLE_HAS_RECEIVER
             | php_jit::JIT_NATIVE_PREPARED_CALLABLE_RETURNS_INT
             | php_jit::JIT_NATIVE_PREPARED_CALLABLE_RETURNS_STRING
+            | php_jit::JIT_NATIVE_PREPARED_CALLABLE_DIRECT_PACKED_BINDING
             | php_jit::JIT_NATIVE_PREPARED_CALLABLE_FIRST_PARAMETER_BY_REFERENCE
-            | php_jit::JIT_NATIVE_PREPARED_CALLABLE_RETURNS_RELEASABLE_SCALAR);
+            | php_jit::JIT_NATIVE_PREPARED_CALLABLE_RETURNS_RELEASABLE_SCALAR
+            | php_jit::JIT_NATIVE_PREPARED_CALLABLE_RETURNS_REFERENCE
+            | php_jit::JIT_NATIVE_PREPARED_CALLABLE_MAGIC_DISPATCH
+            | php_jit::JIT_NATIVE_PREPARED_CALLABLE_VARIADIC);
         self.native_view.flags |= php_jit::JIT_NATIVE_PREPARED_CALLABLE_FIXED_BINDING;
         if plan.has_receiver {
             self.native_view.flags |= php_jit::JIT_NATIVE_PREPARED_CALLABLE_HAS_RECEIVER;
@@ -918,8 +882,23 @@ impl NativePreparedCallableOwner {
             self.native_view.flags |=
                 php_jit::JIT_NATIVE_PREPARED_CALLABLE_RETURNS_RELEASABLE_SCALAR;
         }
+        if plan.returns_by_reference {
+            self.native_view.flags |= php_jit::JIT_NATIVE_PREPARED_CALLABLE_RETURNS_REFERENCE;
+        }
+        if plan.direct_packed_binding {
+            self.native_view.flags |= php_jit::JIT_NATIVE_PREPARED_CALLABLE_DIRECT_PACKED_BINDING;
+        }
+        if plan.magic_dispatch {
+            self.native_view.flags |= php_jit::JIT_NATIVE_PREPARED_CALLABLE_MAGIC_DISPATCH;
+        }
+        if plan.variadic {
+            self.native_view.flags |= php_jit::JIT_NATIVE_PREPARED_CALLABLE_VARIADIC;
+        }
         self.native_view.function_id = plan.function.raw();
         self.native_view.reserved = plan.visible_arity;
+        self.native_view.parameter_by_reference = plan.parameter_by_reference;
+        self.native_view.runtime_view = plan.runtime_view;
+        self.native_view.binding_plan = plan.binding_plan;
     }
 
     pub(crate) fn user_function(
@@ -942,6 +921,18 @@ impl NativePreparedCallableOwner {
             if plan.returns_releasable_scalar {
                 flags |= php_jit::JIT_NATIVE_PREPARED_CALLABLE_RETURNS_RELEASABLE_SCALAR;
             }
+            if plan.returns_by_reference {
+                flags |= php_jit::JIT_NATIVE_PREPARED_CALLABLE_RETURNS_REFERENCE;
+            }
+            if plan.direct_packed_binding {
+                flags |= php_jit::JIT_NATIVE_PREPARED_CALLABLE_DIRECT_PACKED_BINDING;
+            }
+            if plan.magic_dispatch {
+                flags |= php_jit::JIT_NATIVE_PREPARED_CALLABLE_MAGIC_DISPATCH;
+            }
+            if plan.variadic {
+                flags |= php_jit::JIT_NATIVE_PREPARED_CALLABLE_VARIADIC;
+            }
             visible_arity = plan.visible_arity;
         }
         Self::from_native_parts(
@@ -950,6 +941,10 @@ impl NativePreparedCallableOwner {
                 function_id: resolved_function.map_or(u32::MAX, |plan| plan.function.raw()),
                 flags,
                 reserved: visible_arity,
+                parameter_by_reference: resolved_function
+                    .map_or([0; 4], |plan| plan.parameter_by_reference),
+                runtime_view: resolved_function.map_or(0, |plan| plan.runtime_view),
+                binding_plan: resolved_function.map_or(0, |plan| plan.binding_plan),
                 ..php_jit::JitNativePreparedCallableView::default()
             },
             None,
@@ -959,11 +954,71 @@ impl NativePreparedCallableOwner {
         )
     }
 
-    fn internal_builtin(name: Box<[u8]>) -> Self {
+    pub(crate) fn internal_builtin(name: Box<[u8]>) -> Self {
+        let fixed_strlen = name.eq_ignore_ascii_case(b"strlen");
+        let fixed_intval = name.eq_ignore_ascii_case(b"intval");
+        let fixed_is_string = name.eq_ignore_ascii_case(b"is_string");
+        let fixed_is_int = name.eq_ignore_ascii_case(b"is_int")
+            || name.eq_ignore_ascii_case(b"is_integer")
+            || name.eq_ignore_ascii_case(b"is_long");
+        let fixed_is_scalar = name.eq_ignore_ascii_case(b"is_scalar");
+        let fixed_is_numeric = name.eq_ignore_ascii_case(b"is_numeric");
+        let fixed_trim = name.eq_ignore_ascii_case(b"trim");
+        let fixed_ltrim = name.eq_ignore_ascii_case(b"ltrim");
+        let fixed_rtrim = name.eq_ignore_ascii_case(b"rtrim");
+        let fixed_unary_predicate =
+            fixed_is_string || fixed_is_int || fixed_is_scalar || fixed_is_numeric;
+        let fixed = fixed_strlen
+            || fixed_intval
+            || fixed_unary_predicate
+            || fixed_trim
+            || fixed_ltrim
+            || fixed_rtrim;
         Self::from_native_parts(
             php_jit::JitNativePreparedCallableView {
                 kind: php_jit::JIT_NATIVE_CALLABLE_KIND_INTERNAL_BUILTIN,
                 function_id: u32::MAX,
+                flags: if fixed {
+                    let mut flags = php_jit::JIT_NATIVE_PREPARED_CALLABLE_FIXED_BINDING
+                        | php_jit::JIT_NATIVE_PREPARED_CALLABLE_DIRECT_PACKED_BINDING
+                        | php_jit::JIT_NATIVE_PREPARED_CALLABLE_RETURNS_RELEASABLE_SCALAR;
+                    if fixed_strlen {
+                        flags |= php_jit::JIT_NATIVE_PREPARED_CALLABLE_RETURNS_INT;
+                    }
+                    if fixed_trim || fixed_ltrim || fixed_rtrim {
+                        flags |= php_jit::JIT_NATIVE_PREPARED_CALLABLE_RETURNS_STRING;
+                    }
+                    flags
+                } else {
+                    0
+                },
+                reserved: if fixed_trim || fixed_ltrim || fixed_rtrim {
+                    2
+                } else {
+                    u32::from(fixed)
+                },
+                direct_entry: if fixed_strlen {
+                    crate::native_exact::jit_native_strlen_php_entry as *const () as usize as u64
+                } else if fixed_intval {
+                    crate::native_exact::jit_native_intval_php_entry as *const () as usize as u64
+                } else if fixed_is_string {
+                    crate::native_exact::jit_native_is_string_php_entry as *const () as usize as u64
+                } else if fixed_is_int {
+                    crate::native_exact::jit_native_is_int_php_entry as *const () as usize as u64
+                } else if fixed_is_scalar {
+                    crate::native_exact::jit_native_is_scalar_php_entry as *const () as usize as u64
+                } else if fixed_is_numeric {
+                    crate::native_exact::jit_native_is_numeric_php_entry as *const () as usize
+                        as u64
+                } else if fixed_trim {
+                    crate::native_exact::jit_native_trim_php_entry as *const () as usize as u64
+                } else if fixed_ltrim {
+                    crate::native_exact::jit_native_ltrim_php_entry as *const () as usize as u64
+                } else if fixed_rtrim {
+                    crate::native_exact::jit_native_rtrim_php_entry as *const () as usize as u64
+                } else {
+                    0
+                },
                 ..php_jit::JitNativePreparedCallableView::default()
             },
             None,
@@ -973,7 +1028,7 @@ impl NativePreparedCallableOwner {
         )
     }
 
-    pub(crate) fn closure(closure: NativePreparedClosure) -> Self {
+    pub(crate) fn closure(closure: NativePreparedClosure, runtime_view: u64) -> Self {
         let closure_view = closure.native_view;
         let mut flags = closure_view.flags;
         let mut visible_arity = 0;
@@ -1002,6 +1057,8 @@ impl NativePreparedCallableOwner {
                 kind: php_jit::JIT_NATIVE_CALLABLE_KIND_CLOSURE,
                 function_id: closure.closure.function,
                 reserved: visible_arity,
+                parameter_by_reference: [u64::from(closure.first_parameter_by_reference), 0, 0, 0],
+                runtime_view,
                 ..php_jit::JitNativePreparedCallableView::default()
             },
             Some(closure),
@@ -1022,6 +1079,10 @@ impl NativePreparedCallableOwner {
             receiver,
             function_id: resolved_function.map_or(u32::MAX, |plan| plan.function.raw()),
             reserved: resolved_function.map_or(0, |plan| plan.visible_arity),
+            parameter_by_reference: resolved_function
+                .map_or([0; 4], |plan| plan.parameter_by_reference),
+            runtime_view: resolved_function.map_or(0, |plan| plan.runtime_view),
+            binding_plan: resolved_function.map_or(0, |plan| plan.binding_plan),
             ..php_jit::JitNativePreparedCallableView::default()
         };
         if let Some(plan) = resolved_function {
@@ -1043,6 +1104,18 @@ impl NativePreparedCallableOwner {
                 native_view.flags |=
                     php_jit::JIT_NATIVE_PREPARED_CALLABLE_RETURNS_RELEASABLE_SCALAR;
             }
+            if plan.returns_by_reference {
+                native_view.flags |= php_jit::JIT_NATIVE_PREPARED_CALLABLE_RETURNS_REFERENCE;
+            }
+            if plan.direct_packed_binding {
+                native_view.flags |= php_jit::JIT_NATIVE_PREPARED_CALLABLE_DIRECT_PACKED_BINDING;
+            }
+            if plan.magic_dispatch {
+                native_view.flags |= php_jit::JIT_NATIVE_PREPARED_CALLABLE_MAGIC_DISPATCH;
+            }
+            if plan.variadic {
+                native_view.flags |= php_jit::JIT_NATIVE_PREPARED_CALLABLE_VARIADIC;
+            }
         }
         if scope.is_some() {
             native_view.flags |= php_jit::JIT_NATIVE_PREPARED_CALLABLE_HAS_SCOPE;
@@ -1051,6 +1124,39 @@ impl NativePreparedCallableOwner {
             native_view,
             None,
             scope.unwrap_or_default(),
+            method,
+            Box::default(),
+        )
+    }
+
+    /// Publishes one fixed internal object method whose concrete native body
+    /// consumes the same packed receiver/argument frame as generated PHP.
+    pub(crate) fn exact_bound_object(
+        receiver: i64,
+        method: Box<[u8]>,
+        visible_arity: u32,
+        direct_entry: u64,
+        returns_string: bool,
+    ) -> Self {
+        let mut flags = php_jit::JIT_NATIVE_PREPARED_CALLABLE_FIXED_BINDING
+            | php_jit::JIT_NATIVE_PREPARED_CALLABLE_HAS_RECEIVER
+            | php_jit::JIT_NATIVE_PREPARED_CALLABLE_DIRECT_PACKED_BINDING
+            | php_jit::JIT_NATIVE_PREPARED_CALLABLE_RETURNS_RELEASABLE_SCALAR;
+        if returns_string {
+            flags |= php_jit::JIT_NATIVE_PREPARED_CALLABLE_RETURNS_STRING;
+        }
+        Self::from_native_parts(
+            php_jit::JitNativePreparedCallableView {
+                kind: php_jit::JIT_NATIVE_CALLABLE_KIND_BOUND_OBJECT_METHOD,
+                receiver,
+                function_id: u32::MAX,
+                flags,
+                reserved: visible_arity,
+                direct_entry,
+                ..php_jit::JitNativePreparedCallableView::default()
+            },
+            None,
+            Box::default(),
             method,
             Box::default(),
         )
@@ -1066,6 +1172,10 @@ impl NativePreparedCallableOwner {
             kind: php_jit::JIT_NATIVE_CALLABLE_KIND_BOUND_CLASS_METHOD,
             function_id: resolved_function.map_or(u32::MAX, |plan| plan.function.raw()),
             reserved: resolved_function.map_or(0, |plan| plan.visible_arity),
+            parameter_by_reference: resolved_function
+                .map_or([0; 4], |plan| plan.parameter_by_reference),
+            runtime_view: resolved_function.map_or(0, |plan| plan.runtime_view),
+            binding_plan: resolved_function.map_or(0, |plan| plan.binding_plan),
             ..php_jit::JitNativePreparedCallableView::default()
         };
         if resolved_function.is_some() {
@@ -1082,6 +1192,18 @@ impl NativePreparedCallableOwner {
         }
         if resolved_function.is_some_and(|plan| plan.returns_releasable_scalar) {
             native_view.flags |= php_jit::JIT_NATIVE_PREPARED_CALLABLE_RETURNS_RELEASABLE_SCALAR;
+        }
+        if resolved_function.is_some_and(|plan| plan.returns_by_reference) {
+            native_view.flags |= php_jit::JIT_NATIVE_PREPARED_CALLABLE_RETURNS_REFERENCE;
+        }
+        if resolved_function.is_some_and(|plan| plan.direct_packed_binding) {
+            native_view.flags |= php_jit::JIT_NATIVE_PREPARED_CALLABLE_DIRECT_PACKED_BINDING;
+        }
+        if resolved_function.is_some_and(|plan| plan.magic_dispatch) {
+            native_view.flags |= php_jit::JIT_NATIVE_PREPARED_CALLABLE_MAGIC_DISPATCH;
+        }
+        if resolved_function.is_some_and(|plan| plan.variadic) {
+            native_view.flags |= php_jit::JIT_NATIVE_PREPARED_CALLABLE_VARIADIC;
         }
         if scope.is_some() {
             native_view.flags |= php_jit::JIT_NATIVE_PREPARED_CALLABLE_HAS_SCOPE;
@@ -1116,16 +1238,6 @@ impl NativePreparedCallableOwner {
             Box::default(),
         )
     }
-}
-
-enum NativePreparedCallableDispatch {
-    Closure,
-    Named(String),
-    BoundMethod {
-        target: php_runtime::api::CallableMethodTarget,
-        method: String,
-    },
-    Invalid(String),
 }
 
 struct NativeDirectFiber {
@@ -1178,11 +1290,6 @@ struct NativeDirectGenerator {
     yields_seen: u64,
 }
 
-enum NativeFiberReceiver {
-    Direct(i64),
-    Materialized(php_runtime::api::FiberRef),
-}
-
 /// Reusable allocations whose contents never survive a request boundary.
 ///
 /// PHP-visible owners are released before this record is returned to the
@@ -1206,6 +1313,8 @@ pub(super) struct NativeRequestBuffers {
     direct_string_reused_bytes: Box<u64>,
     fiber_suspension_states: php_runtime::api::StableNativeArena<php_jit::JitDeoptState>,
     fiber_suspension_next: Box<u32>,
+    native_trace_frames: php_runtime::api::StableNativeArena<php_jit::JitNativeTraceFrame>,
+    native_trace_depth: Box<u32>,
     static_property_slots:
         php_runtime::api::StableNativeArena<php_jit::JitNativeStaticPropertySlot>,
     static_property_next: Box<u32>,
@@ -1254,6 +1363,10 @@ impl Default for NativeRequestBuffers {
                 php_jit::JIT_NATIVE_FIBER_SUSPENSION_CAPACITY,
             ),
             fiber_suspension_next: Box::new(0),
+            native_trace_frames: php_runtime::api::StableNativeArena::new(
+                php_jit::JIT_NATIVE_TRACE_FRAME_CAPACITY,
+            ),
+            native_trace_depth: Box::new(0),
             static_property_slots: php_runtime::api::StableNativeArena::new(
                 php_jit::JIT_NATIVE_STATIC_PROPERTY_CAPACITY,
             ),
@@ -1311,6 +1424,7 @@ impl NativeRequestPool {
         debug_assert_eq!(*buffers.direct_array_next, 0);
         debug_assert_eq!(*buffers.direct_string_next, 0);
         debug_assert_eq!(*buffers.fiber_suspension_next, 0);
+        debug_assert_eq!(*buffers.native_trace_depth, 0);
         debug_assert_eq!(*buffers.static_property_next, 0);
         debug_assert!(buffers.direct_resource_handles.is_empty());
         debug_assert!(buffers.direct_closure_handles.is_empty());
@@ -1366,6 +1480,21 @@ fn native_request_local_name(function: &php_ir::IrFunction, local: usize) -> Opt
     const SUPERGLOBALS: &[&str] = &[
         "_GET", "_POST", "_COOKIE", "_REQUEST", "_SERVER", "_ENV", "_FILES", "_SESSION",
     ];
+    let local_id = u32::try_from(local).ok().map(php_ir::LocalId::new)?;
+    if let Some(name) = function
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .find_map(|instruction| match &instruction.kind {
+            php_ir::InstructionKind::BindGlobal {
+                local: binding,
+                name,
+            } if *binding == local_id => Some(name.as_str()),
+            _ => None,
+        })
+    {
+        return Some(name);
+    }
     let name = function.locals.get(local)?.as_str();
     ((function.flags.is_top_level
         && name != "GLOBALS"
@@ -1386,50 +1515,6 @@ pub(crate) struct PreparedNativeRuntimeClass {
 enum NativeGeneratorDelegation {
     Array { source: i64, cursor: usize },
     Generator { generator: i64 },
-}
-
-// `control_reserved` is otherwise zero for generated native call states. The
-// marker lets the Fiber suspension stack distinguish an opaque Generator
-// continuation from an ordinary compiled caller without publishing a second
-// value representation or ABI entry point.
-const NATIVE_FIBER_GENERATOR_FOREACH_CONTINUATION: u32 = 0x4746_4f52;
-
-enum NativeGeneratorAdvance {
-    Yielded {
-        key: i64,
-        value: i64,
-    },
-    Complete,
-    FiberSuspended {
-        value: i64,
-        active: i64,
-        /// Direct Generators waiting for `active`, ordered from the immediate
-        /// delegating parent out to the iterator exposed to foreach.
-        parents: Vec<i64>,
-    },
-}
-
-#[derive(Clone)]
-struct NativeGeneratorFiberFrame {
-    active: i64,
-    parents: Vec<i64>,
-}
-
-struct NativeFiberExecution {
-    target: NativeExecutionTarget,
-    handle: php_jit::JitFunctionHandle,
-    arguments: Vec<i64>,
-    state: php_jit::JitDeoptState,
-    nested: Option<Box<NativeFiberExecution>>,
-    generator: Option<NativeGeneratorFiberFrame>,
-}
-
-impl NativeFiberExecution {
-    fn resume_target(&self) -> &NativeExecutionTarget {
-        self.nested
-            .as_deref()
-            .map_or(&self.target, NativeFiberExecution::resume_target)
-    }
 }
 
 #[cfg(test)]

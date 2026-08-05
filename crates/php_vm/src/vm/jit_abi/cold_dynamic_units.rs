@@ -302,10 +302,10 @@ pub(super) fn register_native_dynamic_unit(
     // operation-local resolver transition merely to initialize table
     // addresses.
     context.with_active_dynamic_unit(unit, None, |_| ())?;
-    // A previous request may have completed background optimization after
-    // releasing its request-local unit map. This declaration is the next
-    // safe publication boundary: adopt every completed product before any
-    // caller link is frozen for the new request.
+    // Publish every Generic body at the declaration boundary before any
+    // generated caller can resolve a function or method from this unit. A
+    // callable resolver is metadata-only and must never discover a zero entry
+    // cell that would require Rust-side compilation or invocation.
     let published_function_count = context
         .dynamic_units
         .get(unit)
@@ -315,22 +315,11 @@ pub(super) fn register_native_dynamic_unit(
             u32::try_from(index)
                 .map_err(|_| "dynamic function index exceeds the native ABI".to_owned())?,
         );
-        let completed_optimizer = context.dynamic_units.get(unit).is_some_and(|package| {
-            let external_signatures =
-                visible_external_function_signatures(context, &package.compiled, function);
-            context.worker_state.has_compiled_optimizing_function(
-                &package.compiled,
-                function,
-                &external_signatures,
-            )
-        });
-        if completed_optimizer {
-            prepare_dynamic_native_entry(context, unit, function)?;
-        }
+        prepare_dynamic_native_entry(context, unit, function)?;
     }
-    prepare_linked_function_entries(context)?;
+    prepare_linked_function_entries(context, unit)?;
     prepare_resolved_external_callers(context, &published_function_names, &published_class_names)?;
-    refresh_linked_function_records(context);
+    refresh_linked_function_records_for_unit(context, unit);
     context.publish_function_names(published_function_names);
     for (name, value) in constants {
         if context.lookup_constant(&name).is_ok() {
@@ -720,7 +709,16 @@ pub(super) fn prepare_dynamic_native_entry(
         context.prepare_published_native_metadata()?;
         let _runtime_view = activate_native_context(context);
     } else {
-        context.with_active_dynamic_unit(unit, None, |_| ())?;
+        // The declaration loop publishes one newly compiled body at a time.
+        // Re-entering the inactive package with its full accumulated entry
+        // map made function N rebuild metadata for functions 0..=N, turning
+        // large class files into quadratic cold publication work.
+        let previous_scope = context
+            .native_metadata_preparation_scope
+            .replace(vec![function]);
+        let published = context.with_active_dynamic_unit(unit, None, |_| ());
+        context.native_metadata_preparation_scope = previous_scope;
+        published?;
     }
     let publication_plans_total = context
         .dynamic_units
@@ -923,20 +921,44 @@ pub(super) fn visible_external_function_signatures(
     )
 }
 
-pub(super) fn visible_external_function_signatures_for_unit(
-    context: &NativeRequestColdState<'_>,
-    compiled: &crate::compiled_unit::CompiledUnit,
-) -> Vec<php_jit::JitExternalFunctionSignature> {
-    collect_visible_external_function_signatures(
-        context,
-        compiled.prepared_unit_external_function_calls(),
-    )
+thread_local! {
+    /// Generated loop safepoints observed since the last hot-selection round.
+    static BACKEDGE_SAFEPOINTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-/// At the request boundary, select only baseline functions whose direct
-/// process-owned entry counters reached the worker threshold. Generated warm
-/// calls remain a single preferred-cell load; no runtime tiering helper or
-/// branch is introduced.
+/// Selects hot functions from generated loop-backedge evidence.
+///
+/// A loop that stays inside one call never crosses a request boundary, so
+/// request-completion selection alone can never promote it — which is why
+/// `loop_backedge_threshold` existed but nothing ever became hot from a loop.
+/// Generated code reaches this safepoint only at OSR/loop boundaries and only
+/// on its own throttled interval, so this adds no per-iteration work.
+pub(super) fn schedule_hot_native_functions_on_backedge(context: &NativeRequestColdState<'_>) {
+    if !context.worker_state.background_tiering {
+        return;
+    }
+    let interval = context
+        .worker_state
+        .tiering_options
+        .loop_backedge_threshold
+        .max(1);
+    let due = BACKEDGE_SAFEPOINTS.with(|seen| {
+        let observed = seen.get().saturating_add(1);
+        if observed < interval {
+            seen.set(observed);
+            return false;
+        }
+        seen.set(0);
+        true
+    });
+    if due {
+        schedule_hot_native_functions(context);
+    }
+}
+
+/// Selects baseline functions whose direct process-owned entry counters
+/// reached the worker threshold. Generated warm calls remain a single
+/// preferred-cell load; no runtime tiering helper or branch is introduced.
 pub(super) fn schedule_hot_native_functions(context: &NativeRequestColdState<'_>) {
     if !context.worker_state.background_tiering
         || !context.worker_state.tiering_options.enabled
@@ -950,8 +972,17 @@ pub(super) fn schedule_hot_native_functions(context: &NativeRequestColdState<'_>
         .function_entry_threshold
         .max(1);
     let mut candidates = Vec::new();
-    for package in &context.dynamic_units {
-        let deployment = package.compiled.prepared_deployment_image();
+    // The entry unit's own functions are hot candidates exactly like an
+    // included unit's. Scanning only dynamic units left every function in the
+    // running script permanently on the Generic tier.
+    let units = std::iter::once(&context.compiled).chain(
+        context
+            .dynamic_units
+            .iter()
+            .map(|package| &package.compiled),
+    );
+    for compiled in units {
+        let deployment = compiled.prepared_deployment_image();
         for (index, ((baseline, preferred), entries)) in deployment
             .generic_function_entries
             .iter()
@@ -970,7 +1001,7 @@ pub(super) fn schedule_hot_native_functions(context: &NativeRequestColdState<'_>
             let Ok(function) = u32::try_from(index).map(php_ir::FunctionId::new) else {
                 continue;
             };
-            candidates.push((entries, package.compiled.clone(), function));
+            candidates.push((entries, compiled.clone(), function));
         }
     }
     candidates.sort_unstable_by(|left, right| {
@@ -1171,6 +1202,132 @@ fn prepared_external_call_target(
         .map(PreparedExternalCallTarget::Function)
 }
 
+fn compiled_external_targets_for_function(
+    context: &NativeRequestColdState<'_>,
+    compiled: &crate::compiled_unit::CompiledUnit,
+    function: php_ir::FunctionId,
+) -> Vec<PreparedExternalCallTarget> {
+    let mut targets = compiled
+        .prepared_external_function_calls(function)
+        .iter()
+        .filter_map(|call| prepared_external_call_target(context, call))
+        .collect::<Vec<_>>();
+    for specialization in compiled.prepared_method_specializations(function) {
+        let php_jit::JitMethodSpecializationTarget::Linked(signature) = specialization.target
+        else {
+            continue;
+        };
+        let call = crate::compiled_unit::PreparedExternalFunctionCall {
+            normalized_name: signature.name.to_ascii_lowercase().into_boxed_str(),
+            source_name: signature.name.into_boxed_str(),
+            link_index: signature.link_index,
+        };
+        if let Some(target) = prepared_external_call_target(context, &call) {
+            targets.push(target);
+        }
+    }
+    targets
+}
+
+fn published_direct_callees(
+    context: &NativeRequestColdState<'_>,
+    unit: Option<usize>,
+    function: php_ir::FunctionId,
+) -> Option<Vec<php_ir::FunctionId>> {
+    let compiled = unit.map_or_else(
+        || Some(context.compiled.clone()),
+        |unit| {
+            context
+                .dynamic_units
+                .get(unit)
+                .map(|package| package.compiled.clone())
+        },
+    )?;
+    let mapped = unit.map_or_else(
+        || context.native_entries.get(&function),
+        |unit| {
+            context
+                .dynamic_units
+                .get(unit)
+                .and_then(|package| package.native_entries.get(&function))
+        },
+    );
+    if let Some(metadata) = mapped.and_then(php_jit::JitFunctionHandle::region_state_metadata) {
+        return Some(metadata.direct_callees.clone());
+    }
+    let external_signatures = visible_external_function_signatures(context, &compiled, function);
+    let resolved = context.worker_state.resolved_native_function(
+        &compiled,
+        function,
+        context.options,
+        &external_signatures,
+    );
+    let resolved = resolved.or_else(|| {
+        let mut generic_options = context.options.clone();
+        generic_options.native_optimization = super::super::NativeOptimizationPolicy::Generic;
+        generic_options.tiering.enabled = false;
+        context.worker_state.resolved_native_function(
+            &compiled,
+            function,
+            &generic_options,
+            &external_signatures,
+        )
+    })?;
+    resolved
+        .region_state_metadata()
+        .map(|metadata| metadata.direct_callees.clone())
+}
+
+/// Returns the exact transferred function graph reachable through immutable
+/// compiled links from the include that is about to execute. Dynamic targets
+/// remain lazy and activate their own unit at the existing cold resolution
+/// boundary.
+pub(super) fn transferred_link_dependencies(
+    context: &NativeRequestColdState<'_>,
+) -> std::collections::BTreeMap<usize, std::collections::BTreeSet<php_ir::FunctionId>> {
+    let mut dependencies =
+        std::collections::BTreeMap::<usize, std::collections::BTreeSet<php_ir::FunctionId>>::new();
+    let mut reached = std::collections::BTreeSet::<(Option<usize>, php_ir::FunctionId)>::new();
+    let mut pending = vec![(None, context.compiled.unit().entry)];
+    while let Some((unit, function)) = pending.pop() {
+        if !reached.insert((unit, function)) {
+            continue;
+        }
+        let compiled = match unit {
+            Some(unit) => match context.dynamic_units.get(unit) {
+                Some(package) => package.compiled.clone(),
+                None => continue,
+            },
+            None => context.compiled.clone(),
+        };
+        if let Some(unit) = unit {
+            dependencies.entry(unit).or_default().insert(function);
+        }
+        if let Some(callees) = published_direct_callees(context, unit, function) {
+            pending.extend(callees.into_iter().map(|callee| (unit, callee)));
+        } else {
+            // Ownership-less publication cells cannot prove a complete local
+            // call graph. Keep the cold fallback conservative for that unit.
+            pending.extend(compiled.unit().functions.iter().enumerate().filter_map(
+                |(callee, _)| {
+                    u32::try_from(callee)
+                        .ok()
+                        .map(php_ir::FunctionId::new)
+                        .map(|callee| (unit, callee))
+                },
+            ));
+        }
+        for target in compiled_external_targets_for_function(context, &compiled, function) {
+            let target_unit = target.unit();
+            dependencies.entry(target_unit).or_default();
+            if let Some(target) = target.function() {
+                pending.push((Some(target.unit), target.function));
+            }
+        }
+    }
+    dependencies
+}
+
 pub(super) fn collect_visible_external_function_signatures(
     context: &NativeRequestColdState<'_>,
     calls: &[crate::compiled_unit::PreparedExternalFunctionCall],
@@ -1307,9 +1464,12 @@ pub(super) fn collect_visible_external_function_signatures(
 /// can observe the link. The compiled call itself then loads an already
 /// published preferred entry and never enters the operation-local resolver
 /// transition merely because this is the target's first invocation.
-fn prepare_linked_function_entries(context: &mut NativeRequestColdState<'_>) -> Result<(), String> {
+fn prepare_linked_function_entries(
+    context: &mut NativeRequestColdState<'_>,
+    caller_unit: usize,
+) -> Result<(), String> {
     let mut callers = Vec::new();
-    for (caller_unit, caller) in context.dynamic_units.iter().enumerate() {
+    if let Some(caller) = context.dynamic_units.get(caller_unit) {
         let mut published_callers = if context.current_dynamic_unit == Some(caller_unit) {
             context.native_entries.keys().copied().collect::<Vec<_>>()
         } else {
@@ -1600,7 +1760,7 @@ fn linked_function_record(
                 ) as usize as u64,
                 target_unit
                     .compiled
-                    .prepared_native_function_metadata_ptr(function.function)?
+                    .prepared_native_function_binding_plan_ptr(function.function)?
                     as usize as u64,
                 u64::from(function.function.raw())
                     ^ u64::from(target_unit.compiled.unit().version).rotate_left(17),
@@ -1624,6 +1784,10 @@ fn linked_function_record(
         generation: u64::from(target_unit.compiled.unit().version),
         signature_identity,
         prepared_class,
+        function_id: target
+            .function()
+            .map_or(u32::MAX, |function| function.function.raw()),
+        reserved: 0,
     })
 }
 
@@ -1820,59 +1984,4 @@ pub(super) fn native_external_class_exists(
     name: &str,
 ) -> bool {
     native_external_class_ref(context, name).is_some()
-}
-
-pub(super) fn native_autoload_class(
-    context: &mut NativeRequestColdState<'_>,
-    name: &str,
-    source: &php_ir::Instruction,
-) -> Result<(), String> {
-    let normalized = normalize_class_name(name);
-    if context
-        .unit
-        .classes
-        .iter()
-        .any(|class| class.name == normalized)
-        || php_std::ExtensionRegistry::standard_library()
-            .enabled_class(&normalized)
-            .is_some()
-        || matches!(
-            normalized.as_str(),
-            "exception"
-                | "error"
-                | "typeerror"
-                | "valueerror"
-                | "argumentcounterror"
-                | "fibererror"
-        )
-    {
-        return Ok(());
-    }
-    if !context.autoload_in_progress.insert(normalized.clone()) {
-        return Ok(());
-    }
-    let result = (|| {
-        if !native_external_class_exists(context, name) {
-            invoke_registered_autoload_callbacks_until(
-                context,
-                name.as_bytes(),
-                source,
-                |context| native_external_class_exists(context, name),
-            )?;
-        }
-        if let Some((_, class)) = native_external_class_handle(context, name) {
-            let dependencies = class
-                .parent_display_name
-                .clone()
-                .or_else(|| class.parent.clone())
-                .into_iter()
-                .chain(class.interfaces.iter().cloned());
-            for dependency in dependencies {
-                native_autoload_class(context, &dependency, source)?;
-            }
-        }
-        Ok(())
-    })();
-    context.autoload_in_progress.remove(&normalized);
-    result
 }

@@ -1,16 +1,14 @@
 //! Typed PHP semantic operations that cross the native-call boundary.
 //!
 //! These operations are deliberately separate from user-visible function
-//! calls.  Their numeric IDs are ABI-visible and append-only: native code may
-//! persist the ID in a call frame, while names and other PHP metadata remain
-//! strongly typed in Region IR.
+//! calls. The operation identity exists only while compiling Region IR; no
+//! selector is persisted in a runtime call frame.
 
 use php_ir::{IrSpan, LocalId};
 
 use super::RegionOperand;
 
-/// Stable runtime operation identifiers. Existing values must never be
-/// renumbered or reused.
+/// Compiler-only operation identities used for exhaustive lowering checks.
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum RegionSemanticOperationId {
@@ -81,37 +79,6 @@ impl RegionSemanticOperationId {
     }
 
     #[must_use]
-    pub const fn exact_symbol(self) -> &'static str {
-        match self {
-            Self::StaticPropertyFetch => "phrust_native_static_property_fetch",
-            Self::StaticPropertyAssign => "phrust_native_static_property_assign",
-            Self::StaticPropertyIsset => "phrust_native_static_property_isset",
-            Self::StaticPropertyEmpty => "phrust_native_static_property_empty",
-            Self::StaticPropertyDimIsset => "phrust_native_static_property_dim_isset",
-            Self::StaticPropertyDimEmpty => "phrust_native_static_property_dim_empty",
-            Self::StaticPropertyDimUnset => "phrust_native_static_property_dim_unset",
-            Self::StaticPropertyReference => "phrust_native_static_property_reference",
-            Self::ClassConstantFetch => "phrust_native_class_constant_fetch",
-            Self::ObjectClassName => "phrust_native_object_class_name_semantic",
-            Self::InstanceOf => "phrust_native_instanceof",
-            Self::DynamicInstanceOf => "phrust_native_dynamic_instanceof",
-            Self::ResolveCallable => "phrust_native_resolve_callable_semantic",
-            Self::AcquireCallable => "phrust_native_acquire_callable_semantic",
-            Self::PropertyFetch => "phrust_native_property_fetch_semantic",
-            Self::PropertyAssign => "phrust_native_property_assign_semantic",
-            Self::PropertyIsset => "phrust_native_property_isset",
-            Self::PropertyEmpty => "phrust_native_property_empty",
-            Self::PropertyUnset => "phrust_native_property_unset",
-            Self::PropertyDimAssign => "phrust_native_property_dim_assign",
-            Self::PropertyDimIsset => "phrust_native_property_dim_isset",
-            Self::PropertyDimEmpty => "phrust_native_property_dim_empty",
-            Self::PropertyDimUnset => "phrust_native_property_dim_unset",
-            Self::BindGlobal => "phrust_native_bind_global",
-            Self::BoundClosureClass => "phrust_native_bound_closure_class",
-        }
-    }
-
-    #[must_use]
     pub const fn raw(self) -> u32 {
         self as u32
     }
@@ -161,6 +128,9 @@ pub struct RegionSemanticContext {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RegionPropertyName {
     Static(String),
+    /// A fixed undeclared stdClass name backed by the native dynamic-property
+    /// plane rather than the declared-slot table.
+    FixedDynamic(String),
     Dynamic(RegionOperand),
 }
 

@@ -54,14 +54,15 @@ pub(super) fn lower_native_dynamic_code(
     module: &mut JITModule,
     builder: &mut FunctionBuilder<'_>,
     native_dynamic_code_helper: Option<NativeHelper>,
+    value_release_commit: Option<ir::FuncRef>,
     locals: &NativeLocalMap,
     register_variables: &NativeRegisterMap,
     registers: &mut NativeRegisterMap,
     operation: &RegionNativeDynamicCode,
     instruction: &RegionInstruction,
     result_out: ir::Value,
+    runtime: ir::Value,
     deopt_out: ir::Value,
-    native_operations: GenericNativeOperations,
     function: FunctionId,
     pointer_type: ir::Type,
 ) -> Result<(), CraneliftLoweringError> {
@@ -365,12 +366,6 @@ pub(super) fn lower_native_dynamic_code(
         out_slot,
         std::mem::offset_of!(crate::JitNativeDynamicUnitResolution, runtime_view) as i32,
     );
-    let runtime = helper.runtime.ok_or_else(|| {
-        CraneliftLoweringError::new(
-            "JIT_CRANELIFT_REJECT_NATIVE_DYNAMIC_CODE",
-            "dynamic unit resolver has no request fast state",
-        )
-    })?;
     let deopt_view_pointer = builder.ins().iadd_imm(
         deopt_out,
         i64::try_from(std::mem::offset_of!(
@@ -417,6 +412,10 @@ pub(super) fn lower_native_dynamic_code(
         ],
     );
     let invoked_status = unpack_native_php_control(builder, call, result_out);
+    let exit_deopt_view =
+        builder
+            .ins()
+            .load(pointer_type, MemFlagsData::new(), deopt_view_pointer, 0);
     builder.ins().store(
         MemFlagsData::new(),
         previous_deopt_view,
@@ -483,15 +482,7 @@ pub(super) fn lower_native_dynamic_code(
             std::mem::offset_of!(crate::JitNativeDynamicBinding, reference) as i32,
         );
         let payload = lower_direct_reference_payload_unchecked(builder, reference, deopt_out);
-        let payload = lower_guarded_value_release(
-            module,
-            builder,
-            native_operations.value_release,
-            0,
-            payload,
-            result_out,
-            deopt_out,
-        )?;
+        lower_optimizing_retain(builder, payload, deopt_out);
         let caller_slot = builder.ins().uextend(pointer_type, caller_slot);
         let caller_offset = builder.ins().ishl_imm(caller_slot, 3);
         let caller_address = builder.ins().iadd(caller_frame, caller_offset);
@@ -501,14 +492,17 @@ pub(super) fn lower_native_dynamic_code(
         builder
             .ins()
             .store(MemFlagsData::new(), payload, caller_address, 0);
-        let _ = lower_guarded_value_release(
-            module,
+        lower_direct_release_with_commit(
             builder,
-            native_operations.value_release,
-            1,
             previous,
-            result_out,
+            runtime,
             deopt_out,
+            value_release_commit.ok_or_else(|| {
+                CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_DYNAMIC_RELEASE_COMMIT",
+                    "dynamic unit resolver has no generated release commit",
+                )
+            })?,
         )?;
         builder.ins().jump(done, &[]);
         builder.switch_to_block(done);
@@ -527,6 +521,14 @@ pub(super) fn lower_native_dynamic_code(
         .ins()
         .brif(returned, invoke_ok, &[], invoke_control, &[]);
     builder.switch_to_block(invoke_control);
+    // The request fast state has already returned to the caller view, but the
+    // precise side-exit coordinates and view were published by the included
+    // unit or one of its transitive callees. Preserve the actual exit view in
+    // the deopt record so the cold boundary never pairs callee coordinates
+    // with caller metadata.
+    builder
+        .ins()
+        .store(MemFlagsData::new(), exit_deopt_view, deopt_view_pointer, 0);
     return_native_or_fragment_control(builder, invoked_status, result_out);
     builder.switch_to_block(invoke_ok);
     let value = builder

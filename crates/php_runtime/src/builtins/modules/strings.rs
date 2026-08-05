@@ -2014,6 +2014,16 @@ pub(in crate::builtins::modules) fn builtin_htmlspecialchars(
 
 pub const NATIVE_HTML_ESCAPE_DEFAULT_FLAGS: i64 = HTML_ESCAPE_DEFAULT_FLAGS;
 
+/// Returns the current deterministic PHP translation table as native byte
+/// pairs. No `Value` or `PhpArray` is constructed at this boundary.
+pub fn native_html_translation_entries(
+    table: i64,
+    flags: i64,
+    encoding: Option<&[u8]>,
+) -> Vec<(&'static [u8], &'static [u8])> {
+    direct_html_translation_table_entries(table, flags, encoding)
+}
+
 /// Escapes one authoritative native byte string with PHP's HTML-special-char
 /// flag semantics.
 pub fn native_html_escape_output_length(

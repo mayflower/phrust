@@ -1151,7 +1151,7 @@ wordpress-preflight: _native-cutover-deferred-warning
     scripts/wordpress/preflight.py --wordpress-dir "${PHRUST_WORDPRESS_DIR:-}" --docroot "${PHRUST_WORDPRESS_DOCROOT:-${PHRUST_WORDPRESS_DIR:-}}" --reference-php "${REFERENCE_PHP:-}" --phrust-binary "${PHP_VM_CLI:-target/debug/php-vm}" --phrust-server "${PHRUST_SERVER:-target/debug/phrust-server}" --out target/wordpress-real/preflight.json
 
 parallel-rustc-wrapper:
-    python3 -m unittest scripts/development/test_parallel_php_vm_rustc.py
+    python3 scripts/development/test_parallel_php_vm_rustc.py
 
 wordpress-cutover-build: parallel-rustc-wrapper
     RUSTC_WRAPPER= RUSTC_WORKSPACE_WRAPPER="$PWD/scripts/development/parallel_php_vm_rustc.sh" PHRUST_RUSTC_CACHE_WRAPPER= CARGO_INCREMENTAL=1 cargo build --profile cutover -p php_vm_cli --bin php-vm -p php_server --bin phrust-server

@@ -2,7 +2,8 @@
 
 use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 
-pub(crate) const GENERIC_FUNCTION_SPECIALIZATION: &str = "streaming-generic-v8-shared-entry-abi";
+pub(crate) const GENERIC_FUNCTION_SPECIALIZATION: &str =
+    "streaming-generic-v9-direct-native-callable-entry";
 pub(crate) const OPTIMIZING_FUNCTION_SPECIALIZATION: &str = "ssa-optimizing-v1";
 
 /// Constructs the exact symbolic publication key used by declaration and

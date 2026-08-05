@@ -577,11 +577,18 @@ impl CraneliftCodeManager {
         flags
             .set("preserve_frame_pointers", "true")
             .map_err(|error| CraneliftCodeManagerError::Flags(error.to_string()))?;
-        // The request-critical baseline is deliberately a translation tier.
-        // Its emitted control/state shape is compacted before Cranelift, so
-        // backend optimization would only add cold latency to every fragment.
+        // Steady-state execution is the only thing this backend is measured
+        // on; a cold compile costs single-digit milliseconds and never sits on
+        // a request's critical path twice. Measured on a tight integer loop
+        // with the tier composition pinned so publication timing cannot skew
+        // the result (five runs each):
+        //   none            1157-1209 ms, 56024 code bytes
+        //   speed           1046-1091 ms, 54288 code bytes
+        //   speed_and_size  1067-1107 ms, 54288 code bytes
+        // for about +1.5 ms of compile time. The backend therefore optimizes
+        // rather than merely translating.
         flags
-            .set("opt_level", "none")
+            .set("opt_level", "speed")
             .map_err(|error| CraneliftCodeManagerError::Flags(error.to_string()))?;
         // Most request-critical functions are tiny and favor linear-time
         // allocation. Structurally large groups have already been fragmented

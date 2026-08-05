@@ -1530,20 +1530,39 @@ fn is_basic_only_entity_table(
 
 fn basic_html_translation_table(flags: i64, document_type: HtmlDocumentType) -> PhpArray {
     let mut entries = PhpArray::new();
-    insert_translation_entry(&mut entries, b"&", b"&amp;");
-    if flags & 1 != 0 {
-        insert_translation_entry(
-            &mut entries,
-            b"'",
-            html_translation_single_quote_entity(document_type),
-        );
-    }
-    insert_translation_entry(&mut entries, b">", b"&gt;");
-    insert_translation_entry(&mut entries, b"<", b"&lt;");
-    if flags & 2 != 0 {
-        insert_translation_entry(&mut entries, b"\"", b"&quot;");
+    for (character, entity) in direct_html_translation_entries(flags, document_type) {
+        insert_translation_entry(&mut entries, character, entity);
     }
     entries
+}
+
+fn direct_html_translation_entries(
+    flags: i64,
+    document_type: HtmlDocumentType,
+) -> Vec<(&'static [u8], &'static [u8])> {
+    let mut entries = Vec::with_capacity(5);
+    entries.push((b"&".as_slice(), b"&amp;".as_slice()));
+    if flags & 1 != 0 {
+        entries.push((
+            b"'".as_slice(),
+            html_translation_single_quote_entity(document_type),
+        ));
+    }
+    entries.push((b">".as_slice(), b"&gt;".as_slice()));
+    entries.push((b"<".as_slice(), b"&lt;".as_slice()));
+    if flags & 2 != 0 {
+        entries.push((b"\"".as_slice(), b"&quot;".as_slice()));
+    }
+    entries
+}
+
+pub(in crate::builtins::modules) fn direct_html_translation_table_entries(
+    table: i64,
+    flags: i64,
+    encoding: Option<&[u8]>,
+) -> Vec<(&'static [u8], &'static [u8])> {
+    let _ = (table, encoding);
+    direct_html_translation_entries(flags, html_document_type(flags))
 }
 
 fn insert_translation_entry(entries: &mut PhpArray, character: &[u8], entity: &[u8]) {

@@ -1,10 +1,8 @@
-//! Deliberately cheap streaming Generic compilation policy.
+//! Shared SSA compilation policy for Generic and Optimizing native tiers.
 //!
-//! The Generic backend shares semantic instruction emitters with the
-//! optimizing backend, but it does not share the optimizing value-placement
-//! contract. Values crossing real CFG edges are materialized in the native
-//! fragment frame so Cranelift never has to construct function-wide SSA live
-//! ranges for PHP locals and virtual registers.
+//! Both tiers use the same function-scoped value placement. Generic remains
+//! conservative in its semantic choices and imported exact leaves, while
+//! Optimizing may use publication assumptions and guards.
 
 use super::CraneliftLoweringError;
 use super::executable_region::DefinedRegionFunction;
@@ -16,27 +14,31 @@ type FragmentEmitter<'a> =
 /// Stable compiler mode included in diagnostics and persistent identity.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum NativeCompilationMode {
-    StreamingGeneric,
+    SsaGeneric,
     SsaOptimizing,
 }
 
 impl NativeCompilationMode {
     pub(super) const fn as_str(self) -> &'static str {
         match self {
-            Self::StreamingGeneric => "streaming-generic",
+            Self::SsaGeneric => "ssa-generic",
             Self::SsaOptimizing => "ssa-optimizing",
         }
     }
 
     pub(super) const fn specialization(self) -> &'static str {
         match self {
-            Self::StreamingGeneric => super::native_linkage::GENERIC_FUNCTION_SPECIALIZATION,
+            Self::SsaGeneric => super::native_linkage::GENERIC_FUNCTION_SPECIALIZATION,
             Self::SsaOptimizing => "ssa-optimizing-v1",
         }
     }
 
     pub(super) const fn streams_cfg_state_through_slots(self) -> bool {
-        matches!(self, Self::StreamingGeneric)
+        false
+    }
+
+    pub(super) const fn is_generic(self) -> bool {
+        matches!(self, Self::SsaGeneric)
     }
 }
 
@@ -52,18 +54,18 @@ pub(super) trait NativeFragmentCompiler {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-pub(super) struct StreamingGenericCompiler;
+pub(super) struct SsaGenericCompiler;
 
-impl NativeFragmentCompiler for StreamingGenericCompiler {
+impl NativeFragmentCompiler for SsaGenericCompiler {
     fn mode(&self) -> NativeCompilationMode {
-        NativeCompilationMode::StreamingGeneric
+        NativeCompilationMode::SsaGeneric
     }
 
     fn compile_fragment(
         &self,
         emit: &mut FragmentEmitter<'_>,
     ) -> Result<DefinedRegionFunction, CraneliftLoweringError> {
-        emit(NativeCompilationMode::StreamingGeneric)
+        emit(NativeCompilationMode::SsaGeneric)
     }
 }
 
@@ -83,12 +85,12 @@ impl NativeFragmentCompiler for SsaOptimizingCompiler {
     }
 }
 
-static STREAMING_GENERIC_COMPILER: StreamingGenericCompiler = StreamingGenericCompiler;
+static SSA_GENERIC_COMPILER: SsaGenericCompiler = SsaGenericCompiler;
 static SSA_OPTIMIZING_COMPILER: SsaOptimizingCompiler = SsaOptimizingCompiler;
 
 pub(super) fn compiler_for_tier(tier: NativeCompilerTier) -> &'static dyn NativeFragmentCompiler {
     match tier {
-        NativeCompilerTier::Generic => &STREAMING_GENERIC_COMPILER,
+        NativeCompilerTier::Generic => &SSA_GENERIC_COMPILER,
         NativeCompilerTier::Optimizing => &SSA_OPTIMIZING_COMPILER,
     }
 }
@@ -101,7 +103,7 @@ mod tests {
     fn tiers_select_distinct_stable_compilation_modes() {
         let generic = compiler_for_tier(NativeCompilerTier::Generic);
         let optimizing = compiler_for_tier(NativeCompilerTier::Optimizing);
-        assert_eq!(generic.mode().as_str(), "streaming-generic");
+        assert_eq!(generic.mode().as_str(), "ssa-generic");
         assert_eq!(optimizing.mode().as_str(), "ssa-optimizing");
         assert_ne!(
             generic.mode().specialization(),

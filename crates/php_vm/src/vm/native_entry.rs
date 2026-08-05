@@ -181,21 +181,9 @@ impl Vm {
             php_jit::JIT_RUNTIME_ABI_HASH,
             runtime,
             |types, value| {
-                let class = context
-                    .materialize_outer_result(value)
-                    .ok()
-                    .and_then(super::native_exception_fields)
-                    .map(|(class, _, _)| class);
-                class.is_some_and(|class| {
-                    types.iter().any(|type_| {
-                        type_.eq_ignore_ascii_case(&class)
-                            || type_.eq_ignore_ascii_case("Throwable")
-                            || (type_.eq_ignore_ascii_case("Exception")
-                                && class.ends_with("Exception"))
-                            || (type_.eq_ignore_ascii_case("Error")
-                                && (class == "Error" || class.ends_with("Error")))
-                    })
-                })
+                types
+                    .iter()
+                    .any(|type_| context.direct_object_is_a(value, type_))
             },
         );
         let outcome =
@@ -306,9 +294,21 @@ impl Vm {
                 Ok(php_jit::JitI64InvokeOutcome::SideExit { status, state, .. })
                     if status == php_jit::JitCallStatus::RUNTIME_ERROR.0 as i32 =>
                 {
-                    let operation =
-                        context.instruction_kind_debug(state.function_id, state.continuation_id);
-                    let message = context
+                    if state.control_reserved == php_jit::JIT_NATIVE_RUNTIME_FATAL_DETAIL
+                        && let Some(message) = super::jit_abi::publish_explicit_native_runtime_fatal(
+                            &mut context,
+                            state.function_id,
+                            state.continuation_id,
+                        )
+                    {
+                        VmResult::fatal(
+                            std::mem::take(&mut context.output),
+                            context.diagnostic.take(),
+                            message,
+                        )
+                    } else {
+                        let operation = context.instruction_kind_debug_for_state(&state);
+                        let message = context
                         .diagnostic
                         .as_ref()
                         .map_or_else(
@@ -326,25 +326,26 @@ impl Vm {
                             },
                             |diagnostic| diagnostic.message().to_owned(),
                         );
-                    if context.diagnostic.as_ref().is_some_and(|diagnostic| {
-                        diagnostic.severity() == php_runtime::api::RuntimeSeverity::FatalError
-                    }) && context
-                        .output
-                        .as_bytes()
-                        .windows(b"Fatal error".len())
-                        .any(|window| window == b"Fatal error")
-                    {
-                        VmResult::fatal(
-                            std::mem::take(&mut context.output),
-                            context.diagnostic.take(),
-                            message,
-                        )
-                    } else {
-                        VmResult::runtime_error(
-                            std::mem::take(&mut context.output),
-                            context.diagnostic.take(),
-                            message,
-                        )
+                        if context.diagnostic.as_ref().is_some_and(|diagnostic| {
+                            diagnostic.severity() == php_runtime::api::RuntimeSeverity::FatalError
+                        }) && context
+                            .output
+                            .as_bytes()
+                            .windows(b"Fatal error".len())
+                            .any(|window| window == b"Fatal error")
+                        {
+                            VmResult::fatal(
+                                std::mem::take(&mut context.output),
+                                context.diagnostic.take(),
+                                message,
+                            )
+                        } else {
+                            VmResult::runtime_error(
+                                std::mem::take(&mut context.output),
+                                context.diagnostic.take(),
+                                message,
+                            )
+                        }
                     }
                 }
                 Ok(php_jit::JitI64InvokeOutcome::SideExit { status, .. })

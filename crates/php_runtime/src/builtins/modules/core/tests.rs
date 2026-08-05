@@ -972,6 +972,34 @@ fn variable_type_builtins_cover_objects_references_and_casts() {
 }
 
 #[test]
+fn intval_warns_and_returns_one_for_objects() {
+    let mut output = OutputBuffer::new();
+    let entry = BuiltinRegistry::new()
+        .get("intval")
+        .expect("builtin exists");
+    let mut context = BuiltinContext::new(&mut output);
+    let object = Value::Object(ObjectRef::new_with_display_name(
+        &empty_class("NumericObject"),
+        "NumericObject",
+    ));
+
+    let result = (entry.function())(&mut context, vec![object], RuntimeSourceSpan::default())
+        .expect("object conversion continues after its warning");
+    let diagnostics = context.take_diagnostics();
+
+    assert_eq!(result, Value::Int(1));
+    assert_eq!(diagnostics.len(), 1);
+    assert_eq!(
+        diagnostics[0].id(),
+        "E_PHP_RUNTIME_OBJECT_NUMERIC_CAST_WARNING"
+    );
+    assert_eq!(
+        diagnostics[0].message(),
+        "Object of class NumericObject could not be converted to int"
+    );
+}
+
+#[test]
 fn string_cast_builtins_warn_for_array_to_string() {
     let mut output = OutputBuffer::new();
 

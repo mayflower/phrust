@@ -1,16 +1,12 @@
 {
   "diagnostic_string_parsing_allowlist": [
     {
-      "id": "crates/php_vm/src/vm/jit_abi/baseline_call_support.rs:diagnostic_code_prefix_parse:cbdaba2703e0:1",
-      "reason": "explicit baseline-only conversion from the legacy semantic error envelope into typed NativeCallControl; optimizing exact handlers construct typed control directly"
+      "id": "crates/php_vm/src/vm/jit_abi/cold_services.rs:diagnostic_code_prefix_parse:cbdaba2703e0:1",
+      "reason": "cold-only conversion of the legacy outer throw envelope into typed NativeCallControl; generated exact handlers construct typed control directly"
     },
     {
-      "id": "crates/php_vm/src/vm/jit_abi/baseline_call_support.rs:diagnostic_code_prefix_parse:836d0b5d1da3:1",
-      "reason": "explicit baseline-only exit conversion in NativeCallControl::from_baseline_error; optimizing exact handlers carry the encoded exit value directly"
-    },
-    {
-      "id": "crates/php_vm/src/vm/jit_abi/baseline_runtime_ops.rs:diagnostic_code_prefix_parse:aeb86ceeb4fd:1",
-      "reason": "baseline local-operation continuation translates the legacy cold semantic throw envelope at its ABI boundary; optimizing operations use typed control"
+      "id": "crates/php_vm/src/vm/jit_abi/cold_services.rs:diagnostic_code_prefix_parse:836d0b5d1da3:1",
+      "reason": "cold-only conversion of the legacy outer exit envelope into typed NativeCallControl; generated exact handlers carry the encoded exit value directly"
     }
   ],
   "generated_file_allowlist": [
@@ -138,48 +134,44 @@
   ],
   "large_file_limits": {
     "crates/php_ir/src/lower/expressions.rs": {
-      "max_bytes": 342140,
-      "max_lines": 9561
+      "max_bytes": 342482,
+      "max_lines": 9566
     },
     "crates/php_jit/src/cranelift_lowering.rs": {
-      "max_bytes": 1444651,
-      "max_lines": 35191
+      "max_bytes": 1308877,
+      "max_lines": 31554
     },
     "crates/php_jit/src/cranelift_lowering/call_metadata.rs": {
-      "max_bytes": 179098,
-      "max_lines": 5335
+      "max_bytes": 173677,
+      "max_lines": 5209
     },
     "crates/php_jit/src/cranelift_lowering/executable_region.rs": {
-      "max_bytes": 1026038,
-      "max_lines": 23130
+      "max_bytes": 1100209,
+      "max_lines": 24842
     },
     "crates/php_jit/src/region_ir/executable.rs": {
-      "max_bytes": 378934,
-      "max_lines": 8304
+      "max_bytes": 388148,
+      "max_lines": 8512
     },
     "crates/php_phpt_tools/src/commands/mod.rs": {
       "max_bytes": 186734,
       "max_lines": 5173
     },
     "crates/php_runtime/src/builtins/modules/core.rs": {
-      "max_bytes": 210193,
-      "max_lines": 6518
-    },
-    "crates/php_vm/src/vm/jit_abi/baseline_runtime_ops.rs": {
-      "max_bytes": 260430,
-      "max_lines": 6107
+      "max_bytes": 210544,
+      "max_lines": 6529
     },
     "crates/php_vm/src/vm/jit_abi/cold_request_state.rs": {
-      "max_bytes": 328226,
-      "max_lines": 7448
+      "max_bytes": 301805,
+      "max_lines": 6738
     },
     "crates/php_vm/src/vm/jit_abi/native/exact_call_dispatch.rs": {
-      "max_bytes": 252838,
-      "max_lines": 6641
+      "max_bytes": 268907,
+      "max_lines": 7060
     },
     "crates/php_vm/src/vm/jit_abi/native/fast_state_impl.rs": {
-      "max_bytes": 270279,
-      "max_lines": 6264
+      "max_bytes": 295145,
+      "max_lines": 6825
     }
   },
   "module_wide_allowlist": [

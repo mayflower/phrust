@@ -2,13 +2,13 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use php_ir::{IrConstant, IrReturnType, LocalId, RegId};
+use php_ir::{FunctionId, IrConstant, IrReturnType, LocalId, RegId};
 
 use super::{
     RegionBinaryOp, RegionCallResult, RegionCallTarget, RegionCastOp, RegionGraph,
     RegionInstructionKind, RegionNativeControl, RegionNativeDynamicCode, RegionNativeSuspend,
-    RegionOperand, RegionSemanticOp, RegionTerminator, RegionUnaryOp, SsaIntegerRange,
-    SsaOwnership, SsaValueClass, SsaValueFact, ssa::ExecutableSsaGraph,
+    RegionOperand, RegionSemanticOp, RegionTerminator, RegionUnaryOp, SsaCertainty,
+    SsaIntegerRange, SsaOwnership, SsaValueClass, SsaValueFact, ssa::ExecutableSsaGraph,
 };
 
 /// Storage selected for a PHP local before Cranelift lowering.
@@ -58,6 +58,7 @@ pub struct ExecutableValueFlow {
     reference_dimension_loads: BTreeMap<u32, RegId>,
     moved_local_stores: BTreeSet<u32>,
     moved_register_copies: BTreeSet<u32>,
+    moved_array_insert_operands: BTreeSet<(u32, RegId)>,
     consumed_call_operands: BTreeSet<(u32, RegId)>,
     elided_discards: BTreeSet<u32>,
     frame_cleanup_locals: BTreeSet<LocalId>,
@@ -155,6 +156,15 @@ impl ExecutableValueFlow {
         self.moved_register_copies.contains(&continuation_id)
     }
 
+    /// Whether a fresh array insertion takes the final owner of this key or
+    /// value register. Region IR spells literal insertion as copy + discard;
+    /// this ownership decision fuses that pair without refcount traffic.
+    #[must_use]
+    pub fn moves_value_into_array(&self, continuation_id: u32, register: RegId) -> bool {
+        self.moved_array_insert_operands
+            .contains(&(continuation_id, register))
+    }
+
     /// Whether this semantic call is the final owner-bearing use of a
     /// register and therefore must release the synchronous ABI borrow after
     /// the call returns.
@@ -179,6 +189,7 @@ impl ExecutableValueFlow {
         self.moved_local_stores
             .len()
             .saturating_add(self.moved_register_copies.len())
+            .saturating_add(self.moved_array_insert_operands.len())
     }
 
     #[must_use]
@@ -311,6 +322,44 @@ impl ExecutableValueFlow {
                             ));
                         }
                     }
+                    RegionInstructionKind::ArrayInsert { key, value, .. } => {
+                        for operand in key.into_iter().chain(std::iter::once(value)) {
+                            let RegionOperand::Register(src) = operand else {
+                                continue;
+                            };
+                            if !self
+                                .moved_array_insert_operands
+                                .contains(&(instruction.continuation_id, src))
+                            {
+                                continue;
+                            }
+                            if terminator_uses.contains(&src) {
+                                return Err(format!(
+                                    "array-moved r{} is used by a terminator",
+                                    src.raw()
+                                ));
+                            }
+                            let invalid_use =
+                                instruction_uses.get(&src).into_iter().flatten().find(
+                                    |&&(use_block, use_index, continuation)| {
+                                        use_may_follow(
+                                            &reachability,
+                                            block_index,
+                                            instruction_index,
+                                            use_block,
+                                            use_index,
+                                        ) && !self.elided_discards.contains(&continuation)
+                                    },
+                                );
+                            if let Some(&(_, _, continuation)) = invalid_use {
+                                return Err(format!(
+                                    "array-moved r{} is reused at continuation {}",
+                                    src.raw(),
+                                    continuation
+                                ));
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -409,6 +458,19 @@ pub fn analyze_executable_value_flow(
     region: &RegionGraph,
     constants: &[IrConstant],
 ) -> ExecutableValueFlow {
+    analyze_executable_value_flow_with_function_returns(region, constants, &BTreeMap::new())
+}
+
+/// Build executable value flow with the declared result facts of same-unit
+/// generated callees. The ordinary two-argument entry remains useful to
+/// isolated Region tests, while production lowering must preserve published
+/// PHP return types across generated-to-generated calls.
+#[must_use]
+pub fn analyze_executable_value_flow_with_function_returns(
+    region: &RegionGraph,
+    constants: &[IrConstant],
+    function_returns: &BTreeMap<FunctionId, SsaValueFact>,
+) -> ExecutableValueFlow {
     let local_storage = classify_locals(region);
     let eligible_locals = local_storage
         .iter()
@@ -500,6 +562,7 @@ pub fn analyze_executable_value_flow(
                     constants,
                     &local_facts,
                     &register_facts,
+                    function_returns,
                 ) {
                     // Executable Region IR registers are single-assignment;
                     // reevaluation replaces the previous iteration's fact.
@@ -611,12 +674,16 @@ pub fn analyze_executable_value_flow(
             break;
         }
     }
+    refine_literal_array_facts(region, constants, &mut local_facts, &mut register_facts);
     let reachability = block_reachability(region);
     let (moved_local_stores, mut elided_discards) =
         find_moved_local_stores(region, &local_storage, &register_facts, &reachability);
     let (moved_register_copies, moved_copy_discards) =
         find_moved_register_copies(region, &register_facts, &reachability);
     elided_discards.extend(moved_copy_discards);
+    let (moved_array_insert_operands, moved_array_insert_discards) =
+        find_moved_array_insert_operands(region, &register_facts, &reachability);
+    elided_discards.extend(moved_array_insert_discards);
     let (consumed_call_operands, call_operand_discards) =
         find_consumed_call_operands(region, &register_facts);
     elided_discards.extend(call_operand_discards);
@@ -642,6 +709,7 @@ pub fn analyze_executable_value_flow(
         reference_dimension_loads,
         moved_local_stores,
         moved_register_copies,
+        moved_array_insert_operands,
         consumed_call_operands,
         elided_discards,
         frame_cleanup_locals,
@@ -710,9 +778,13 @@ pub fn analyze_generic_value_ownership(region: &RegionGraph) -> ExecutableValueF
                 );
                 continue;
             }
-            if let Some((register, fact)) =
-                instruction_result_fact(&instruction.kind, &[], &local_facts, &register_facts)
-                && fact.ownership == SsaOwnership::Owned
+            if let Some((register, fact)) = instruction_result_fact(
+                &instruction.kind,
+                &[],
+                &local_facts,
+                &register_facts,
+                &BTreeMap::new(),
+            ) && fact.ownership == SsaOwnership::Owned
             {
                 register_facts.insert(register, fact);
             }
@@ -722,9 +794,12 @@ pub fn analyze_generic_value_ownership(region: &RegionGraph) -> ExecutableValueF
     let reachability = block_reachability(region);
     let (moved_local_stores, moved_store_discards) =
         find_moved_local_stores(region, &local_storage, &register_facts, &reachability);
+    let (moved_array_insert_operands, moved_array_insert_discards) =
+        find_moved_array_insert_operands(region, &register_facts, &reachability);
     let (consumed_call_operands, call_operand_discards) =
         find_consumed_call_operands(region, &register_facts);
     let mut elided_discards = moved_store_discards;
+    elided_discards.extend(moved_array_insert_discards);
     elided_discards.extend(call_operand_discards);
     let owned_entry_parameters = find_owned_entry_parameters(region, &local_storage);
     let mut frame_cleanup_locals =
@@ -773,6 +848,7 @@ pub fn analyze_generic_value_ownership(region: &RegionGraph) -> ExecutableValueF
         borrowed_local_loads,
         reference_dimension_loads,
         moved_local_stores,
+        moved_array_insert_operands,
         consumed_call_operands,
         elided_discards,
         frame_cleanup_locals,
@@ -987,6 +1063,94 @@ fn find_moved_register_copies(
                     elided_discards.insert(*discard_continuation);
                 }
                 _ => {}
+            }
+        }
+    }
+    (moved, elided_discards)
+}
+
+fn find_moved_array_insert_operands(
+    region: &RegionGraph,
+    register_facts: &BTreeMap<RegId, SsaValueFact>,
+    reachability: &[BTreeSet<usize>],
+) -> (BTreeSet<(u32, RegId)>, BTreeSet<u32>) {
+    let mut uses = BTreeMap::<RegId, Vec<(usize, usize, bool, u32)>>::new();
+    let mut terminator_uses = BTreeSet::new();
+    for (block_index, block) in region.blocks.iter().enumerate() {
+        for (instruction_index, instruction) in block.instructions.iter().enumerate() {
+            let discarded = matches!(instruction.kind, RegionInstructionKind::Discard { .. });
+            for register in instruction.register_uses() {
+                uses.entry(register).or_default().push((
+                    block_index,
+                    instruction_index,
+                    discarded,
+                    instruction.continuation_id,
+                ));
+            }
+        }
+        terminator_uses.extend(block.terminator.register_uses());
+    }
+
+    let mut moved = BTreeSet::new();
+    let mut elided_discards = BTreeSet::new();
+    for (block_index, block) in region.blocks.iter().enumerate() {
+        for (instruction_index, instruction) in block.instructions.iter().enumerate() {
+            let RegionInstructionKind::ArrayInsert {
+                key,
+                value,
+                by_ref_local: None,
+                ..
+            } = instruction.kind
+            else {
+                continue;
+            };
+            let operands = key.into_iter().chain(std::iter::once(value));
+            let registers = operands
+                .filter_map(|operand| match operand {
+                    RegionOperand::Register(register) => Some(register),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            for register in registers.iter().copied() {
+                if registers
+                    .iter()
+                    .filter(|candidate| **candidate == register)
+                    .count()
+                    != 1
+                    || register_facts.get(&register).is_none_or(|fact| {
+                        fact.ownership != SsaOwnership::Owned || !fact.has_runtime_lifecycle()
+                    })
+                    || terminator_uses.contains(&register)
+                {
+                    continue;
+                }
+                let remaining = uses
+                    .get(&register)
+                    .into_iter()
+                    .flatten()
+                    .filter(|&&(use_block, use_index, _, _)| {
+                        use_may_follow(
+                            reachability,
+                            block_index,
+                            instruction_index,
+                            use_block,
+                            use_index,
+                        )
+                    })
+                    .copied()
+                    .collect::<Vec<_>>();
+                match remaining.as_slice() {
+                    [] => {
+                        moved.insert((instruction.continuation_id, register));
+                    }
+                    [(use_block, use_index, true, discard_continuation)]
+                        if *use_block == block_index && *use_index > instruction_index =>
+                    {
+                        moved.insert((instruction.continuation_id, register));
+                        elided_discards.insert(*discard_continuation);
+                    }
+                    _ => {}
+                }
             }
         }
     }
@@ -1339,6 +1503,7 @@ fn native_call_preserves_borrowed_arguments(call: &super::RegionNativeCall) -> b
     let RegionCallTarget::Function {
         name,
         function: None,
+        ..
     } = &call.target
     else {
         return false;
@@ -1649,11 +1814,280 @@ fn operand_fact(
     }
 }
 
+/// Refine values selected from an immutable, compiler-built array graph.
+///
+/// PHP array element types are generally dynamic, so ordinary value-flow
+/// intentionally does not attach a schema to every array. Array literals are
+/// different: Region IR exposes the complete `NewArray`/`ArrayInsert` graph,
+/// which lets us prove that every value produced by a particular foreach or
+/// fixed-key fetch is itself an array. Generic lowering needs this proof just
+/// as much as Optimizing lowering; otherwise a statically constructed nested
+/// array can lose its class at the foreach boundary and spuriously require a
+/// runtime iterator executor.
+fn refine_literal_array_facts(
+    region: &RegionGraph,
+    constants: &[IrConstant],
+    local_facts: &mut BTreeMap<LocalId, SsaValueFact>,
+    register_facts: &mut BTreeMap<RegId, SsaValueFact>,
+) {
+    let definitions = region
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .filter_map(|instruction| match instruction.kind {
+            RegionInstructionKind::Move { dst, src } => Some((dst, src)),
+            RegionInstructionKind::LoadLocal { dst, local, .. } => {
+                Some((dst, RegionOperand::Local(local)))
+            }
+            _ => None,
+        })
+        .collect::<BTreeMap<_, _>>();
+    let fresh_arrays = region
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .filter_map(|instruction| match instruction.kind {
+            RegionInstructionKind::NewArray { dst } => Some(dst),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    let literal_arrays = region
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .filter_map(|instruction| match instruction.kind {
+            RegionInstructionKind::Move {
+                dst,
+                src: RegionOperand::Constant(index),
+            } if matches!(constants.get(index as usize), Some(IrConstant::Array(_))) => Some(dst),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    let literal_array_element_arrays = region
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .filter_map(|instruction| match instruction.kind {
+            RegionInstructionKind::Move {
+                dst,
+                src: RegionOperand::Constant(index),
+            } => match constants.get(index as usize) {
+                Some(IrConstant::Array(entries))
+                    if !entries.is_empty()
+                        && entries
+                            .iter()
+                            .all(|entry| matches!(entry.value, IrConstant::Array(_))) =>
+                {
+                    Some(dst)
+                }
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    let array_candidates = fresh_arrays
+        .union(&literal_arrays)
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let entries = region
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .filter_map(|instruction| match instruction.kind {
+            RegionInstructionKind::ArrayInsert {
+                array,
+                key,
+                value,
+                by_ref_local: None,
+            } if fresh_arrays.contains(&array) => Some((array, key, value)),
+            _ => None,
+        })
+        .fold(
+            BTreeMap::<RegId, Vec<(Option<RegionOperand>, RegionOperand)>>::new(),
+            |mut entries, (array, key, value)| {
+                entries.entry(array).or_default().push((key, value));
+                entries
+            },
+        );
+    let stores = region
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .filter_map(|instruction| match instruction.kind {
+            RegionInstructionKind::StoreLocal { local, src } => Some((local, src)),
+            _ => None,
+        })
+        .fold(
+            BTreeMap::<LocalId, Vec<RegionOperand>>::new(),
+            |mut stores, (local, source)| {
+                stores.entry(local).or_default().push(source);
+                stores
+            },
+        );
+    let mut candidates = array_candidates
+        .iter()
+        .copied()
+        .map(|register| (register, BTreeSet::from([register])))
+        .collect::<BTreeMap<_, _>>();
+    let mut local_candidates = BTreeMap::<LocalId, BTreeSet<RegId>>::new();
+    let mut foreach_sources = BTreeMap::<RegId, BTreeSet<RegId>>::new();
+    let candidate_set = |operand: RegionOperand,
+                         registers: &BTreeMap<RegId, BTreeSet<RegId>>,
+                         locals: &BTreeMap<LocalId, BTreeSet<RegId>>| {
+        match operand {
+            RegionOperand::Register(register) => registers.get(&register).cloned(),
+            RegionOperand::Local(local) => locals.get(&local).cloned(),
+            RegionOperand::I64(_)
+            | RegionOperand::Constant(_)
+            | RegionOperand::LinkedConstant { .. } => None,
+        }
+    };
+
+    let instruction_count = region
+        .blocks
+        .iter()
+        .map(|block| block.instructions.len())
+        .sum::<usize>();
+    for _ in 0..=instruction_count {
+        let mut changed = false;
+        for (local, sources) in &stores {
+            let Some(resolved) = sources
+                .iter()
+                .map(|source| candidate_set(*source, &candidates, &local_candidates))
+                .collect::<Option<Vec<_>>>()
+            else {
+                continue;
+            };
+            let resolved = resolved.into_iter().flatten().collect::<BTreeSet<_>>();
+            if !resolved.is_empty() && local_candidates.get(local) != Some(&resolved) {
+                local_candidates.insert(*local, resolved);
+                changed = true;
+            }
+        }
+        for instruction in region.blocks.iter().flat_map(|block| &block.instructions) {
+            let (destination, resolved) = match instruction.kind {
+                RegionInstructionKind::LoadLocal { dst, local, .. } => {
+                    (Some(dst), local_candidates.get(&local).cloned())
+                }
+                RegionInstructionKind::Move { dst, src } => (
+                    Some(dst),
+                    candidate_set(src, &candidates, &local_candidates),
+                ),
+                RegionInstructionKind::ForeachInit { iterator, source } => {
+                    if let Some(source) = candidate_set(source, &candidates, &local_candidates)
+                        && foreach_sources.get(&iterator) != Some(&source)
+                    {
+                        foreach_sources.insert(iterator, source);
+                        changed = true;
+                    }
+                    (None, None)
+                }
+                RegionInstructionKind::ForeachNext {
+                    iterator, value, ..
+                } => {
+                    let resolved = foreach_sources.get(&iterator).and_then(|sources| {
+                        let values = sources
+                            .iter()
+                            .map(|source| {
+                                if literal_array_element_arrays.contains(source) {
+                                    return Some(BTreeSet::from([*source]));
+                                }
+                                let values = entries
+                                    .get(source)?
+                                    .iter()
+                                    .map(|(_, value)| {
+                                        candidate_set(*value, &candidates, &local_candidates)
+                                    })
+                                    .collect::<Option<Vec<_>>>()?;
+                                Some(values.into_iter().flatten().collect::<BTreeSet<_>>())
+                            })
+                            .collect::<Option<Vec<_>>>()?;
+                        (!values.is_empty())
+                            .then(|| values.into_iter().flatten().collect::<BTreeSet<_>>())
+                    });
+                    (Some(value), resolved)
+                }
+                RegionInstructionKind::FetchDim {
+                    dst, array, key, ..
+                } => {
+                    let key = literal_root_operand(key, &definitions);
+                    let resolved =
+                        candidate_set(array, &candidates, &local_candidates).and_then(|arrays| {
+                            let values = arrays
+                                .iter()
+                                .map(|array| {
+                                    let (_, value) =
+                                        entries.get(array)?.iter().find(|(candidate, _)| {
+                                            candidate.is_some_and(|candidate| {
+                                                literal_root_operand(candidate, &definitions) == key
+                                            })
+                                        })?;
+                                    candidate_set(*value, &candidates, &local_candidates)
+                                })
+                                .collect::<Option<Vec<_>>>()?;
+                            (!values.is_empty())
+                                .then(|| values.into_iter().flatten().collect::<BTreeSet<_>>())
+                        });
+                    (Some(dst), resolved)
+                }
+                _ => (None, None),
+            };
+            if let (Some(destination), Some(resolved)) = (destination, resolved)
+                && !resolved.is_empty()
+                && candidates.get(&destination) != Some(&resolved)
+            {
+                candidates.insert(destination, resolved);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    for register in candidates.keys().copied() {
+        let ownership = register_facts
+            .get(&register)
+            .map_or(SsaOwnership::Owned, |fact| fact.ownership);
+        register_facts.insert(
+            register,
+            SsaValueFact::known(SsaValueClass::ArrayHandle, ownership),
+        );
+    }
+    for local in local_candidates.keys().copied() {
+        let ownership = local_facts
+            .get(&local)
+            .map_or(SsaOwnership::Owned, |fact| fact.ownership);
+        local_facts.insert(
+            local,
+            SsaValueFact::known(SsaValueClass::ArrayHandle, ownership),
+        );
+    }
+}
+
+fn literal_root_operand(
+    mut operand: RegionOperand,
+    definitions: &BTreeMap<RegId, RegionOperand>,
+) -> RegionOperand {
+    let mut visited = BTreeSet::new();
+    while let RegionOperand::Register(register) = operand {
+        if !visited.insert(register) {
+            break;
+        }
+        let Some(source) = definitions.get(&register).copied() else {
+            break;
+        };
+        operand = source;
+    }
+    operand
+}
+
 fn instruction_result_fact(
     kind: &RegionInstructionKind,
     constants: &[IrConstant],
     locals: &BTreeMap<LocalId, SsaValueFact>,
     registers: &BTreeMap<RegId, SsaValueFact>,
+    function_returns: &BTreeMap<FunctionId, SsaValueFact>,
 ) -> Option<(RegId, SsaValueFact)> {
     let fact = |operand| operand_fact(constants, locals, registers, operand);
     match kind {
@@ -1664,9 +2098,17 @@ fn instruction_result_fact(
         | RegionInstructionKind::AssignProperty {
             dst, value: src, ..
         } => Some((*dst, fact(*src))),
-        RegionInstructionKind::LoadLocal { dst, local, quiet } => {
+        RegionInstructionKind::LoadLocal {
+            dst,
+            local,
+            quiet: _,
+        } => {
             let mut fact = locals.get(local).copied().unwrap_or(SsaValueFact::UNKNOWN);
-            if *quiet && fact.class == SsaValueClass::Uninitialized {
+            if fact.class == SsaValueClass::Uninitialized {
+                // Both generated load forms produce native null for a missing
+                // local. The non-quiet form emits its exact undefined-variable
+                // warning first; retaining `Uninitialized` past that producer
+                // incorrectly rejects ordinary typed consumers such as count.
                 fact = SsaValueFact::exact(SsaValueClass::Null, SsaOwnership::ImmortalConstant);
             }
             Some((*dst, fact))
@@ -1883,12 +2325,17 @@ fn instruction_result_fact(
         RegionInstructionKind::NativeCall(call) => match call.result {
             RegionCallResult::Register(dst) => {
                 let class = match &call.target {
-                    RegionCallTarget::Function { name, .. } => {
-                        fixed_function_result_fact(name).unwrap_or(SsaValueFact::UNKNOWN)
-                    }
-                    RegionCallTarget::Method { .. }
-                    | RegionCallTarget::StaticMethod { .. }
-                    | RegionCallTarget::Closure { .. }
+                    RegionCallTarget::Function { name, function, .. } => function
+                        .and_then(|function| function_returns.get(&function).copied())
+                        .or_else(|| fixed_function_result_fact(name))
+                        .unwrap_or(SsaValueFact::UNKNOWN),
+                    RegionCallTarget::Method { function, .. } => function
+                        .and_then(|function| function_returns.get(&function).copied())
+                        .unwrap_or(SsaValueFact::UNKNOWN),
+                    RegionCallTarget::Closure { function, .. } => function
+                        .and_then(|function| function_returns.get(&function).copied())
+                        .unwrap_or(SsaValueFact::UNKNOWN),
+                    RegionCallTarget::StaticMethod { .. }
                     | RegionCallTarget::Callable { .. }
                     | RegionCallTarget::Pipe { .. }
                     | RegionCallTarget::Constructor { .. }
@@ -2034,6 +2481,63 @@ fn type_fact(type_: &IrReturnType) -> SsaValueFact {
         | IrReturnType::Dnf { .. } => return SsaValueFact::UNKNOWN,
     };
     SsaValueFact::known(class, SsaOwnership::Borrowed)
+}
+
+/// Returns whether one generated SSA fact proves that a value already
+/// satisfies a declared PHP type without coercion or a runtime class lookup.
+/// Publication uses the same predicate as call lowering so a typed property
+/// slot is never exposed to direct CLIF merely because its numeric layout is
+/// known.
+#[must_use]
+pub fn generated_fact_satisfies_type(fact: SsaValueFact, type_: &IrReturnType) -> bool {
+    if fact.certainty == SsaCertainty::Unknown {
+        return matches!(type_, IrReturnType::Mixed);
+    }
+    match type_ {
+        IrReturnType::Int => fact.class == SsaValueClass::Int,
+        IrReturnType::Float => fact.class == SsaValueClass::Float,
+        IrReturnType::String => fact.class == SsaValueClass::StringHandle,
+        IrReturnType::Array => fact.class == SsaValueClass::ArrayHandle,
+        IrReturnType::Callable => fact.class == SsaValueClass::CallableHandle,
+        IrReturnType::Object => fact.class == SsaValueClass::ObjectHandle,
+        IrReturnType::Bool => fact.class == SsaValueClass::Bool,
+        IrReturnType::Null | IrReturnType::Void => fact.class == SsaValueClass::Null,
+        IrReturnType::False | IrReturnType::True => false,
+        IrReturnType::Mixed => true,
+        IrReturnType::Nullable { inner } => {
+            fact.class == SsaValueClass::Null || generated_fact_satisfies_type(fact, inner)
+        }
+        IrReturnType::Union { members } => members
+            .iter()
+            .any(|member| generated_fact_satisfies_type(fact, member)),
+        IrReturnType::Iterable => matches!(
+            fact.class,
+            SsaValueClass::ArrayHandle | SsaValueClass::ObjectHandle
+        ),
+        IrReturnType::Class { name, .. } => match name.trim_start_matches('\\') {
+            name if name.eq_ignore_ascii_case("Closure") => {
+                fact.class == SsaValueClass::CallableHandle
+            }
+            name if name.eq_ignore_ascii_case("Generator") => {
+                fact.class == SsaValueClass::GeneratorHandle
+            }
+            name if name.eq_ignore_ascii_case("Fiber") => fact.class == SsaValueClass::FiberHandle,
+            _ => false,
+        },
+        IrReturnType::Never | IrReturnType::Intersection { .. } | IrReturnType::Dnf { .. } => false,
+    }
+}
+
+/// A successful generated call owns its returned native value. Only concrete
+/// declared PHP types are publication facts; unions and nullable results
+/// still require runtime classification.
+#[must_use]
+pub(crate) fn generated_call_return_fact(type_: &IrReturnType) -> Option<SsaValueFact> {
+    let fact = type_fact(type_);
+    (fact.certainty != super::SsaCertainty::Unknown).then_some(SsaValueFact {
+        ownership: SsaOwnership::Owned,
+        ..fact
+    })
 }
 
 fn join_facts(left: SsaValueFact, right: SsaValueFact) -> SsaValueFact {
@@ -2272,7 +2776,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_compiled_unpack_consumes_its_owned_source_array() {
+    fn elided_empty_unpack_releases_its_owned_source_array() {
         let mut builder = IrBuilder::new(UnitId::new(4_238));
         let file = builder.add_file("direct-unpack-owner.php");
         let span = IrSpan::new(file, 0, 1);
@@ -2314,19 +2818,8 @@ mod tests {
         let unit = builder.finish();
         let region = build_baseline_region(&unit, caller).expect("region");
         let flow = analyze_executable_value_flow(&region, &unit.constants);
-        let call = region.blocks[0]
-            .instructions
-            .iter()
-            .find(|instruction| match &instruction.kind {
-                RegionInstructionKind::NativeCall(call) => {
-                    call.direct_compiled_unpack_target() == Some(callee)
-                }
-                _ => false,
-            })
-            .expect("direct compiled unpack call");
-        assert!(flow.consumes_call_operand(call.continuation_id, source));
         flow.verify_ownership(&region)
-            .expect("last-use direct-unpack ownership should verify");
+            .expect("elided empty-unpack ownership should verify");
     }
 
     #[test]

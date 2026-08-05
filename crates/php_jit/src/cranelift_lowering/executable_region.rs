@@ -1,5 +1,6 @@
 use super::*;
 use crate::region_ir::{RegionPropertyName, RegionSemanticOp};
+use std::cell::Cell;
 use std::collections::BTreeSet;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -34,7 +35,7 @@ struct NativeEntryArrayRequirement {
     all_value_types: Vec<php_ir::IrReturnType>,
 }
 
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum NativeEntryArrayKey {
     Integer(i64),
     Constant(u32),
@@ -44,6 +45,7 @@ enum NativeEntryArrayKey {
 enum NativeEntryArrayProbeLeaf {
     ExistsOnly,
     PlainValue,
+    DirectArray,
 }
 
 #[derive(Clone, Debug)]
@@ -325,15 +327,25 @@ impl NativeFixedBuiltinPublicationPlan {
 
 #[derive(Clone, Debug, Default)]
 struct NativeOptimizingAssumptions {
+    /// Instruction boundaries that cannot use an optional optimizing fact.
+    /// They tail-transfer directly into the matching Generic Cranelift
+    /// continuation; they are not a reason to reject the function artifact.
+    generic_instruction_continuations: BTreeSet<u32>,
     proven_array_calls: BTreeSet<u32>,
     proven_fixed_builtin_calls: BTreeSet<u32>,
+    proven_throwable_method_calls: BTreeSet<u32>,
     fixed_builtin_plans: BTreeMap<u32, NativeFixedBuiltinPublicationPlan>,
     proven_array_instructions: BTreeSet<u32>,
     proven_binary_instructions: BTreeSet<u32>,
+    proven_numeric_binary_instructions: BTreeSet<u32>,
     binary_operand_classes: BTreeMap<u32, (SsaValueClass, SsaValueClass)>,
     proven_scalar_control_instructions: BTreeSet<u32>,
     fresh_array_instructions: BTreeSet<u32>,
     fresh_array_capacities: BTreeMap<u32, u32>,
+    /// Explicit keys proven unique within one fresh literal. The optional
+    /// integer is the already-normalized append-state key; `None` denotes a
+    /// proven non-integer constant key.
+    fresh_unique_array_keys: BTreeMap<u32, Option<i64>>,
     proven_local_loads: BTreeSet<u32>,
     proven_request_local_stores: BTreeSet<u32>,
     proven_return_reference_stores: BTreeSet<u32>,
@@ -375,79 +387,62 @@ struct NativeOptimizingAssumptions {
     reference_payloads_are_proven: bool,
 }
 
-impl NativeOptimizingAssumptions {
-    fn reference_payload_proof(&self) -> Option<NativeReferencePayloadProof> {
-        self.reference_payloads_are_proven
-            .then_some(NativeReferencePayloadProof(()))
-    }
+include!("executable_region/optimizing_assumptions.rs");
 
-    fn array_call_is_proven(&self, continuation_id: u32) -> bool {
-        self.proven_array_calls.contains(&continuation_id)
-    }
+fn constructed_throwable_registers(region: &RegionGraph) -> BTreeSet<RegId> {
+    region
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .filter_map(|instruction| match &instruction.kind {
+            RegionInstructionKind::NativeCall(call)
+                if stable_internal_throwable_constructor(&call.target) =>
+            {
+                match call.result {
+                    RegionCallResult::Register(register) => Some(register),
+                    RegionCallResult::Discard | RegionCallResult::ReferenceLocal(_) => None,
+                }
+            }
+            _ => None,
+        })
+        .collect()
+}
 
-    fn fixed_builtin_call_is_proven(&self, continuation_id: u32) -> bool {
-        self.fixed_builtin_plans
-            .get(&continuation_id)
-            .is_some_and(NativeFixedBuiltinPublicationPlan::is_proven)
-            || self.proven_fixed_builtin_calls.contains(&continuation_id)
+fn immutable_throwable_locals(region: &RegionGraph) -> BTreeSet<LocalId> {
+    let instructions = region.blocks.iter().flat_map(|block| &block.instructions);
+    let constructed = constructed_throwable_registers(region);
+    let mut writes = BTreeMap::<LocalId, usize>::new();
+    let mut constructed_stores = BTreeSet::new();
+    for instruction in instructions {
+        let (local, source) = match instruction.kind {
+            RegionInstructionKind::StoreLocal { local, src } => (local, Some(src)),
+            RegionInstructionKind::AssignLocalResult { local, .. }
+            | RegionInstructionKind::BindReference { target: local, .. }
+            | RegionInstructionKind::BindReferenceDim { target: local, .. }
+            | RegionInstructionKind::BindReferenceFromProperty { target: local, .. }
+            | RegionInstructionKind::BindReferenceFromPropertyDim { target: local, .. } => {
+                (local, None)
+            }
+            _ => continue,
+        };
+        *writes.entry(local).or_default() += 1;
+        if matches!(source, Some(RegionOperand::Register(register)) if constructed.contains(&register))
+        {
+            constructed_stores.insert(local);
+        }
     }
-
-    fn array_instruction_is_proven(&self, continuation_id: u32) -> bool {
-        self.proven_array_instructions.contains(&continuation_id)
-    }
-
-    fn array_instruction_root_is_by_reference(&self, continuation_id: u32) -> bool {
-        self.by_ref_array_instructions.contains(&continuation_id)
-    }
-
-    fn binary_instruction_is_proven(&self, continuation_id: u32) -> bool {
-        self.proven_binary_instructions.contains(&continuation_id)
-    }
-
-    fn binary_instruction_operand_classes(
-        &self,
-        continuation_id: u32,
-    ) -> Option<(SsaValueClass, SsaValueClass)> {
-        self.binary_operand_classes.get(&continuation_id).copied()
-    }
-
-    fn scalar_control_instruction_is_proven(&self, continuation_id: u32) -> bool {
-        self.proven_scalar_control_instructions
-            .contains(&continuation_id)
-    }
-
-    fn array_instruction_is_fresh(&self, continuation_id: u32) -> bool {
-        self.fresh_array_instructions.contains(&continuation_id)
-    }
-
-    fn fresh_array_capacity(&self, continuation_id: u32) -> Option<u32> {
-        self.fresh_array_capacities.get(&continuation_id).copied()
-    }
-
-    fn local_load_is_proven(&self, continuation_id: u32) -> bool {
-        self.proven_local_loads.contains(&continuation_id)
-    }
-
-    fn request_local_store_is_proven(&self, continuation_id: u32) -> bool {
-        self.proven_request_local_stores.contains(&continuation_id)
-    }
-
-    fn return_reference_store_is_proven(&self, continuation_id: u32) -> bool {
-        self.proven_return_reference_stores
-            .contains(&continuation_id)
-    }
-
-    fn return_reference_is_prebound(&self, local: LocalId) -> bool {
-        self.proven_reference_locals.contains(&local)
-    }
-
-    fn terminator_is_proven(&self, continuation_id: u32) -> bool {
-        self.proven_terminators.contains(&continuation_id)
-    }
-
-    fn return_plan(&self, continuation_id: u32) -> Option<NativeOptimizingReturnPlan> {
-        self.return_plans.get(&continuation_id).copied()
-    }
+    let mut immutable = region
+        .exception_regions
+        .iter()
+        .filter_map(|handler| handler.exception_local)
+        .filter(|local| !writes.contains_key(local))
+        .collect::<BTreeSet<_>>();
+    immutable.extend(
+        constructed_stores
+            .into_iter()
+            .filter(|local| writes.get(local) == Some(&1)),
+    );
+    immutable
 }
 
 fn publication_root_operand(
@@ -581,6 +576,333 @@ fn publication_type_fact(type_: &php_ir::IrReturnType) -> Option<crate::region_i
         class,
         SsaOwnership::Owned,
     ))
+}
+
+fn published_internal_constant_fact(name: &str) -> Option<crate::region_ir::SsaValueFact> {
+    use php_std::ConstantValue;
+
+    let value = php_std::ExtensionRegistry::standard_library()
+        .enabled_constant(name)?
+        .value()?;
+    let class = match value {
+        ConstantValue::Null => SsaValueClass::Null,
+        ConstantValue::Bool(_) => SsaValueClass::Bool,
+        ConstantValue::Int(_) => SsaValueClass::Int,
+        ConstantValue::Float(_) => SsaValueClass::Float,
+        ConstantValue::String(_) => SsaValueClass::StringHandle,
+        ConstantValue::Array(_) => SsaValueClass::ArrayHandle,
+    };
+    let fact = crate::region_ir::SsaValueFact::exact(class, SsaOwnership::Owned);
+    Some(match value {
+        ConstantValue::Int(value) => {
+            fact.with_integer_range(crate::region_ir::SsaIntegerRange::exact(value))
+        }
+        ConstantValue::Null
+        | ConstantValue::Bool(_)
+        | ConstantValue::Float(_)
+        | ConstantValue::String(_)
+        | ConstantValue::Array(_) => fact,
+    })
+}
+
+fn published_fetch_constant_facts(
+    region: &RegionGraph,
+) -> BTreeMap<RegId, crate::region_ir::SsaValueFact> {
+    region
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .filter_map(|instruction| {
+            let RegionInstructionKind::FetchConst { dst } = instruction.kind else {
+                return None;
+            };
+            let php_ir::InstructionKind::FetchConst {
+                dst: source_dst,
+                ref name,
+                ..
+            } = instruction.source_kind
+            else {
+                return None;
+            };
+            (dst == source_dst)
+                .then(|| published_internal_constant_fact(name))
+                .flatten()
+                .map(|fact| (dst, fact))
+        })
+        .collect()
+}
+
+#[derive(Clone, Debug, Default)]
+struct PublishedNumericClosure {
+    locals: BTreeSet<LocalId>,
+    registers: BTreeSet<RegId>,
+}
+
+fn fact_is_published_numeric(fact: crate::region_ir::SsaValueFact) -> bool {
+    fact.certainty != crate::region_ir::SsaCertainty::Unknown
+        && matches!(fact.class, SsaValueClass::Int | SsaValueClass::Float)
+}
+
+fn operand_is_published_numeric(
+    operand: RegionOperand,
+    constants: &[IrConstant],
+    value_flow: &ExecutableValueFlow,
+    fetch_facts: &BTreeMap<RegId, crate::region_ir::SsaValueFact>,
+    locals: &BTreeSet<LocalId>,
+    registers: &BTreeSet<RegId>,
+) -> bool {
+    fixed_numeric_operand_fact(value_flow, constants, operand)
+        .or_else(|| match operand {
+            RegionOperand::Register(register) => fetch_facts.get(&register).copied(),
+            RegionOperand::Local(_)
+            | RegionOperand::Constant(_)
+            | RegionOperand::I64(_)
+            | RegionOperand::LinkedConstant { .. } => None,
+        })
+        .is_some_and(fact_is_published_numeric)
+        || match operand {
+            RegionOperand::Register(register) => registers.contains(&register),
+            RegionOperand::Local(local) => locals.contains(&local),
+            RegionOperand::Constant(_)
+            | RegionOperand::I64(_)
+            | RegionOperand::LinkedConstant { .. } => false,
+        }
+}
+
+/// Prove compiler-owned numeric cycles without pretending that integer
+/// arithmetic can never overflow. Add/subtract/multiply close over PHP's
+/// `{int,float}` result domain, so a loop-carried local may remain numeric even
+/// when the ordinary single-class SSA lattice correctly reports `Unknown`.
+/// Every admitted local must have a non-cyclic numeric seed and every store in
+/// the closed component must preserve that numeric domain.
+fn published_numeric_closure(
+    region: &RegionGraph,
+    constants: &[IrConstant],
+    value_flow: &ExecutableValueFlow,
+    fetch_facts: &BTreeMap<RegId, crate::region_ir::SsaValueFact>,
+) -> PublishedNumericClosure {
+    let instructions = region
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .collect::<Vec<_>>();
+    let producers = instructions
+        .iter()
+        .flat_map(|instruction| {
+            instruction
+                .register_definitions()
+                .into_iter()
+                .map(|register| (register, &instruction.kind))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let stores = instructions
+        .iter()
+        .filter_map(|instruction| match instruction.kind {
+            RegionInstructionKind::StoreLocal { local, src }
+            | RegionInstructionKind::AssignLocalResult {
+                local, value: src, ..
+            } => Some((local, src)),
+            _ => None,
+        })
+        .fold(
+            BTreeMap::<LocalId, Vec<RegionOperand>>::new(),
+            |mut stores, (local, source)| {
+                stores.entry(local).or_default().push(source);
+                stores
+            },
+        );
+    let unset_locals = instructions
+        .iter()
+        .filter_map(|instruction| match instruction.kind {
+            RegionInstructionKind::UnsetLocal { local } => Some(local),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+
+    let mut locals = stores
+        .iter()
+        .filter_map(|(local, _sources)| {
+            (!region.parameter_locals.contains(local)
+                && value_flow.local_storage(*local).is_promoted()
+                && !unset_locals.contains(local))
+            .then_some(*local)
+        })
+        .collect::<BTreeSet<_>>();
+    let mut registers = producers.keys().copied().collect::<BTreeSet<_>>();
+
+    loop {
+        let previous_locals = locals.clone();
+        let previous_registers = registers.clone();
+        registers.retain(|register| {
+            let operand = RegionOperand::Register(*register);
+            if fixed_numeric_operand_fact(value_flow, constants, operand)
+                .or_else(|| fetch_facts.get(register).copied())
+                .is_some_and(fact_is_published_numeric)
+            {
+                return true;
+            }
+            match producers.get(register).copied() {
+                Some(RegionInstructionKind::LoadLocal { local, .. }) => {
+                    previous_locals.contains(local)
+                }
+                Some(
+                    RegionInstructionKind::Move { src, .. }
+                    | RegionInstructionKind::AssignLocalResult { value: src, .. }
+                    | RegionInstructionKind::AssignProperty { value: src, .. },
+                ) => operand_is_published_numeric(
+                    *src,
+                    constants,
+                    value_flow,
+                    fetch_facts,
+                    &previous_locals,
+                    &previous_registers,
+                ),
+                Some(RegionInstructionKind::Unary {
+                    op: RegionUnaryOp::Plus | RegionUnaryOp::Minus,
+                    src,
+                    ..
+                }) => operand_is_published_numeric(
+                    *src,
+                    constants,
+                    value_flow,
+                    fetch_facts,
+                    &previous_locals,
+                    &previous_registers,
+                ),
+                Some(RegionInstructionKind::Binary { op, lhs, rhs, .. })
+                    if matches!(
+                        op,
+                        RegionBinaryOp::Add | RegionBinaryOp::Sub | RegionBinaryOp::Mul
+                    ) =>
+                {
+                    [*lhs, *rhs].into_iter().all(|operand| {
+                        operand_is_published_numeric(
+                            operand,
+                            constants,
+                            value_flow,
+                            fetch_facts,
+                            &previous_locals,
+                            &previous_registers,
+                        )
+                    })
+                }
+                _ => false,
+            }
+        });
+        locals.retain(|local| {
+            stores.get(local).is_some_and(|sources| {
+                sources.iter().copied().all(|source| {
+                    operand_is_published_numeric(
+                        source,
+                        constants,
+                        value_flow,
+                        fetch_facts,
+                        &previous_locals,
+                        &previous_registers,
+                    )
+                })
+            })
+        });
+        if locals == previous_locals && registers == previous_registers {
+            break;
+        }
+    }
+
+    // Reject an otherwise closed SCC that has no real numeric producer. The
+    // least fixed point below walks from constants, typed values, published
+    // fetches, and already-known call results through the surviving closure.
+    let mut anchored_locals = BTreeSet::new();
+    let mut anchored_registers = registers
+        .iter()
+        .copied()
+        .filter(|register| {
+            fixed_numeric_operand_fact(value_flow, constants, RegionOperand::Register(*register))
+                .or_else(|| fetch_facts.get(register).copied())
+                .is_some_and(fact_is_published_numeric)
+        })
+        .collect::<BTreeSet<_>>();
+    loop {
+        let previous_locals = anchored_locals.clone();
+        let previous_registers = anchored_registers.clone();
+        for register in registers.iter().copied() {
+            if anchored_registers.contains(&register) {
+                continue;
+            }
+            let anchored = match producers.get(&register).copied() {
+                Some(RegionInstructionKind::LoadLocal { local, .. }) => {
+                    previous_locals.contains(local)
+                }
+                Some(
+                    RegionInstructionKind::Move { src, .. }
+                    | RegionInstructionKind::AssignLocalResult { value: src, .. }
+                    | RegionInstructionKind::AssignProperty { value: src, .. },
+                ) => operand_is_published_numeric(
+                    *src,
+                    constants,
+                    value_flow,
+                    fetch_facts,
+                    &previous_locals,
+                    &previous_registers,
+                ),
+                Some(RegionInstructionKind::Unary {
+                    op: RegionUnaryOp::Plus | RegionUnaryOp::Minus,
+                    src,
+                    ..
+                }) => operand_is_published_numeric(
+                    *src,
+                    constants,
+                    value_flow,
+                    fetch_facts,
+                    &previous_locals,
+                    &previous_registers,
+                ),
+                Some(RegionInstructionKind::Binary { op, lhs, rhs, .. })
+                    if matches!(
+                        op,
+                        RegionBinaryOp::Add | RegionBinaryOp::Sub | RegionBinaryOp::Mul
+                    ) =>
+                {
+                    [*lhs, *rhs].into_iter().all(|operand| {
+                        operand_is_published_numeric(
+                            operand,
+                            constants,
+                            value_flow,
+                            fetch_facts,
+                            &previous_locals,
+                            &previous_registers,
+                        )
+                    })
+                }
+                _ => false,
+            };
+            if anchored {
+                anchored_registers.insert(register);
+            }
+        }
+        for local in locals.iter().copied() {
+            if stores.get(&local).is_some_and(|sources| {
+                sources.iter().copied().any(|source| {
+                    operand_is_published_numeric(
+                        source,
+                        constants,
+                        value_flow,
+                        fetch_facts,
+                        &previous_locals,
+                        &previous_registers,
+                    )
+                })
+            }) {
+                anchored_locals.insert(local);
+            }
+        }
+        if anchored_locals == previous_locals && anchored_registers == previous_registers {
+            break;
+        }
+    }
+    PublishedNumericClosure {
+        locals: anchored_locals,
+        registers: anchored_registers,
+    }
 }
 
 fn entry_array_source(
@@ -1088,6 +1410,32 @@ fn publish_fixed_builtin_assumptions(
             length: provided_arity,
         }
     } else if stable_builtin_array_multisort(&call.target)
+        || stable_builtin_print(&call.target)
+        || stable_builtin_print_r(&call.target)
+        || stable_builtin_var_dump(&call.target)
+        || stable_builtin_var_export(&call.target)
+        || stable_builtin_mysqli_set_charset(&call.target)
+        || stable_builtin_mysqli_query(&call.target)
+        || stable_builtin_mysqli_fetch_array(&call.target)
+        || stable_builtin_mysqli_fetch_object(&call.target)
+        || stable_builtin_mysqli_character_set_name(&call.target)
+        || stable_builtin_mysqli_result_count(&call.target).is_some()
+        || stable_builtin_mysqli_fetch_field(&call.target)
+        || stable_builtin_mysqli_connect_status(&call.target).is_some()
+        || stable_builtin_mysqli_close(&call.target)
+        || stable_builtin_mysqli_get_server_info(&call.target)
+        || stable_builtin_mysqli_select_db(&call.target)
+        || stable_builtin_mysqli_real_escape_string(&call.target)
+        || stable_builtin_mysqli_free_result(&call.target)
+        || stable_builtin_mysqli_more_results(&call.target)
+        || stable_builtin_mysqli_next_result(&call.target)
+        || stable_builtin_mysqli_report(&call.target)
+        || stable_builtin_mysqli_init(&call.target)
+        || stable_builtin_mysqli_options(&call.target)
+        || stable_builtin_mysqli_real_connect(&call.target)
+        || stable_builtin_mysqli_connection_status(&call.target).is_some()
+        || stable_builtin_error_log(&call.target)
+        || stable_builtin_sleep(&call.target)
         || matches!(
             stable_builtin_format(&call.target),
             Some(StableFormatBuiltin::Sprintf | StableFormatBuiltin::Printf)
@@ -1175,9 +1523,14 @@ fn collect_optimizing_assumptions(
     value_flow: &ExecutableValueFlow,
     function_params: &BTreeMap<FunctionId, NativeFunctionMetadata>,
     external_function_signatures: &[crate::JitExternalFunctionSignature],
+    forced_generic_continuations: &BTreeSet<u32>,
+    rejection_continuation: &Cell<Option<u32>>,
 ) -> Result<NativeOptimizingAssumptions, CraneliftLoweringError> {
+    rejection_continuation.set(None);
     if region.compile_metadata.tier != NativeCompilerTier::Optimizing {
-        return Ok(NativeOptimizingAssumptions::default());
+        return Ok(collect_generic_static_assumptions(
+            region, constants, value_flow,
+        ));
     }
     // This pass records optional entry facts and exact-family plans. Failure
     // to prove one is handled by a generated Generic continuation; it never
@@ -1219,6 +1572,69 @@ fn collect_optimizing_assumptions(
             _ => None,
         })
         .collect::<BTreeMap<_, _>>();
+    // A fixed declared-property write makes an immediately following read of
+    // the same entry receiver definitely initialized. Keep this deliberately
+    // block-local and preserve the fact only across instructions that cannot
+    // invoke user code. The property write itself is non-hooked and its
+    // admission permits only a non-destructive old owner; discarding the
+    // assignment result is likewise safe because the property retained an
+    // independent owner first.
+    let definitely_initialized_property_fetches = region
+        .blocks
+        .iter()
+        .flat_map(|block| {
+            let mut initialized = BTreeSet::<(LocalId, String)>::new();
+            let mut safe_assignment_results = BTreeSet::<RegId>::new();
+            let mut fetches = Vec::new();
+            for instruction in &block.instructions {
+                match &instruction.kind {
+                    RegionInstructionKind::AssignProperty {
+                        dst,
+                        object,
+                        property,
+                        dynamic_stdclass: false,
+                        ..
+                    } => {
+                        let RegionOperand::Local(local) =
+                            publication_root_operand(*object, &definitions)
+                        else {
+                            initialized.clear();
+                            safe_assignment_results.clear();
+                            continue;
+                        };
+                        initialized.insert((local, property.clone()));
+                        safe_assignment_results.insert(*dst);
+                    }
+                    RegionInstructionKind::FetchProperty {
+                        object,
+                        property,
+                        dynamic_stdclass: false,
+                        ..
+                    } => {
+                        if let RegionOperand::Local(local) =
+                            publication_root_operand(*object, &definitions)
+                            && initialized.contains(&(local, property.clone()))
+                        {
+                            fetches.push(instruction.continuation_id);
+                        }
+                    }
+                    RegionInstructionKind::Discard {
+                        src: RegionOperand::Register(register),
+                    } if safe_assignment_results.remove(register) => {}
+                    RegionInstructionKind::Nop
+                    | RegionInstructionKind::Move { .. }
+                    | RegionInstructionKind::LoadLocal { .. } => {}
+                    _ => {
+                        initialized.clear();
+                        safe_assignment_results.clear();
+                    }
+                }
+            }
+            fetches
+        })
+        .collect::<BTreeSet<_>>();
+    let immutable_exception_locals = immutable_throwable_locals(region);
+    let constructed_throwable_registers = constructed_throwable_registers(region);
     let bound_global_continuations = region
         .blocks
         .iter()
@@ -1272,6 +1688,7 @@ fn collect_optimizing_assumptions(
                             RegionCallTarget::Function {
                                 name,
                                 function: None,
+                                ..
                             } => signature
                                 .name
                                 .trim_start_matches('\\')
@@ -1292,9 +1709,21 @@ fn collect_optimizing_assumptions(
             Some((result, fact))
         })
         .collect::<BTreeMap<_, _>>();
+    let published_fetch_constant_facts = published_fetch_constant_facts(region);
+    let published_numeric_closure = published_numeric_closure(
+        region,
+        constants,
+        value_flow,
+        &published_fetch_constant_facts,
+    );
     let publication_operand_fact = |operand: RegionOperand| {
         if let RegionOperand::Register(register) = operand
             && let Some(fact) = published_call_result_facts.get(&register).copied()
+        {
+            return fact;
+        }
+        if let RegionOperand::Register(register) = operand
+            && let Some(fact) = published_fetch_constant_facts.get(&register).copied()
         {
             return fact;
         }
@@ -1308,6 +1737,16 @@ fn collect_optimizing_assumptions(
             return fact;
         }
         lowering_operand_fact(value_flow, constants, operand)
+    };
+    let publication_operand_is_numeric = |operand: RegionOperand| {
+        operand_is_published_numeric(
+            operand,
+            constants,
+            value_flow,
+            &published_fetch_constant_facts,
+            &published_numeric_closure.locals,
+            &published_numeric_closure.registers,
+        )
     };
     let mut internal_array_sources = BTreeMap::<RegId, BTreeSet<NativeEntryArraySource>>::new();
     for instruction in region.blocks.iter().flat_map(|block| &block.instructions) {
@@ -1532,6 +1971,183 @@ fn collect_optimizing_assumptions(
         .keys()
         .copied()
         .collect::<BTreeSet<_>>();
+    // Carry exact literal-array provenance through the small SSA/local graph
+    // used by nested foreach paths. Value-flow intentionally does not model
+    // per-key array schemas, but publication can prove them from immutable
+    // fresh-array construction: every candidate array must publish the same
+    // fixed key with another proven literal-array value.
+    let literal_array_entries = region
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .filter_map(|instruction| match instruction.kind {
+            RegionInstructionKind::ArrayInsert {
+                array,
+                key,
+                value,
+                by_ref_local: None,
+            } if new_array_registers.contains(&array) => Some((array, key, value)),
+            _ => None,
+        })
+        .fold(
+            BTreeMap::<RegId, Vec<(Option<RegionOperand>, RegionOperand)>>::new(),
+            |mut entries, (array, key, value)| {
+                entries.entry(array).or_default().push((key, value));
+                entries
+            },
+        );
+    let local_store_operands = region
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .filter_map(|instruction| match instruction.kind {
+            RegionInstructionKind::StoreLocal { local, src } => Some((local, src)),
+            _ => None,
+        })
+        .fold(
+            BTreeMap::<LocalId, Vec<RegionOperand>>::new(),
+            |mut stores, (local, source)| {
+                stores.entry(local).or_default().push(source);
+                stores
+            },
+        );
+    let mut literal_array_candidates = new_array_registers
+        .iter()
+        .copied()
+        .map(|register| (register, BTreeSet::from([register])))
+        .collect::<BTreeMap<_, _>>();
+    let mut literal_array_locals = BTreeMap::<LocalId, BTreeSet<RegId>>::new();
+    let mut literal_foreach_sources = BTreeMap::<RegId, BTreeSet<RegId>>::new();
+    for _ in 0..=region
+        .blocks
+        .iter()
+        .map(|block| block.instructions.len())
+        .sum::<usize>()
+    {
+        let mut changed = false;
+        for (local, sources) in &local_store_operands {
+            let candidates = sources
+                .iter()
+                .map(
+                    |source| match publication_root_operand(*source, &definitions) {
+                        RegionOperand::Register(register) => {
+                            literal_array_candidates.get(&register).cloned()
+                        }
+                        _ => None,
+                    },
+                )
+                .collect::<Option<Vec<_>>>()
+                .map(|sets| sets.into_iter().flatten().collect::<BTreeSet<_>>());
+            if let Some(candidates) = candidates
+                && !candidates.is_empty()
+                && literal_array_locals.get(local) != Some(&candidates)
+            {
+                literal_array_locals.insert(*local, candidates);
+                changed = true;
+            }
+        }
+        for instruction in region.blocks.iter().flat_map(|block| &block.instructions) {
+            let candidates = match instruction.kind {
+                RegionInstructionKind::LoadLocal { dst: _, local, .. } => {
+                    literal_array_locals.get(&local).cloned()
+                }
+                RegionInstructionKind::Move { dst: _, src } => {
+                    match publication_root_operand(src, &definitions) {
+                        RegionOperand::Register(register) => {
+                            literal_array_candidates.get(&register).cloned()
+                        }
+                        RegionOperand::Local(local) => literal_array_locals.get(&local).cloned(),
+                        _ => None,
+                    }
+                }
+                RegionInstructionKind::ForeachInit { iterator, source } => {
+                    let source = match publication_root_operand(source, &definitions) {
+                        RegionOperand::Register(register) => {
+                            literal_array_candidates.get(&register).cloned()
+                        }
+                        RegionOperand::Local(local) => literal_array_locals.get(&local).cloned(),
+                        _ => None,
+                    };
+                    if let Some(source) = source
+                        && literal_foreach_sources.get(&iterator) != Some(&source)
+                    {
+                        literal_foreach_sources.insert(iterator, source);
+                        changed = true;
+                    }
+                    None
+                }
+                RegionInstructionKind::ForeachNext {
+                    iterator, value: _, ..
+                } => literal_foreach_sources.get(&iterator).and_then(|sources| {
+                    let sets = sources
+                        .iter()
+                        .flat_map(|source| literal_array_entries.get(source).into_iter().flatten())
+                        .map(
+                            |(_, value)| match publication_root_operand(*value, &definitions) {
+                                RegionOperand::Register(register) => {
+                                    literal_array_candidates.get(&register).cloned()
+                                }
+                                RegionOperand::Local(local) => {
+                                    literal_array_locals.get(&local).cloned()
+                                }
+                                _ => None,
+                            },
+                        )
+                        .collect::<Option<Vec<_>>>()?;
+                    (!sets.is_empty()).then(|| sets.into_iter().flatten().collect())
+                }),
+                RegionInstructionKind::FetchDim {
+                    dst: _, array, key, ..
+                } => (|| {
+                    let arrays = match publication_root_operand(array, &definitions) {
+                        RegionOperand::Register(register) => {
+                            literal_array_candidates.get(&register)
+                        }
+                        RegionOperand::Local(local) => literal_array_locals.get(&local),
+                        _ => None,
+                    }?;
+                    let key = publication_root_operand(key, &definitions);
+                    let sets = arrays
+                        .iter()
+                        .map(|array| {
+                            let (_, value) = literal_array_entries
+                                .get(array)?
+                                .iter()
+                                .find(|(candidate, _)| *candidate == Some(key))?;
+                            match publication_root_operand(*value, &definitions) {
+                                RegionOperand::Register(register) => {
+                                    literal_array_candidates.get(&register).cloned()
+                                }
+                                RegionOperand::Local(local) => {
+                                    literal_array_locals.get(&local).cloned()
+                                }
+                                _ => None,
+                            }
+                        })
+                        .collect::<Option<Vec<_>>>()?;
+                    (!sets.is_empty()).then(|| sets.into_iter().flatten().collect())
+                })(),
+                _ => None,
+            };
+            let destination = match instruction.kind {
+                RegionInstructionKind::LoadLocal { dst, .. }
+                | RegionInstructionKind::Move { dst, .. }
+                | RegionInstructionKind::ForeachNext { value: dst, .. }
+                | RegionInstructionKind::FetchDim { dst, .. } => Some(dst),
+                _ => None,
+            };
+            if let (Some(destination), Some(candidates)) = (destination, candidates)
+                && !candidates.is_empty()
+                && literal_array_candidates.get(&destination) != Some(&candidates)
+            {
+                literal_array_candidates.insert(destination, candidates);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
     let new_array_mutation_counts = region
         .blocks
         .iter()
@@ -1765,6 +2381,8 @@ fn collect_optimizing_assumptions(
         })
         .collect();
     let mut admitted_array_fetches = BTreeMap::<RegId, (NativeEntryArraySource, i64)>::new();
+    let mut admitted_array_probe_fetches =
+        BTreeMap::<RegId, (NativeEntryArraySource, NativeEntryArrayKey)>::new();
     let mut published_property_array_sources = BTreeMap::<RegId, usize>::new();
     let mut entry_dependent_continuations = BTreeSet::new();
     let mut fresh_insert_modes = BTreeMap::<RegId, bool>::new();
@@ -1808,33 +2426,83 @@ fn collect_optimizing_assumptions(
                 facts
             },
         );
-    let mut published_integer_results = region
-        .blocks
+    let mut published_integer_results = published_call_result_facts
         .iter()
-        .flat_map(|block| &block.instructions)
-        .filter_map(|instruction| match &instruction.kind {
-            RegionInstructionKind::NativeCall(call)
-                if stable_builtin_array_pointer(&call.target).is_some()
-                    || stable_builtin_array_stack(&call.target).is_some()
-                    || stable_builtin_length(&call.target).is_some()
-                    || matches!(
-                        stable_builtin_array_aggregate(&call.target),
-                        Some(
-                            StableArrayAggregateBuiltin::Count
-                                | StableArrayAggregateBuiltin::SizeOf
-                        )
-                    ) =>
-            {
-                match call.result {
-                    RegionCallResult::Register(result) => Some(result),
-                    RegionCallResult::Discard | RegionCallResult::ReferenceLocal(_) => None,
-                }
-            }
-            _ => None,
+        .filter_map(|(register, fact)| {
+            (fact.certainty != crate::region_ir::SsaCertainty::Unknown
+                && fact.class == SsaValueClass::Int)
+                .then_some(*register)
         })
+        .chain(
+            region
+                .blocks
+                .iter()
+                .flat_map(|block| &block.instructions)
+                .filter_map(|instruction| match &instruction.kind {
+                    RegionInstructionKind::NativeCall(call)
+                        if stable_builtin_array_pointer(&call.target).is_some()
+                            || stable_builtin_array_stack(&call.target).is_some()
+                            || stable_builtin_length(&call.target).is_some()
+                            || matches!(
+                                stable_builtin_array_aggregate(&call.target),
+                                Some(
+                                    StableArrayAggregateBuiltin::Count
+                                        | StableArrayAggregateBuiltin::SizeOf
+                                )
+                            ) =>
+                    {
+                        match call.result {
+                            RegionCallResult::Register(result) => Some(result),
+                            RegionCallResult::Discard | RegionCallResult::ReferenceLocal(_) => None,
+                        }
+                    }
+                    _ => None,
+                }),
+        )
         .collect::<BTreeSet<_>>();
-    for instruction in region.blocks.iter().flat_map(|block| &block.instructions) {
+    let published_object_results =
+        region
+            .blocks
+            .iter()
+            .flat_map(|block| &block.instructions)
+            .filter_map(|instruction| match &instruction.kind {
+                RegionInstructionKind::NativeCall(RegionNativeCall {
+                    target:
+                        RegionCallTarget::Constructor { .. }
+                        | RegionCallTarget::DynamicConstructor { .. },
+                    result: RegionCallResult::Register(result),
+                    returns_by_reference: false,
+                    ..
+                }) => Some(*result),
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+    let mut entry_dependent_integer_results = BTreeSet::<RegId>::new();
+    'instructions: for instruction in region.blocks.iter().flat_map(|block| &block.instructions) {
+        rejection_continuation.set(Some(instruction.continuation_id));
+        if forced_generic_continuations.contains(&instruction.continuation_id) {
+            admission
+                .generic_instruction_continuations
+                .insert(instruction.continuation_id);
+            continue;
+        }
         if let RegionInstructionKind::Binary { dst, op, lhs, rhs } = instruction.kind {
+            let admission_before_binary = admission.clone();
+            let entry_dependencies_before_binary = entry_dependent_continuations.clone();
+            let integer_results_before_binary = published_integer_results.clone();
+            let entry_integer_results_before_binary = entry_dependent_integer_results.clone();
+            macro_rules! resume_binary_in_generic {
+                () => {{
+                    admission = admission_before_binary;
+                    entry_dependent_continuations = entry_dependencies_before_binary;
+                    published_integer_results = integer_results_before_binary;
+                    entry_dependent_integer_results = entry_integer_results_before_binary;
+                    admission
+                        .generic_instruction_continuations
+                        .insert(instruction.continuation_id);
+                    continue 'instructions;
+                }};
+            }
             let lhs_fact = publication_operand_fact(lhs);
             let rhs_fact = publication_operand_fact(rhs);
             let lhs_numeric_fact =
@@ -1856,7 +2524,7 @@ fn collect_optimizing_assumptions(
                         && known(rhs_fact, SsaValueClass::ArrayHandle) =>
                 {
                     for operand in [lhs, rhs] {
-                        let source = publication_entry_array_source(
+                        let Ok(source) = publication_entry_array_source(
                             region,
                             &definitions,
                             &parameter_indices,
@@ -1864,7 +2532,9 @@ fn collect_optimizing_assumptions(
                             operand,
                             continuation,
                             "array union",
-                        )?;
+                        ) else {
+                            resume_binary_in_generic!();
+                        };
                         let requirement = admission.array_requirements.entry(source).or_default();
                         // The union owns one new stable array and retains every
                         // admitted key/value at most once. Reserving one
@@ -1877,6 +2547,17 @@ fn collect_optimizing_assumptions(
                     entry_dependent_continuations.insert(continuation);
                 }
                 RegionBinaryOp::Add | RegionBinaryOp::Sub | RegionBinaryOp::Mul
+                    if (!numeric(lhs_numeric_fact) || !numeric(rhs_numeric_fact))
+                        && publication_operand_is_numeric(lhs)
+                        && publication_operand_is_numeric(rhs) =>
+                {
+                    admission
+                        .proven_numeric_binary_instructions
+                        .insert(continuation);
+                    admission.fixed_value_allocations =
+                        admission.fixed_value_allocations.saturating_add(1);
+                }
+                RegionBinaryOp::Add | RegionBinaryOp::Sub | RegionBinaryOp::Mul
                     if known(lhs_numeric_fact, SsaValueClass::Int)
                         && known(rhs_numeric_fact, SsaValueClass::Int)
                         && result_fact.integer_range.is_some() => {}
@@ -1884,6 +2565,15 @@ fn collect_optimizing_assumptions(
                     if known(lhs_numeric_fact, SsaValueClass::Int)
                         && known(rhs_numeric_fact, SsaValueClass::Int) =>
                 {
+                    let result_depends_on_entry = [lhs, rhs].into_iter().any(|operand| {
+                        publication_entry_parameter(operand, &definitions, &parameter_indices)
+                            .is_some()
+                            || matches!(
+                                publication_root_operand(operand, &definitions),
+                                RegionOperand::Register(register)
+                                    if entry_dependent_integer_results.contains(&register)
+                            )
+                    });
                     let fixed_integer = |operand| {
                         publication_integer_operand(constants, &definitions, operand).or_else(
                             || match fixed_numeric_string_value(constants, operand) {
@@ -1925,12 +2615,7 @@ fn collect_optimizing_assumptions(
                             _ => unreachable!("integer arithmetic publication operation"),
                         };
                         if total.is_none() {
-                            return Err(CraneliftLoweringError::new(
-                                "JIT_CRANELIFT_REJECT_BINARY_OVERFLOW_PUBLICATION",
-                                format!(
-                                    "integer arithmetic at continuation {continuation} has a fixed overflowing result",
-                                ),
-                            ));
+                            resume_binary_in_generic!();
                         }
                     }
                     let (lhs_minimum, lhs_maximum, rhs_minimum, rhs_maximum) =
@@ -1997,7 +2682,7 @@ fn collect_optimizing_assumptions(
                                     forbidden_values: Vec::new(),
                                 });
                         } else {
-                            admit_publication_integer(
+                            if admit_publication_integer(
                                 &mut admission,
                                 value_flow,
                                 constants,
@@ -2009,7 +2694,11 @@ fn collect_optimizing_assumptions(
                                 &[],
                                 continuation,
                                 "integer arithmetic",
-                            )?;
+                            )
+                            .is_err()
+                            {
+                                resume_binary_in_generic!();
+                            }
                         }
                     }
                     if rhs_fixed.is_none() && !published_integer(rhs) {
@@ -2024,7 +2713,7 @@ fn collect_optimizing_assumptions(
                                     forbidden_values: Vec::new(),
                                 });
                         } else {
-                            admit_publication_integer(
+                            if admit_publication_integer(
                                 &mut admission,
                                 value_flow,
                                 constants,
@@ -2036,11 +2725,18 @@ fn collect_optimizing_assumptions(
                                 &[],
                                 continuation,
                                 "integer arithmetic",
-                            )?;
+                            )
+                            .is_err()
+                            {
+                                resume_binary_in_generic!();
+                            }
                         }
                     }
                     published_integer_results.insert(dst);
-                    entry_dependent_continuations.insert(continuation);
+                    if result_depends_on_entry {
+                        entry_dependent_integer_results.insert(dst);
+                        entry_dependent_continuations.insert(continuation);
+                    }
                 }
                 RegionBinaryOp::Add | RegionBinaryOp::Sub | RegionBinaryOp::Mul
                     if numeric(lhs_numeric_fact)
@@ -2056,7 +2752,7 @@ fn collect_optimizing_assumptions(
                                 .integer_range
                                 .is_some_and(|range| range.excludes(0))
                             {
-                                admit_publication_integer(
+                                if admit_publication_integer(
                                     &mut admission,
                                     value_flow,
                                     constants,
@@ -2068,7 +2764,11 @@ fn collect_optimizing_assumptions(
                                     &[0],
                                     continuation,
                                     "division",
-                                )?;
+                                )
+                                .is_err()
+                                {
+                                    resume_binary_in_generic!();
+                                }
                                 entry_dependent_continuations.insert(continuation);
                             }
                         }
@@ -2084,15 +2784,10 @@ fn collect_optimizing_assumptions(
                                 _ => None,
                             };
                             if fixed == Some(0.0) {
-                                return Err(CraneliftLoweringError::new(
-                                    "JIT_CRANELIFT_REJECT_BINARY_DIVISOR_PUBLICATION",
-                                    format!(
-                                        "division at continuation {continuation} has a zero floating divisor"
-                                    ),
-                                ));
+                                resume_binary_in_generic!();
                             }
                             if fixed.is_none() {
-                                let parameter_index = admit_publication_scalar_class(
+                                let Ok(Some(parameter_index)) = admit_publication_scalar_class(
                                     &mut admission,
                                     value_flow,
                                     constants,
@@ -2102,15 +2797,9 @@ fn collect_optimizing_assumptions(
                                     SsaValueClass::Float,
                                     continuation,
                                     "division",
-                                )?
-                                .ok_or_else(|| {
-                                    CraneliftLoweringError::new(
-                                        "JIT_CRANELIFT_REJECT_BINARY_DIVISOR_PUBLICATION",
-                                        format!(
-                                            "division at continuation {continuation} has no entry-rooted floating divisor"
-                                        ),
-                                    )
-                                })?;
+                                ) else {
+                                    resume_binary_in_generic!();
+                                };
                                 admission
                                     .float_requirements
                                     .push(NativeEntryFloatRequirement {
@@ -2131,7 +2820,7 @@ fn collect_optimizing_assumptions(
                         .integer_range
                         .is_some_and(|range| range.excludes(0))
                     {
-                        admit_publication_integer(
+                        if admit_publication_integer(
                             &mut admission,
                             value_flow,
                             constants,
@@ -2143,7 +2832,11 @@ fn collect_optimizing_assumptions(
                             &[0],
                             continuation,
                             "modulo",
-                        )?;
+                        )
+                        .is_err()
+                        {
+                            resume_binary_in_generic!();
+                        }
                         entry_dependent_continuations.insert(continuation);
                     }
                 }
@@ -2152,7 +2845,7 @@ fn collect_optimizing_assumptions(
                         && known(rhs_fact, SsaValueClass::Int) =>
                 {
                     if rhs_fact.integer_range.is_none_or(|range| range.minimum < 0) {
-                        admit_publication_integer(
+                        if admit_publication_integer(
                             &mut admission,
                             value_flow,
                             constants,
@@ -2164,7 +2857,11 @@ fn collect_optimizing_assumptions(
                             &[],
                             continuation,
                             "shift",
-                        )?;
+                        )
+                        .is_err()
+                        {
+                            resume_binary_in_generic!();
+                        }
                         entry_dependent_continuations.insert(continuation);
                     }
                 }
@@ -2176,7 +2873,7 @@ fn collect_optimizing_assumptions(
                         && known(rhs_fact, SsaValueClass::StringHandle) =>
                 {
                     for operand in [lhs, rhs] {
-                        admit_publication_string(
+                        if admit_publication_string(
                             &mut admission,
                             value_flow,
                             constants,
@@ -2187,7 +2884,11 @@ fn collect_optimizing_assumptions(
                             1,
                             continuation,
                             "string bit operation",
-                        )?;
+                        )
+                        .is_err()
+                        {
+                            resume_binary_in_generic!();
+                        }
                     }
                     entry_dependent_continuations.insert(continuation);
                 }
@@ -2197,7 +2898,7 @@ fn collect_optimizing_assumptions(
                             SsaValueClass::StringHandle
                                 if fact.certainty != crate::region_ir::SsaCertainty::Unknown =>
                             {
-                                admit_publication_string(
+                                if admit_publication_string(
                                     &mut admission,
                                     value_flow,
                                     constants,
@@ -2208,7 +2909,11 @@ fn collect_optimizing_assumptions(
                                     1,
                                     continuation,
                                     "concatenation",
-                                )?;
+                                )
+                                .is_err()
+                                {
+                                    resume_binary_in_generic!();
+                                }
                                 entry_dependent_continuations.insert(continuation);
                             }
                             SsaValueClass::Null
@@ -2226,29 +2931,24 @@ fn collect_optimizing_assumptions(
                                     );
                             }
                             _ => {
-                                return Err(CraneliftLoweringError::new(
-                                    "JIT_CRANELIFT_REJECT_BINARY_CONCAT_PUBLICATION",
-                                    format!(
-                                        "concatenation at continuation {continuation} has no total scalar/string publication plan"
-                                    ),
-                                ));
+                                resume_binary_in_generic!();
                             }
                         }
                     }
                 }
                 RegionBinaryOp::Pow if numeric(lhs_numeric_fact) && numeric(rhs_numeric_fact) => {}
                 _ => {
-                    return Err(CraneliftLoweringError::new(
-                        "JIT_CRANELIFT_REJECT_BINARY_PUBLICATION",
-                        format!(
-                            "binary {op:?} at continuation {continuation} has no total native type/shape plan"
-                        ),
-                    ));
+                    resume_binary_in_generic!();
                 }
             }
-            admission
-                .binary_operand_classes
-                .insert(continuation, (lhs_fact.class, rhs_fact.class));
+            if !admission
+                .proven_numeric_binary_instructions
+                .contains(&continuation)
+            {
+                admission
+                    .binary_operand_classes
+                    .insert(continuation, (lhs_fact.class, rhs_fact.class));
+            }
             admission.proven_binary_instructions.insert(continuation);
         }
         if let RegionInstructionKind::Echo { src } = instruction.kind {
@@ -2263,13 +2963,10 @@ fn collect_optimizing_assumptions(
                         | SsaValueClass::Null
                 )
             {
-                return Err(CraneliftLoweringError::new(
-                    "JIT_CRANELIFT_REJECT_ECHO_PUBLICATION",
-                    format!(
-                        "echo at continuation {} has no total scalar string plan",
-                        instruction.continuation_id,
-                    ),
-                ));
+                admission
+                    .generic_instruction_continuations
+                    .insert(instruction.continuation_id);
+                continue 'instructions;
             }
             if let Some(NativeEntryArraySource::Parameter(parameter_index)) =
                 entry_array_source(src, &definitions, &parameter_indices)
@@ -2285,9 +2982,10 @@ fn collect_optimizing_assumptions(
         }
         match instruction.kind {
             RegionInstructionKind::Compare { lhs, rhs, .. } => {
-                for operand in [lhs, rhs] {
+                let operands = [lhs, rhs];
+                if operands.iter().copied().any(|operand| {
                     let fact = lowering_operand_fact(value_flow, constants, operand);
-                    if fact.certainty == crate::region_ir::SsaCertainty::Unknown
+                    fact.certainty == crate::region_ir::SsaCertainty::Unknown
                         || !matches!(
                             fact.class,
                             SsaValueClass::Null
@@ -2297,15 +2995,14 @@ fn collect_optimizing_assumptions(
                                 | SsaValueClass::StringHandle
                                 | SsaValueClass::ResourceHandle
                         )
-                    {
-                        return Err(CraneliftLoweringError::new(
-                            "JIT_CRANELIFT_REJECT_COMPARE_PUBLICATION",
-                            format!(
-                                "comparison at continuation {} has no total scalar/resource operand plan",
-                                instruction.continuation_id,
-                            ),
-                        ));
-                    }
+                }) {
+                    admission
+                        .generic_instruction_continuations
+                        .insert(instruction.continuation_id);
+                    continue;
+                }
+                for operand in operands {
+                    let fact = lowering_operand_fact(value_flow, constants, operand);
                     let guarded = admit_publication_scalar_class(
                         &mut admission,
                         value_flow,
@@ -2341,13 +3038,10 @@ fn collect_optimizing_assumptions(
                     ),
                 };
                 if fact.certainty == crate::region_ir::SsaCertainty::Unknown || !admitted {
-                    return Err(CraneliftLoweringError::new(
-                        "JIT_CRANELIFT_REJECT_UNARY_PUBLICATION",
-                        format!(
-                            "unary {op:?} at continuation {} has no total native operand plan",
-                            instruction.continuation_id,
-                        ),
-                    ));
+                    admission
+                        .generic_instruction_continuations
+                        .insert(instruction.continuation_id);
+                    continue;
                 }
                 if op == RegionUnaryOp::BitNot && fact.class == SsaValueClass::StringHandle {
                     admit_publication_string(
@@ -2428,13 +3122,10 @@ fn collect_optimizing_assumptions(
                     RegionCastOp::Void => true,
                 };
                 if fact.certainty == crate::region_ir::SsaCertainty::Unknown || !admitted {
-                    return Err(CraneliftLoweringError::new(
-                        "JIT_CRANELIFT_REJECT_CAST_PUBLICATION",
-                        format!(
-                            "cast {op:?} at continuation {} has no total native operand plan",
-                            instruction.continuation_id,
-                        ),
-                    ));
+                    admission
+                        .generic_instruction_continuations
+                        .insert(instruction.continuation_id);
+                    continue;
                 }
                 if op == RegionCastOp::Array && fact.class != SsaValueClass::ArrayHandle {
                     admission.fixed_array_entries = admission
@@ -2498,13 +3189,10 @@ fn collect_optimizing_assumptions(
                         | SsaValueClass::MixedHandle
                 )
             {
-                return Err(CraneliftLoweringError::new(
-                    "JIT_CRANELIFT_REJECT_TRUTHINESS_PUBLICATION",
-                    format!(
-                        "empty-local at continuation {} has no exact truthiness shape",
-                        instruction.continuation_id,
-                    ),
-                ));
+                admission
+                    .generic_instruction_continuations
+                    .insert(instruction.continuation_id);
+                continue;
             }
             let guarded = admit_publication_scalar_class(
                 &mut admission,
@@ -2521,21 +3209,6 @@ fn collect_optimizing_assumptions(
             admission
                 .proven_scalar_control_instructions
                 .insert(instruction.continuation_id);
-        }
-        if let RegionInstructionKind::UnsetLocal { local } = instruction.kind {
-            let storage = value_flow.local_storage(local);
-            if storage == crate::region_ir::LocalStorageClass::Superglobal
-                || region.flags.is_top_level
-                    && storage == crate::region_ir::LocalStorageClass::RequestGlobal
-            {
-                return Err(CraneliftLoweringError::new(
-                    "JIT_CRANELIFT_REJECT_GLOBAL_BINDING_UNSET",
-                    format!(
-                        "global-binding unset at continuation {} is assigned to baseline before region entry",
-                        instruction.continuation_id,
-                    ),
-                ));
-            }
         }
         if matches!(
             &instruction.kind,
@@ -2672,6 +3345,13 @@ fn collect_optimizing_assumptions(
                         ),
                     ));
                 }
+                admission.fresh_unique_array_keys.insert(
+                    instruction.continuation_id,
+                    match normalized {
+                        NativeEntryArrayKey::Integer(value) => Some(value),
+                        NativeEntryArrayKey::Constant(_) => None,
+                    },
+                );
             }
             let count = fresh_insert_counts.entry(array).or_default();
             *count = count.saturating_add(1);
@@ -2740,15 +3420,49 @@ fn collect_optimizing_assumptions(
         }
         if let RegionInstructionKind::ForeachInit { iterator, source } = instruction.kind {
             let root = publication_root_operand(source, &definitions);
-            if let RegionOperand::Register(register) = root
-                && (new_array_registers.contains(&register)
-                    || internal_array_sources.contains_key(&register))
+            let source_fact = lowering_operand_fact(value_flow, constants, source);
+            let published_array = match root {
+                RegionOperand::Register(register) => {
+                    new_array_registers.contains(&register)
+                        || internal_array_sources.contains_key(&register)
+                        || literal_array_candidates.contains_key(&register)
+                }
+                RegionOperand::Local(local) => {
+                    new_array_local_sources.contains_key(&local)
+                        || literal_array_locals.contains_key(&local)
+                }
+                _ => false,
+            };
+            if published_array
+                || source_fact.certainty != crate::region_ir::SsaCertainty::Unknown
+                    && source_fact.class == SsaValueClass::ArrayHandle
             {
                 admission
                     .proven_array_instructions
                     .insert(instruction.continuation_id);
                 admission.fixed_value_allocations =
                     admission.fixed_value_allocations.saturating_add(1);
+                debug_assert!(foreach_sources.contains_key(&iterator));
+                continue;
+            }
+            if let RegionOperand::Register(register) = source
+                && let Some((root, key)) = admitted_array_probe_fetches.get(&register).cloned()
+            {
+                admission
+                    .array_requirements
+                    .entry(root)
+                    .or_default()
+                    .probe_paths
+                    .push(NativeEntryArrayProbeRequirement {
+                        keys: vec![key],
+                        leaf: NativeEntryArrayProbeLeaf::DirectArray,
+                    });
+                admission
+                    .proven_array_instructions
+                    .insert(instruction.continuation_id);
+                admission.fixed_value_allocations =
+                    admission.fixed_value_allocations.saturating_add(1);
+                entry_dependent_continuations.insert(instruction.continuation_id);
                 debug_assert!(foreach_sources.contains_key(&iterator));
                 continue;
             }
@@ -3417,13 +4131,10 @@ fn collect_optimizing_assumptions(
                     .proven_local_loads
                     .insert(instruction.continuation_id);
             } else {
-                return Err(CraneliftLoweringError::new(
-                    "JIT_CRANELIFT_REJECT_LOCAL_WARNING_BOUNDARY",
-                    format!(
-                        "non-quiet local load at continuation {} is not definitely initialized before optimizing entry",
-                        instruction.continuation_id,
-                    ),
-                ));
+                // Generated lowering performs the one value-state test,
+                // emits the fixed undefined-variable diagnostic when needed,
+                // and continues with PHP's null value. This is a local
+                // semantic boundary, never a whole-function admission error.
             }
         }
         if let RegionInstructionKind::FetchDim {
@@ -3563,30 +4274,19 @@ fn collect_optimizing_assumptions(
                     ),
                 ));
             }
-            let key = match key {
-                RegionOperand::Constant(index) => match constants.get(index as usize) {
-                    Some(IrConstant::Int(value)) if native_integer_fits_immediate(*value) => *value,
-                    _ => {
-                        return Err(CraneliftLoweringError::new(
-                            "JIT_CRANELIFT_REJECT_ARRAY_DIM_KEY_NORMALIZATION",
-                            format!(
-                                "dimension read at continuation {} has no publication-normalized integer key",
-                                instruction.continuation_id,
-                            ),
-                        ));
-                    }
-                },
-                RegionOperand::I64(value) if native_integer_fits_immediate(value) => value,
-                _ => {
-                    return Err(CraneliftLoweringError::new(
-                        "JIT_CRANELIFT_REJECT_ARRAY_DIM_KEY_NORMALIZATION",
-                        format!(
-                            "dimension read at continuation {} has no publication-normalized integer key",
-                            instruction.continuation_id,
-                        ),
-                    ));
-                }
-            };
+            let key = publication_native_array_key(
+                constants,
+                publication_root_operand(key, &definitions),
+            )
+            .ok_or_else(|| {
+                CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_REJECT_ARRAY_DIM_KEY_NORMALIZATION",
+                    format!(
+                        "dimension read at continuation {} has no publication-normalized key",
+                        instruction.continuation_id,
+                    ),
+                )
+            })?;
             if by_ref_parameters.contains(&source_local) {
                 return Err(CraneliftLoweringError::new(
                     "JIT_CRANELIFT_REJECT_ARRAY_DIM_REFERENCE",
@@ -3600,10 +4300,9 @@ fn collect_optimizing_assumptions(
                 .proven_array_instructions
                 .insert(instruction.continuation_id);
             entry_dependent_continuations.insert(instruction.continuation_id);
-            admitted_array_fetches.insert(dst, (source, key));
-            let requirement = admission.array_requirements.entry(source).or_default();
-            if !quiet && mode == php_ir::instruction::DimFetchMode::Read {
-                requirement.required_integer_keys.insert(key);
+            admitted_array_probe_fetches.insert(dst, (source, key.clone()));
+            if let NativeEntryArrayKey::Integer(key) = key {
+                admitted_array_fetches.insert(dst, (source, key));
             }
         }
         if let RegionInstructionKind::IssetDim { local, keys, .. }
@@ -3846,13 +4545,9 @@ fn collect_optimizing_assumptions(
                         .insert(instruction.continuation_id);
                 }
                 RegionInstructionKind::UnsetDim { keys, .. } if keys.len() == 1 => {
-                    return Err(CraneliftLoweringError::new(
-                        "JIT_CRANELIFT_REJECT_GLOBAL_BINDING_UNSET",
-                        format!(
-                            "global binding unset at continuation {} must enter baseline before optimizing execution",
-                            instruction.continuation_id,
-                        ),
-                    ));
+                    admission
+                        .proven_array_instructions
+                        .insert(instruction.continuation_id);
                 }
                 RegionInstructionKind::UnsetDim { keys, .. } if keys.len() > 1 => {
                     let normalized = keys[1..]
@@ -3932,27 +4627,22 @@ fn collect_optimizing_assumptions(
                 ));
             }
             let (required_state, readable, releasable) = match &instruction.kind {
-                RegionInstructionKind::FetchProperty { .. } => (
-                    crate::JIT_NATIVE_TRUSTED_PROPERTY_SLOT_PUBLISHED,
-                    true,
-                    false,
-                ),
-                RegionInstructionKind::AssignProperty { value, .. } => {
-                    let value = lowering_operand_fact(value_flow, constants, *value);
-                    if value.certainty == crate::region_ir::SsaCertainty::Unknown
-                        || !matches!(
-                            value.class,
-                            SsaValueClass::Int | SsaValueClass::Bool | SsaValueClass::Null
-                        )
-                    {
-                        return Err(CraneliftLoweringError::new(
-                            "JIT_CRANELIFT_REJECT_PROPERTY_VALUE_OWNERSHIP",
-                            format!(
-                                "property assignment at continuation {} has no immediate ownership plan",
-                                instruction.continuation_id,
-                            ),
-                        ));
-                    }
+                RegionInstructionKind::FetchProperty { .. } => {
+                    let initialized_by_generated_store = definitely_initialized_property_fetches
+                        .contains(&instruction.continuation_id);
+                    (
+                        crate::JIT_NATIVE_TRUSTED_PROPERTY_SLOT_PUBLISHED,
+                        !initialized_by_generated_store,
+                        false,
+                    )
+                }
+                RegionInstructionKind::AssignProperty { .. } => {
+                    // The generated store retains every encoded runtime
+                    // handle before publication and releases the replaced
+                    // owner through the total direct-value commit leaf.
+                    // Restricting this path to immediate scalar facts was a
+                    // stale pre-totalization admission rule and forced known
+                    // string/array/object values through Generic.
                     (
                         crate::JIT_NATIVE_TRUSTED_PROPERTY_SLOT_WRITABLE,
                         false,
@@ -3978,7 +4668,18 @@ fn collect_optimizing_assumptions(
             if let RegionInstructionKind::FetchProperty { dst, .. } = instruction.kind {
                 published_property_array_sources.insert(dst, requirement_index);
             }
-            entry_dependent_continuations.insert(instruction.continuation_id);
+            // A declared-property write consumes an immutable layout/slot
+            // plan and inspects the slot's current initialized/value fields
+            // at the point of the store. Control-flow joins and earlier
+            // effects cannot stale that plan. Reads additionally require the
+            // entry-published initialized state and remain entry-dependent.
+            if matches!(
+                instruction.kind,
+                RegionInstructionKind::FetchProperty { .. }
+            ) && !definitely_initialized_property_fetches.contains(&instruction.continuation_id)
+            {
+                entry_dependent_continuations.insert(instruction.continuation_id);
+            }
         }
         if let RegionInstructionKind::ArrayCallback(call) = &instruction.kind {
             let RegionArrayCallbackTarget::Stable(callback) = &call.callback else {
@@ -4552,6 +5253,28 @@ fn collect_optimizing_assumptions(
                 source: target,
             } => {
                 if instruction.native_global_name.is_some() {
+                    let reads_global_reference = matches!(
+                        &instruction.kind,
+                        RegionInstructionKind::BindReferenceDim { .. }
+                    ) && keys.len() == 1
+                        && reference_target_local(*target);
+                    let rebinds_global_reference = matches!(
+                        &instruction.kind,
+                        RegionInstructionKind::BindReferenceIntoDim { .. }
+                    ) && keys.len() == 1
+                        && reference_source_local(*target);
+                    if reads_global_reference || rebinds_global_reference {
+                        if rebinds_global_reference {
+                            admission.fixed_value_allocations =
+                                admission.fixed_value_allocations.saturating_add(1);
+                        }
+                        admission.plain_globals.insert(instruction.continuation_id);
+                        admission
+                            .proven_array_instructions
+                            .insert(instruction.continuation_id);
+                        entry_dependent_continuations.insert(instruction.continuation_id);
+                        continue;
+                    }
                     return Err(CraneliftLoweringError::new(
                         "JIT_CRANELIFT_REJECT_GLOBAL_REFERENCE_DIM_PUBLICATION",
                         format!(
@@ -4944,13 +5667,10 @@ fn collect_optimizing_assumptions(
         }
         if let RegionInstructionKind::CloneObject { object, plain, .. } = &instruction.kind {
             if !plain {
-                return Err(CraneliftLoweringError::new(
-                    "JIT_CRANELIFT_REJECT_CLONE_PUBLICATION",
-                    format!(
-                        "clone at continuation {} has no publication proof excluding __clone",
-                        instruction.continuation_id,
-                    ),
-                ));
+                // A class-specific __clone target is not immutable at this
+                // generic publication boundary. The emitted artifact takes
+                // this instruction's one baseline-native continuation.
+                continue;
             }
             let fact = lowering_operand_fact(value_flow, constants, *object);
             if fact.certainty == crate::region_ir::SsaCertainty::Unknown
@@ -4970,7 +5690,10 @@ fn collect_optimizing_assumptions(
                 if by_ref_parameters.contains(&region.parameter_locals[parameter_index]) {
                     return Err(CraneliftLoweringError::new(
                         "JIT_CRANELIFT_REJECT_CLONE_REFERENCE",
-                        "plain clone source is a by-reference parameter",
+                        format!(
+                            "plain clone at continuation {} has a by-reference source parameter",
+                            instruction.continuation_id,
+                        ),
                     ));
                 }
                 admission
@@ -4995,42 +5718,87 @@ fn collect_optimizing_assumptions(
         let RegionInstructionKind::NativeCall(call) = &instruction.kind else {
             continue;
         };
+        let admission_before_call = admission.clone();
+        let entry_dependencies_before_call = entry_dependent_continuations.clone();
+        macro_rules! resume_call_in_generic {
+            () => {{
+                admission = admission_before_call;
+                entry_dependent_continuations = entry_dependencies_before_call;
+                admission
+                    .generic_instruction_continuations
+                    .insert(instruction.continuation_id);
+                continue 'instructions;
+            }};
+        }
+        if stable_direct_native_builtin(&call.target)
+            && stable_exact_control_builtin_family(&call.target).is_none()
+        {
+            admission
+                .proven_fixed_builtin_calls
+                .insert(instruction.continuation_id);
+        }
+        if call.args.is_empty()
+            && stable_throwable_method(&call.target).is_some()
+            && call
+                .operands
+                .first()
+                .copied()
+                .flatten()
+                .is_some_and(
+                    |receiver| match publication_root_operand(receiver, &definitions) {
+                        RegionOperand::Local(local) => immutable_exception_locals.contains(&local),
+                        RegionOperand::Register(register) => {
+                            constructed_throwable_registers.contains(&register)
+                        }
+                        _ => false,
+                    },
+                )
+        {
+            admission
+                .proven_throwable_method_calls
+                .insert(instruction.continuation_id);
+        }
+        if call.variadic && call.trailing_unpack_argument().is_none() {
+            let capacity = call
+                .args
+                .len()
+                .max(crate::JIT_NATIVE_DIRECT_ARRAY_INITIAL_CAPACITY as usize)
+                .checked_next_power_of_two()
+                .filter(|capacity| *capacity <= crate::JIT_NATIVE_DIRECT_ARRAY_ENTRY_CAPACITY)
+                .ok_or_else(|| {
+                    CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_VARIADIC_BINDING_CAPACITY",
+                        "prepared variadic argument frame exceeds native array capacity",
+                    )
+                })?;
+            admission.fixed_value_allocations = admission.fixed_value_allocations.saturating_add(1);
+            admission.fixed_array_entries = admission.fixed_array_entries.saturating_add(capacity);
+            for name in call
+                .args
+                .iter()
+                .filter_map(|argument| argument.name.as_deref())
+            {
+                admission.fixed_value_allocations =
+                    admission.fixed_value_allocations.saturating_add(1);
+                admission.fixed_string_bytes =
+                    admission.fixed_string_bytes.saturating_add(name.len());
+            }
+        }
         if let RegionCallTarget::Method {
             receiver_layout_id: Some(layout_id),
             ..
         } = &call.target
         {
-            let receiver = call.operands.first().copied().flatten().ok_or_else(|| {
-                CraneliftLoweringError::new(
-                    "JIT_CRANELIFT_REJECT_METHOD_RECEIVER_PUBLICATION",
-                    format!(
-                        "specialized method at continuation {} has no receiver",
-                        instruction.continuation_id,
-                    ),
-                )
-            })?;
-            let NativeEntryArraySource::Parameter(parameter_index) = entry_array_source(
-                receiver,
-                &definitions,
-                &parameter_indices,
-            )
-            .ok_or_else(|| {
-                CraneliftLoweringError::new(
-                    "JIT_CRANELIFT_REJECT_METHOD_RECEIVER_PUBLICATION",
-                    format!(
-                        "specialized method at continuation {} is not rooted at an entry receiver",
-                        instruction.continuation_id,
-                    ),
-                )
-            })?
+            let Some(receiver) = call.operands.first().copied().flatten() else {
+                resume_call_in_generic!();
+            };
+            let Some(NativeEntryArraySource::Parameter(parameter_index)) =
+                entry_array_source(receiver, &definitions, &parameter_indices)
             else {
-                unreachable!("method receiver operands are entry parameters")
+                resume_call_in_generic!();
             };
             if by_ref_parameters.contains(&region.parameter_locals[parameter_index]) {
-                return Err(CraneliftLoweringError::new(
-                    "JIT_CRANELIFT_REJECT_METHOD_RECEIVER_REFERENCE",
-                    "specialized method receiver is a by-reference parameter",
-                ));
+                resume_call_in_generic!();
             }
             admission
                 .object_layout_requirements
@@ -5044,24 +5812,13 @@ fn collect_optimizing_assumptions(
             operation: RegionSemanticOp::InstanceOf { object, .. },
         } = &call.target
         {
-            let NativeEntryArraySource::Parameter(parameter_index) =
-                entry_array_source(*object, &definitions, &parameter_indices).ok_or_else(|| {
-                    CraneliftLoweringError::new(
-                        "JIT_CRANELIFT_REJECT_INSTANCEOF_PUBLICATION",
-                        format!(
-                            "instanceof at continuation {} is not rooted at an entry object",
-                            instruction.continuation_id,
-                        ),
-                    )
-                })?
+            let Some(NativeEntryArraySource::Parameter(parameter_index)) =
+                entry_array_source(*object, &definitions, &parameter_indices)
             else {
-                unreachable!("instanceof object operands are entry parameters")
+                resume_call_in_generic!();
             };
             if by_ref_parameters.contains(&region.parameter_locals[parameter_index]) {
-                return Err(CraneliftLoweringError::new(
-                    "JIT_CRANELIFT_REJECT_INSTANCEOF_REFERENCE",
-                    "instanceof object is a by-reference parameter",
-                ));
+                resume_call_in_generic!();
             }
             admission
                 .instanceof_requirements
@@ -5075,33 +5832,21 @@ fn collect_optimizing_assumptions(
             operation: RegionSemanticOp::DynamicInstanceOf { object, target, .. },
         } = &call.target
         {
-            let target_name = publication_utf8_string(constants, &definitions, *target)
-                .ok_or_else(|| {
-                    CraneliftLoweringError::new(
-                        "JIT_CRANELIFT_REJECT_DYNAMIC_INSTANCEOF_TARGET",
-                        format!(
-                            "dynamic instanceof at continuation {} has no fixed UTF-8 target class",
-                            instruction.continuation_id,
-                        ),
-                    )
-                })?;
+            let Some(target_name) = publication_utf8_string(constants, &definitions, *target)
+            else {
+                resume_call_in_generic!();
+            };
             if target_name.trim_start_matches('\\').is_empty() {
-                return Err(CraneliftLoweringError::new(
-                    "JIT_CRANELIFT_REJECT_DYNAMIC_INSTANCEOF_TARGET",
-                    "dynamic instanceof target class is empty",
-                ));
+                resume_call_in_generic!();
             }
             let parameter_index =
                 publication_entry_parameter(*object, &definitions, &parameter_indices);
             if parameter_index.is_some_and(|parameter_index| {
                 by_ref_parameters.contains(&region.parameter_locals[parameter_index])
             }) {
-                return Err(CraneliftLoweringError::new(
-                    "JIT_CRANELIFT_REJECT_DYNAMIC_INSTANCEOF_REFERENCE",
-                    "dynamic instanceof object is a by-reference parameter",
-                ));
+                resume_call_in_generic!();
             }
-            let _ = admit_publication_scalar_class(
+            if admit_publication_scalar_class(
                 &mut admission,
                 value_flow,
                 constants,
@@ -5111,7 +5856,11 @@ fn collect_optimizing_assumptions(
                 SsaValueClass::ObjectHandle,
                 instruction.continuation_id,
                 "dynamic instanceof object",
-            )?;
+            )
+            .is_err()
+            {
+                resume_call_in_generic!();
+            }
             admission
                 .instanceof_requirements
                 .push(NativeEntryInstanceofRequirement {
@@ -6426,7 +7175,8 @@ fn collect_optimizing_assumptions(
                     RegionCallTarget::Function {
                         name,
                         function: None,
-                    } => (Some(name.as_str()), None),
+                        linked_function,
+                    } => (Some(name.as_str()), *linked_function),
                     RegionCallTarget::Method {
                         function: None,
                         linked_function: Some(link_index),
@@ -7184,10 +7934,16 @@ fn collect_optimizing_assumptions(
             }
 
             if stable_builtin_str_replace(&call.target) {
-                if arguments.len() != 3 {
+                if !matches!(arguments.len(), 3 | 4) {
                     return Err(CraneliftLoweringError::new(
                         "JIT_CRANELIFT_REJECT_STR_REPLACE_ARITY",
-                        "str_replace requires three positional scalar strings",
+                        "str_replace requires three scalar inputs and an optional count reference",
+                    ));
+                }
+                if arguments.len() == 4 && call.args[3].by_ref_local.is_none() {
+                    return Err(CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_STR_REPLACE_COUNT_REFERENCE",
+                        "str_replace count output requires one direct local reference",
                     ));
                 }
                 let search_length =
@@ -7241,12 +7997,26 @@ fn collect_optimizing_assumptions(
             }
 
             if stable_builtin_explode(&call.target) {
-                if arguments.len() != 2 {
+                if !matches!(arguments.len(), 2 | 3) {
                     return Err(CraneliftLoweringError::new(
                         "JIT_CRANELIFT_REJECT_EXPLODE_ARITY",
-                        "explode requires two positional strings",
+                        "explode requires two strings and an optional fixed limit",
                     ));
                 }
+                let piece_limit = arguments
+                    .get(2)
+                    .map(|limit| {
+                        publication_integer_operand(constants, &definitions, *limit)
+                            .filter(|limit| *limit >= 0)
+                            .map(|limit| usize::try_from(limit.max(1)).unwrap_or(usize::MAX))
+                            .ok_or_else(|| {
+                                CraneliftLoweringError::new(
+                                    "JIT_CRANELIFT_REJECT_EXPLODE_PUBLICATION",
+                                    "explode limit is not a fixed nonnegative integer",
+                                )
+                            })
+                    })
+                    .transpose()?;
                 let delimiter_length =
                     publication_string_length(constants, &definitions, arguments[0])
                         .filter(|length| *length != 0)
@@ -7262,7 +8032,8 @@ fn collect_optimizing_assumptions(
                     let pieces = input_length
                         .checked_div(delimiter_length)
                         .unwrap_or(0)
-                        .saturating_add(1);
+                        .saturating_add(1)
+                        .min(piece_limit.unwrap_or(usize::MAX));
                     admission.fixed_value_allocations = admission
                         .fixed_value_allocations
                         .saturating_add(pieces.saturating_add(1));
@@ -8332,6 +9103,12 @@ fn collect_optimizing_assumptions(
             && (fact.certainty == crate::region_ir::SsaCertainty::Unknown
                 || fact.class != SsaValueClass::ArrayHandle)
         {
+            if count_family {
+                // Unknown/countable-object inputs are locally total through
+                // the fixed count/sizeof leaf. They do not create an array
+                // entry requirement and must not reject the whole function.
+                continue;
+            }
             return Err(CraneliftLoweringError::new(
                 "JIT_CRANELIFT_REJECT_ARRAY_FAMILY_TYPE",
                 format!(
@@ -8367,6 +9144,7 @@ fn collect_optimizing_assumptions(
                 .projection_allocations += usize::from(projection);
         }
     }
+    rejection_continuation.set(None);
     if let Some(continuation_id) = entry_dependent_continuations
         .intersection(&unstable_before)
         .next()
@@ -8477,33 +9255,17 @@ fn collect_optimizing_assumptions(
                 sources
             },
         );
-    let has_instruction_frame_exit = region
+    let fiber_suspend_results = region
         .blocks
         .iter()
         .flat_map(|block| &block.instructions)
-        .any(|instruction| {
-            matches!(
-                instruction.kind,
-                RegionInstructionKind::NativeControl(RegionNativeControl::Throw { .. })
-                    | RegionInstructionKind::NativeControl(RegionNativeControl::EndFinally {
-                        outer_finally: None,
-                        ..
-                    })
-            )
-        });
-    if has_instruction_frame_exit
-        && let Some(local) = value_flow
-            .frame_cleanup_locals()
-            .find(|local| !cleanup_local_is_total(*local))
-    {
-        return Err(CraneliftLoweringError::new(
-            "JIT_CRANELIFT_REJECT_DESTRUCTOR_PUBLICATION",
-            format!(
-                "frame-exit cleanup for local {} can require a PHP-visible destructor or cold owner",
-                local.raw(),
-            ),
-        ));
-    }
+        .filter_map(|instruction| match instruction.kind {
+            RegionInstructionKind::NativeSuspend(RegionNativeSuspend::FiberSuspend {
+                dst, ..
+            }) => Some(dst),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
     for block in &region.blocks {
         let exits_to_generic_dynamic_continuation = block.instructions.iter().any(|instruction| {
             matches!(
@@ -8539,6 +9301,10 @@ fn collect_optimizing_assumptions(
                 }
                 _ => return None,
             };
+            if matches!(operand, RegionOperand::Register(register) if fiber_suspend_results.contains(&register))
+            {
+                return None;
+            }
             (!optimizing_fact_satisfies_type(fact, return_type))
                 .then(|| {
                     publication_return_plan(
@@ -8590,7 +9356,8 @@ fn collect_optimizing_assumptions(
             | RegionTerminator::JumpIfTrue { condition, .. }
             | RegionTerminator::JumpIf { condition, .. } => {
                 let fact = lowering_operand_fact(value_flow, constants, condition);
-                if fact.certainty == crate::region_ir::SsaCertainty::Unknown
+                if unstable_before.contains(&block.terminator_continuation_id)
+                    || fact.certainty == crate::region_ir::SsaCertainty::Unknown
                     || matches!(
                         fact.class,
                         SsaValueClass::Uninitialized
@@ -8598,15 +9365,8 @@ fn collect_optimizing_assumptions(
                             | SsaValueClass::MixedHandle
                     )
                 {
-                    return Err(CraneliftLoweringError::new(
-                        "JIT_CRANELIFT_REJECT_TRUTHINESS_PUBLICATION",
-                        format!(
-                            "branch at continuation {} has no exact truthiness shape",
-                            block.terminator_continuation_id,
-                        ),
-                    ));
-                }
-                let guarded = admit_publication_scalar_class(
+                    false
+                } else if let Ok(guarded) = admit_publication_scalar_class(
                     &mut admission,
                     value_flow,
                     constants,
@@ -8616,10 +9376,13 @@ fn collect_optimizing_assumptions(
                     fact.class,
                     block.terminator_continuation_id,
                     "branch truthiness",
-                )?;
-                entry_dependent_continuations
-                    .extend(guarded.map(|_| block.terminator_continuation_id));
-                true
+                ) {
+                    entry_dependent_continuations
+                        .extend(guarded.map(|_| block.terminator_continuation_id));
+                    true
+                } else {
+                    false
+                }
             }
             _ => true,
         };
@@ -8633,34 +9396,45 @@ fn collect_optimizing_assumptions(
                     value,
                     finally: None,
                 } => {
+                    let fiber_resume_value = matches!(
+                        value,
+                        RegionOperand::Register(register)
+                            if fiber_suspend_results.contains(&register)
+                    );
                     let return_type_total = region.return_type.as_ref().is_none_or(|return_type| {
-                        optimizing_fact_satisfies_type(publication_operand_fact(value), return_type)
-                            || matches!(
+                        !fiber_resume_value
+                            && (optimizing_fact_satisfies_type(
+                                publication_operand_fact(value),
+                                return_type,
+                            ) || matches!(
                                 (value, return_type),
                                 (RegionOperand::Register(register), php_ir::IrReturnType::Int)
                                     if published_integer_results.contains(&register)
-                            )
-                            || matches!(return_type, php_ir::IrReturnType::Array)
+                            ) || matches!(
+                                (value, return_type),
+                                (RegionOperand::Register(register), php_ir::IrReturnType::Object)
+                                    if published_object_results.contains(&register)
+                            ) || matches!(return_type, php_ir::IrReturnType::Array)
                                 && operand_root_local(value)
                                     .is_some_and(|local| new_array_locals.contains(&local))
-                            || operand_root_local(value).is_some_and(|local| {
-                                local_store_sources.get(&local).is_some_and(|sources| {
-                                    matches!(
-                                        sources.as_slice(),
-                                        [(_, source)]
-                                            if optimizing_fact_satisfies_type(
-                                                publication_operand_fact(*source),
-                                                return_type,
-                                            )
-                                    )
+                                || operand_root_local(value).is_some_and(|local| {
+                                    local_store_sources.get(&local).is_some_and(|sources| {
+                                        matches!(
+                                            sources.as_slice(),
+                                            [(_, source)]
+                                                if optimizing_fact_satisfies_type(
+                                                    publication_operand_fact(*source),
+                                                    return_type,
+                                                )
+                                        )
+                                    })
                                 })
-                            })
-                            || admission
-                                .return_plans
-                                .contains_key(&block.terminator_continuation_id)
-                            || admission
-                                .proven_terminators
-                                .contains(&block.terminator_continuation_id)
+                                || admission
+                                    .return_plans
+                                    .contains_key(&block.terminator_continuation_id)
+                                || admission
+                                    .proven_terminators
+                                    .contains(&block.terminator_continuation_id))
                     });
                     return_type_total && cleanup_total
                 }
@@ -8727,20 +9501,11 @@ fn collect_optimizing_assumptions(
                 } => false,
             };
         if !total {
-            let non_total_cleanup_locals = block
-                .terminator_live_locals
-                .iter()
-                .copied()
-                .filter(|local| !cleanup_local_is_total(*local))
-                .map(LocalId::raw)
-                .collect::<Vec<_>>();
-            return Err(CraneliftLoweringError::new(
-                "JIT_CRANELIFT_REJECT_NON_TOTAL_TERMINATOR_PUBLICATION",
-                format!(
-                    "terminator at continuation {} has no total native return/type/ownership/cleanup plan; non-total cleanup locals={non_total_cleanup_locals:?}",
-                    block.terminator_continuation_id
-                ),
-            ));
+            // A return/exit whose optional type or cleanup facts are not
+            // entry-provable leaves the specialized region at this exact
+            // terminator. Earlier instructions remain Optimizing code and
+            // Generic resumes with the same encoded values and identities.
+            continue;
         }
         admission
             .proven_terminators
@@ -8759,13 +9524,17 @@ fn collect_optimizing_assumptions(
         ));
     }
     for instruction in region.blocks.iter().flat_map(|block| &block.instructions) {
+        if forced_generic_continuations.contains(&instruction.continuation_id) {
+            continue;
+        }
         let RegionInstructionKind::NativeCall(call) = &instruction.kind else {
             continue;
         };
         let Some(family) = stable_exact_control_builtin_family(&call.target) else {
             continue;
         };
-        publish_fixed_builtin_assumptions(
+        let before_fixed_builtin = admission.clone();
+        if publish_fixed_builtin_assumptions(
             &mut admission,
             call,
             instruction.continuation_id,
@@ -8779,7 +9548,14 @@ fn collect_optimizing_assumptions(
                 .iter()
                 .take_while(|parameter| !parameter.variadic)
                 .count(),
-        )?;
+        )
+        .is_err()
+        {
+            admission = before_fixed_builtin;
+            admission
+                .generic_instruction_continuations
+                .insert(instruction.continuation_id);
+        }
     }
     admission.fixed_lvalue_insertions = admission
         .array_requirements
@@ -8804,6 +9580,396 @@ fn collect_optimizing_assumptions(
     }
     admission.reference_payloads_are_proven = true;
     Ok(admission)
+}
+
+fn rejection_continuation_id(error: &CraneliftLoweringError) -> Option<u32> {
+    let marker = "continuation ";
+    let start = error.detail.rfind(marker)? + marker.len();
+    let digits = error.detail[start..]
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>();
+    (!digits.is_empty()).then(|| digits.parse().ok()).flatten()
+}
+
+fn optimizing_dynamic_call_has_generated_spine(
+    call: &RegionNativeCall,
+    external_function_signatures: &[crate::JitExternalFunctionSignature],
+) -> bool {
+    if call.returns_by_reference
+        || matches!(call.result, RegionCallResult::ReferenceLocal(_))
+        || call.argument_operand_offset != 1
+        || call.operands.iter().any(Option::is_none)
+    {
+        return false;
+    }
+
+    let positional = call
+        .args
+        .iter()
+        .all(|argument| argument.name.is_none() && !argument.unpack);
+    let fixed_callable = matches!(
+        &call.target,
+        RegionCallTarget::Callable { .. }
+            | RegionCallTarget::Closure { function: None, .. }
+            | RegionCallTarget::Pipe { .. }
+    ) && call.operands.len() == call.args.len().saturating_add(1)
+        && positional;
+    let unpacked_callable = matches!(
+        &call.target,
+        RegionCallTarget::Callable { .. } | RegionCallTarget::Closure { function: None, .. }
+    ) && call.trailing_unpack_argument() == Some(0)
+        && call.operands.len() == 2;
+    let constructor = matches!(
+        &call.target,
+        RegionCallTarget::Constructor { .. } | RegionCallTarget::DynamicConstructor { .. }
+    ) && call.argument_operand_offset
+        == usize::from(matches!(
+            &call.target,
+            RegionCallTarget::DynamicConstructor { .. }
+        ))
+        && call.operands.len() == call.args.len().saturating_add(call.argument_operand_offset)
+        && positional;
+    let unresolved_function = matches!(
+        &call.target,
+        RegionCallTarget::Function { function: None, .. }
+    ) && call.argument_operand_offset == 0
+        && call.operands.len() == call.args.len()
+        && call.args.iter().all(|argument| !argument.unpack)
+        && (call.args.iter().all(|argument| argument.name.is_none())
+            || unresolved_function_link_index(call, external_function_signatures).is_some());
+    let method = matches!(&call.target, RegionCallTarget::Method { .. })
+        && call.argument_operand_offset == 1
+        && call.operands.len() == call.args.len().saturating_add(1)
+        && positional;
+    let static_method = matches!(&call.target, RegionCallTarget::StaticMethod { .. })
+        && call.argument_operand_offset == 0
+        && call.operands.len() == call.args.len()
+        && positional;
+
+    fixed_callable
+        || unpacked_callable
+        || constructor
+        || unresolved_function
+        || method
+        || static_method
+}
+
+fn collect_generic_static_assumptions(
+    region: &RegionGraph,
+    constants: &[IrConstant],
+    value_flow: &ExecutableValueFlow,
+) -> NativeOptimizingAssumptions {
+    let definitions = region
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .filter_map(|instruction| match instruction.kind {
+            RegionInstructionKind::LoadLocal { dst, local, .. } => {
+                Some((dst, RegionOperand::Local(local)))
+            }
+            RegionInstructionKind::Move { dst, src } => Some((dst, src)),
+            _ => None,
+        })
+        .collect::<BTreeMap<_, _>>();
+    let published_fetch_constant_facts = published_fetch_constant_facts(region);
+    let published_numeric_closure = published_numeric_closure(
+        region,
+        constants,
+        value_flow,
+        &published_fetch_constant_facts,
+    );
+    let publication_operand_fact = |operand: RegionOperand| {
+        if let RegionOperand::Register(register) = operand
+            && let Some(fact) = published_fetch_constant_facts.get(&register).copied()
+        {
+            return fact;
+        }
+        lowering_operand_fact(value_flow, constants, operand)
+    };
+    let publication_operand_is_numeric = |operand: RegionOperand| {
+        operand_is_published_numeric(
+            operand,
+            constants,
+            value_flow,
+            &published_fetch_constant_facts,
+            &published_numeric_closure.locals,
+            &published_numeric_closure.registers,
+        )
+    };
+    let immutable_exception_locals = immutable_throwable_locals(region);
+    let constructed_throwable_registers = constructed_throwable_registers(region);
+    let insert_totals = region
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .filter_map(|instruction| match instruction.kind {
+            RegionInstructionKind::ArrayInsert { array, .. } => Some(array),
+            _ => None,
+        })
+        .fold(BTreeMap::<RegId, usize>::new(), |mut totals, array| {
+            *totals.entry(array).or_default() += 1;
+            totals
+        });
+    let mut assumptions = NativeOptimizingAssumptions::default();
+    for instruction in region.blocks.iter().flat_map(|block| &block.instructions) {
+        match instruction.kind {
+            RegionInstructionKind::NativeCall(ref call) => {
+                if call.args.is_empty()
+                    && stable_throwable_method(&call.target).is_some()
+                    && call
+                        .operands
+                        .first()
+                        .copied()
+                        .flatten()
+                        .is_some_and(|receiver| {
+                            match publication_root_operand(receiver, &definitions) {
+                                RegionOperand::Local(local) => {
+                                    immutable_exception_locals.contains(&local)
+                                }
+                                RegionOperand::Register(register) => {
+                                    constructed_throwable_registers.contains(&register)
+                                }
+                                _ => false,
+                            }
+                        })
+                {
+                    assumptions
+                        .proven_throwable_method_calls
+                        .insert(instruction.continuation_id);
+                }
+                let magic_method = match &call.target {
+                    crate::region_ir::RegionCallTarget::Method {
+                        method,
+                        function: None,
+                        ..
+                    } => Some((method.as_str(), false)),
+                    crate::region_ir::RegionCallTarget::StaticMethod { class_name, method } => {
+                        assumptions.fixed_value_allocations =
+                            assumptions.fixed_value_allocations.saturating_add(1);
+                        assumptions.fixed_string_bytes = assumptions
+                            .fixed_string_bytes
+                            .saturating_add(class_name.trim_start_matches('\\').len());
+                        Some((method.as_str(), true))
+                    }
+                    _ => None,
+                };
+                if let Some((method, _static_target)) = magic_method
+                    && call
+                        .args
+                        .iter()
+                        .all(|argument| argument.name.is_none() && !argument.unpack)
+                {
+                    let capacity = call
+                        .args
+                        .len()
+                        .max(crate::JIT_NATIVE_DIRECT_ARRAY_INITIAL_CAPACITY as usize)
+                        .checked_next_power_of_two()
+                        .filter(|capacity| {
+                            *capacity <= crate::JIT_NATIVE_DIRECT_ARRAY_ENTRY_CAPACITY
+                        })
+                        .unwrap_or(crate::JIT_NATIVE_DIRECT_ARRAY_ENTRY_CAPACITY);
+                    assumptions.fixed_value_allocations =
+                        assumptions.fixed_value_allocations.saturating_add(2);
+                    assumptions.fixed_array_entries =
+                        assumptions.fixed_array_entries.saturating_add(capacity);
+                    assumptions.fixed_string_bytes =
+                        assumptions.fixed_string_bytes.saturating_add(method.len());
+                }
+                if call.variadic && call.trailing_unpack_argument().is_none() {
+                    let capacity = call
+                        .args
+                        .len()
+                        .max(crate::JIT_NATIVE_DIRECT_ARRAY_INITIAL_CAPACITY as usize)
+                        .checked_next_power_of_two()
+                        .filter(|capacity| {
+                            *capacity <= crate::JIT_NATIVE_DIRECT_ARRAY_ENTRY_CAPACITY
+                        })
+                        .unwrap_or(crate::JIT_NATIVE_DIRECT_ARRAY_ENTRY_CAPACITY);
+                    assumptions.fixed_value_allocations =
+                        assumptions.fixed_value_allocations.saturating_add(1);
+                    assumptions.fixed_array_entries =
+                        assumptions.fixed_array_entries.saturating_add(capacity);
+                    for name in call
+                        .args
+                        .iter()
+                        .filter_map(|argument| argument.name.as_deref())
+                    {
+                        assumptions.fixed_value_allocations =
+                            assumptions.fixed_value_allocations.saturating_add(1);
+                        assumptions.fixed_string_bytes =
+                            assumptions.fixed_string_bytes.saturating_add(name.len());
+                    }
+                }
+                if let Some(unpack) = call.trailing_unpack_argument()
+                    && call
+                        .operands
+                        .get(call.argument_operand_offset.saturating_add(unpack))
+                        .copied()
+                        .flatten()
+                        .is_some_and(|operand| {
+                            let fact = lowering_operand_fact(value_flow, constants, operand);
+                            fact.certainty != crate::region_ir::SsaCertainty::Unknown
+                                && fact.class == SsaValueClass::ArrayHandle
+                        })
+                {
+                    assumptions
+                        .proven_array_calls
+                        .insert(instruction.continuation_id);
+                }
+                if matches!(
+                    stable_builtin_array_aggregate(&call.target),
+                    Some(StableArrayAggregateBuiltin::Count | StableArrayAggregateBuiltin::SizeOf)
+                ) && direct_fixed_builtin_operand(call, 0).is_some_and(|operand| {
+                    let fact = lowering_operand_fact(value_flow, constants, operand);
+                    fact.certainty != crate::region_ir::SsaCertainty::Unknown
+                        && fact.class == SsaValueClass::ArrayHandle
+                }) {
+                    assumptions
+                        .proven_array_calls
+                        .insert(instruction.continuation_id);
+                }
+            }
+            RegionInstructionKind::Binary {
+                dst: _,
+                op,
+                lhs,
+                rhs,
+            } if matches!(
+                op,
+                RegionBinaryOp::BitAnd | RegionBinaryOp::BitOr | RegionBinaryOp::BitXor
+            ) && [lhs, rhs].into_iter().all(|operand| {
+                let fact = publication_operand_fact(operand);
+                fact.certainty != crate::region_ir::SsaCertainty::Unknown
+                    && fact.class == SsaValueClass::Int
+            }) =>
+            {
+                // Integer bitwise operations are intrinsically total.
+                assumptions
+                    .proven_binary_instructions
+                    .insert(instruction.continuation_id);
+                assumptions.binary_operand_classes.insert(
+                    instruction.continuation_id,
+                    (SsaValueClass::Int, SsaValueClass::Int),
+                );
+                assumptions.fixed_value_allocations =
+                    assumptions.fixed_value_allocations.saturating_add(1);
+            }
+            RegionInstructionKind::Binary {
+                op: RegionBinaryOp::Add | RegionBinaryOp::Sub | RegionBinaryOp::Mul,
+                lhs,
+                rhs,
+                ..
+            } if publication_operand_is_numeric(lhs) && publication_operand_is_numeric(rhs) => {
+                assumptions
+                    .proven_binary_instructions
+                    .insert(instruction.continuation_id);
+                assumptions
+                    .proven_numeric_binary_instructions
+                    .insert(instruction.continuation_id);
+                assumptions.fixed_value_allocations =
+                    assumptions.fixed_value_allocations.saturating_add(1);
+            }
+            RegionInstructionKind::Binary { op, .. } if op == RegionBinaryOp::Concat => {
+                // The exact concatenation leaf owns PHP's complete scalar,
+                // object-to-string, warning, and exception semantics. Generic
+                // code therefore needs no entry specialization to invoke it.
+                assumptions
+                    .proven_binary_instructions
+                    .insert(instruction.continuation_id);
+            }
+            RegionInstructionKind::InitStaticLocal { default, .. } => {
+                // A cold publication normally installs this request-owned
+                // reference first. Generic remains locally total when an
+                // on-demand generated callee becomes reachable after that
+                // publication boundary, so reserve its one initialization
+                // cell (plus native literal storage) up front.
+                assumptions.fixed_value_allocations =
+                    assumptions.fixed_value_allocations.saturating_add(1);
+                if let RegionOperand::Constant(index) = default
+                    && let Some(IrConstant::StringBytes(bytes)) = constants.get(index as usize)
+                {
+                    assumptions.fixed_value_allocations =
+                        assumptions.fixed_value_allocations.saturating_add(1);
+                    assumptions.fixed_string_bytes =
+                        assumptions.fixed_string_bytes.saturating_add(bytes.len());
+                }
+            }
+            RegionInstructionKind::NewArray { dst } => {
+                assumptions
+                    .proven_array_instructions
+                    .insert(instruction.continuation_id);
+                assumptions
+                    .fresh_array_instructions
+                    .insert(instruction.continuation_id);
+                let Some(capacity) = insert_totals
+                    .get(&dst)
+                    .copied()
+                    .unwrap_or(0)
+                    .max(crate::JIT_NATIVE_DIRECT_ARRAY_INITIAL_CAPACITY as usize)
+                    .checked_next_power_of_two()
+                    .filter(|capacity| *capacity <= crate::JIT_NATIVE_DIRECT_ARRAY_ENTRY_CAPACITY)
+                else {
+                    continue;
+                };
+                assumptions.fresh_array_capacities.insert(
+                    instruction.continuation_id,
+                    u32::try_from(capacity).expect("direct array capacity is bounded"),
+                );
+                assumptions.fixed_value_allocations =
+                    assumptions.fixed_value_allocations.saturating_add(1);
+                assumptions.fixed_array_entries =
+                    assumptions.fixed_array_entries.saturating_add(capacity);
+            }
+            RegionInstructionKind::ArrayInsert { .. }
+            | RegionInstructionKind::ArraySpread { .. } => {
+                assumptions
+                    .proven_array_instructions
+                    .insert(instruction.continuation_id);
+                assumptions
+                    .fresh_array_instructions
+                    .insert(instruction.continuation_id);
+            }
+            _ => {}
+        }
+    }
+    assumptions
+}
+
+fn generic_terminator_requires_return_check(
+    region: &RegionGraph,
+    terminator: &RegionTerminator,
+    constants: &[IrConstant],
+    value_flow: &ExecutableValueFlow,
+) -> bool {
+    if region.flags.is_generator || region.return_type.is_none() {
+        return false;
+    }
+    let return_type = region
+        .return_type
+        .as_ref()
+        .expect("typed return checked above");
+    match terminator {
+        RegionTerminator::Return {
+            value,
+            finally: None,
+        } => !crate::region_ir::generated_fact_satisfies_type(
+            lowering_operand_fact(value_flow, constants, *value),
+            return_type,
+        ),
+        RegionTerminator::ReturnReference { finally: None, .. } => true,
+        RegionTerminator::Jump { .. }
+        | RegionTerminator::JumpIfFalse { .. }
+        | RegionTerminator::JumpIfTrue { .. }
+        | RegionTerminator::JumpIf { .. }
+        | RegionTerminator::Return {
+            finally: Some(_), ..
+        }
+        | RegionTerminator::ReturnReference {
+            finally: Some(_), ..
+        }
+        | RegionTerminator::Exit { .. } => false,
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -9103,10 +10269,10 @@ impl NativeFunctionFragmentLayout {
                             uses.into_iter()
                                 .filter(|register| !block_definitions.contains(register)),
                         );
-                        if instruction_has_sparse_snapshot(
-                            instruction,
-                            region.compile_metadata.tier,
-                        ) {
+                        if register_liveness
+                            .transition_live
+                            .contains_key(&instruction.continuation_id)
+                        {
                             registers.extend(
                                 register_liveness
                                     .transition_live
@@ -9314,7 +10480,8 @@ fn optimizing_compiled_call_params<'a>(
         RegionCallTarget::Function {
             name,
             function: None,
-        } => (Some(name.as_str()), None),
+            linked_function,
+        } => (Some(name.as_str()), *linked_function),
         RegionCallTarget::Method {
             function: None,
             linked_function: Some(link_index),
@@ -9353,6 +10520,134 @@ fn direct_fixed_builtin_operand(call: &RegionNativeCall, index: usize) -> Option
                 .copied()
                 .flatten()
         })
+}
+
+fn operand_is_proven_non_object(
+    region: &RegionGraph,
+    value_flow: &ExecutableValueFlow,
+    constants: &[IrConstant],
+    operand: RegionOperand,
+    visiting: &mut BTreeSet<LocalId>,
+) -> bool {
+    let fact = lowering_operand_fact(value_flow, constants, operand);
+    if fact.certainty != crate::region_ir::SsaCertainty::Unknown {
+        return !matches!(
+            fact.class,
+            SsaValueClass::ObjectHandle
+                | SsaValueClass::ReferenceHandle
+                | SsaValueClass::MixedHandle
+        );
+    }
+    match operand {
+        RegionOperand::Local(local) => {
+            local_is_proven_non_object(region, value_flow, constants, local, visiting)
+        }
+        RegionOperand::Register(register) => region
+            .blocks
+            .iter()
+            .flat_map(|block| &block.instructions)
+            .find_map(|instruction| match instruction.kind {
+                RegionInstructionKind::LoadLocal { dst, local, .. } if dst == register => Some(
+                    local_is_proven_non_object(region, value_flow, constants, local, visiting),
+                ),
+                RegionInstructionKind::Move { dst, src } if dst == register => Some(
+                    operand_is_proven_non_object(region, value_flow, constants, src, visiting),
+                ),
+                _ => None,
+            })
+            .unwrap_or(false),
+        RegionOperand::I64(_)
+        | RegionOperand::Constant(_)
+        | RegionOperand::LinkedConstant { .. } => false,
+    }
+}
+
+fn local_is_proven_non_object(
+    region: &RegionGraph,
+    value_flow: &ExecutableValueFlow,
+    constants: &[IrConstant],
+    local: LocalId,
+    visiting: &mut BTreeSet<LocalId>,
+) -> bool {
+    if !visiting.insert(local) {
+        return false;
+    }
+    let declared_non_object = region
+        .params
+        .iter()
+        .find(|parameter| parameter.local == local)
+        .and_then(|parameter| parameter.type_.as_ref())
+        .is_some_and(|type_| {
+            publication_type_fact(type_).is_some_and(|fact| {
+                !matches!(
+                    fact.class,
+                    SsaValueClass::ObjectHandle
+                        | SsaValueClass::ReferenceHandle
+                        | SsaValueClass::MixedHandle
+                )
+            })
+        });
+    let bound_source = region
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .find_map(|instruction| match instruction.kind {
+            RegionInstructionKind::BindReference { target, source } if target == local => {
+                Some(source)
+            }
+            _ => None,
+        });
+    let stores = region
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .filter_map(|instruction| match instruction.kind {
+            RegionInstructionKind::StoreLocal { local: target, src }
+            | RegionInstructionKind::AssignLocalResult {
+                local: target,
+                value: src,
+                ..
+            } if target == local => Some(src),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let result = declared_non_object
+        || bound_source.is_some_and(|source| {
+            local_is_proven_non_object(region, value_flow, constants, source, visiting)
+        })
+        || !stores.is_empty()
+            && stores.into_iter().all(|operand| {
+                operand_is_proven_non_object(region, value_flow, constants, operand, visiting)
+            });
+    visiting.remove(&local);
+    result
+}
+
+fn countable_object_is_possible(
+    region: &RegionGraph,
+    instruction: &RegionInstruction,
+    value_flow: &ExecutableValueFlow,
+    constants: &[IrConstant],
+) -> bool {
+    let RegionInstructionKind::NativeCall(call) = &instruction.kind else {
+        return true;
+    };
+    if !matches!(
+        stable_builtin_array_aggregate(&call.target),
+        Some(StableArrayAggregateBuiltin::Count | StableArrayAggregateBuiltin::SizeOf)
+    ) {
+        return true;
+    }
+    let mut visiting = BTreeSet::new();
+    let proven_non_object =
+        if let Some(local) = call.args.first().and_then(|argument| argument.by_ref_local) {
+            local_is_proven_non_object(region, value_flow, constants, local, &mut visiting)
+        } else {
+            direct_fixed_builtin_operand(call, 0).is_some_and(|operand| {
+                operand_is_proven_non_object(region, value_flow, constants, operand, &mut visiting)
+            })
+        };
+    !proven_non_object
 }
 
 fn optimizing_strval_uses_float_handler(
@@ -9507,6 +10802,87 @@ fn native_transition_successors(terminator: &RegionTerminator) -> Vec<BlockId> {
     }
 }
 
+fn instruction_can_require_local_generic_continuation(kind: &RegionInstructionKind) -> bool {
+    matches!(
+        kind,
+        RegionInstructionKind::Binary { .. }
+            | RegionInstructionKind::Compare { .. }
+            | RegionInstructionKind::Echo { .. }
+            | RegionInstructionKind::Unary { .. }
+            | RegionInstructionKind::Cast { .. }
+            | RegionInstructionKind::EmptyLocal { .. }
+            | RegionInstructionKind::InitStaticLocal { .. }
+            | RegionInstructionKind::FetchConst { .. }
+            | RegionInstructionKind::NewArray { .. }
+            | RegionInstructionKind::CloneObject { .. }
+            | RegionInstructionKind::CloneWith { .. }
+            | RegionInstructionKind::ArrayInsert { .. }
+            | RegionInstructionKind::ArraySpread { .. }
+            | RegionInstructionKind::FetchDim { .. }
+            | RegionInstructionKind::AssignDim { .. }
+            | RegionInstructionKind::AppendDim { .. }
+            | RegionInstructionKind::UnsetDim { .. }
+            | RegionInstructionKind::IssetDim { .. }
+            | RegionInstructionKind::EmptyDim { .. }
+            | RegionInstructionKind::FetchProperty { .. }
+            | RegionInstructionKind::AssignProperty { .. }
+            | RegionInstructionKind::BindReference { .. }
+            | RegionInstructionKind::BindReferenceDim { .. }
+            | RegionInstructionKind::BindReferenceIntoDim { .. }
+            | RegionInstructionKind::BindReferenceProperty { .. }
+            | RegionInstructionKind::BindReferenceFromProperty { .. }
+            | RegionInstructionKind::BindReferenceFromPropertyDim { .. }
+            | RegionInstructionKind::BindReferenceIntoPropertyDim { .. }
+            | RegionInstructionKind::BindReferenceDimFromProperty { .. }
+            | RegionInstructionKind::ForeachInit { .. }
+            | RegionInstructionKind::ForeachInitRef { .. }
+            | RegionInstructionKind::ForeachNext { .. }
+            | RegionInstructionKind::ForeachNextRef { .. }
+            | RegionInstructionKind::ForeachCleanup { .. }
+            | RegionInstructionKind::ArrayCallback(_)
+            | RegionInstructionKind::PregCallbackArray(_)
+            | RegionInstructionKind::NativeCall(_)
+            | RegionInstructionKind::NativeControl(_)
+            | RegionInstructionKind::NativeDynamicCode(_)
+    )
+}
+
+pub(super) fn local_generic_boundary_for_rejection(
+    region: &RegionGraph,
+    rejection_continuation: u32,
+) -> Option<u32> {
+    let instructions = region
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .collect::<Vec<_>>();
+    let rejected_index = instructions
+        .iter()
+        .position(|instruction| instruction.continuation_id == rejection_continuation)?;
+    let rejected = instructions[rejected_index];
+    if instruction_can_require_local_generic_continuation(&rejected.kind) {
+        return Some(rejected.continuation_id);
+    }
+    if !matches!(
+        rejected.kind,
+        RegionInstructionKind::LoadLocal { .. }
+            | RegionInstructionKind::StoreLocal { .. }
+            | RegionInstructionKind::AssignLocalResult { .. }
+    ) {
+        return None;
+    }
+    // Request-scope locals can lose their entry COW/publication fact only
+    // after an earlier semantic boundary. Leave before the nearest such
+    // instruction so Generic executes that effect exactly once and naturally
+    // owns every subsequent request-local read/write. This avoids publishing
+    // resume blocks for every SSA-plain local operation.
+    instructions[..rejected_index]
+        .iter()
+        .rev()
+        .find(|instruction| instruction_can_require_local_generic_continuation(&instruction.kind))
+        .map(|instruction| instruction.continuation_id)
+}
+
 pub(super) fn instruction_has_native_transition(
     instruction: &RegionInstruction,
     tier: NativeCompilerTier,
@@ -9523,43 +10899,11 @@ pub(super) fn instruction_has_native_transition(
     if instruction.optimizer_transition_entry {
         return true;
     }
-    if crate::region_ir::generic_instruction_lowering(&instruction.source_kind).requires_safepoint {
-        return true;
-    }
-    // Checked binary operations can request a baseline retry. A userland call
-    // also needs a caller continuation when its callee suspends (for example a
-    // Fiber::suspend nested below the call); throw and exit still unwind
-    // terminally through the handler table. These are real resumable
-    // safepoints, not instruction-per-resume entries.
-    matches!(
-        instruction.kind,
-        RegionInstructionKind::Binary { .. }
-            | RegionInstructionKind::Unary { .. }
-            | RegionInstructionKind::LoadLocal { .. }
-            | RegionInstructionKind::StoreLocal { .. }
-            | RegionInstructionKind::AssignLocalResult { .. }
-            | RegionInstructionKind::Discard { .. }
-            | RegionInstructionKind::IssetLocal { .. }
-            | RegionInstructionKind::EmptyLocal { .. }
-            | RegionInstructionKind::UnsetLocal { .. }
-            | RegionInstructionKind::NewArray { .. }
-            | RegionInstructionKind::ArrayInsert { .. }
-            | RegionInstructionKind::AppendDim { .. }
-            | RegionInstructionKind::IssetDim { .. }
-            | RegionInstructionKind::EmptyDim { .. }
-            | RegionInstructionKind::FetchDim {
-                mode: php_ir::instruction::DimFetchMode::Read,
-                ..
-            }
-            | RegionInstructionKind::ForeachInit { .. }
-            | RegionInstructionKind::ForeachNext { .. }
-            | RegionInstructionKind::ForeachCleanup { .. }
-            | RegionInstructionKind::FetchProperty { .. }
-            | RegionInstructionKind::ArrayCallback(_)
-            | RegionInstructionKind::PregCallbackArray(_)
-            | RegionInstructionKind::NativeCall(_)
-            | RegionInstructionKind::NativeDynamicCode(_)
-    )
+    // Only families whose optional optimizing admission can select a local
+    // Generic boundary get a same-instruction resume entry. Elemental locals,
+    // moves, releases, and already-total direct operations remain straight-line
+    // Generic code rather than an instruction-per-block compatibility executor.
+    instruction_can_require_local_generic_continuation(&instruction.kind)
 }
 
 fn instruction_has_sparse_snapshot(
@@ -9812,7 +11156,16 @@ fn native_register_live_in(region: &RegionGraph) -> BTreeMap<BlockId, BTreeSet<R
     loop {
         let mut changed = false;
         for (index, block) in region.blocks.iter().enumerate().rev() {
-            let mut live = native_transition_successors(&block.terminator)
+            let mut successors = native_transition_successors(&block.terminator)
+                .into_iter()
+                .collect::<BTreeSet<_>>();
+            for handler in &region.exception_regions {
+                if handler.protected_blocks.contains(&block.id) {
+                    successors.extend(handler.catch);
+                    successors.extend(handler.finally);
+                }
+            }
+            let mut live = successors
                 .into_iter()
                 .filter_map(|successor| block_indices.get(&successor).copied())
                 .flat_map(|successor| live_in[successor].iter().copied())
@@ -9858,6 +11211,22 @@ struct NativeRegisterLiveness {
 impl NativeRegisterLiveness {
     fn analyze(region: &RegionGraph) -> Self {
         let block_live_in = native_register_live_in(region);
+        let mut exceptional_live = BTreeMap::<BlockId, BTreeSet<RegId>>::new();
+        for handler in &region.exception_regions {
+            let handler_live = handler
+                .catch
+                .into_iter()
+                .chain(handler.finally)
+                .filter_map(|target| block_live_in.get(&target))
+                .flat_map(|registers| registers.iter().copied())
+                .collect::<BTreeSet<_>>();
+            for protected in &handler.protected_blocks {
+                exceptional_live
+                    .entry(*protected)
+                    .or_default()
+                    .extend(handler_live.iter().copied());
+            }
+        }
         let mut transition_live = BTreeMap::new();
         for block in &region.blocks {
             let mut live = native_transition_successors(&block.terminator)
@@ -9867,13 +11236,20 @@ impl NativeRegisterLiveness {
                 .collect::<BTreeSet<_>>();
             live.extend(block.terminator.register_uses());
             if block_terminator_has_native_transition(block, region.compile_metadata.tier) {
-                transition_live.insert(
-                    block.terminator_continuation_id,
-                    block
-                        .terminator_live_registers
-                        .clone()
-                        .unwrap_or_else(|| live.iter().copied().collect()),
+                let mut snapshot = block
+                    .terminator_live_registers
+                    .clone()
+                    .unwrap_or_else(|| live.iter().copied().collect::<Vec<_>>());
+                snapshot.extend(
+                    exceptional_live
+                        .get(&block.id)
+                        .into_iter()
+                        .flatten()
+                        .copied(),
                 );
+                snapshot.sort_unstable();
+                snapshot.dedup();
+                transition_live.insert(block.terminator_continuation_id, snapshot);
             }
             for instruction in block.instructions.iter().rev() {
                 for defined in region_instruction_defined_registers(&instruction.kind) {
@@ -9887,14 +11263,23 @@ impl NativeRegisterLiveness {
                         .flatten()
                         .copied(),
                 );
-                if instruction_has_sparse_snapshot(instruction, region.compile_metadata.tier) {
-                    transition_live.insert(
-                        instruction.continuation_id,
-                        instruction
-                            .transition_live_registers
-                            .clone()
-                            .unwrap_or_else(|| live.iter().copied().collect()),
+                if instruction_has_sparse_snapshot(instruction, region.compile_metadata.tier)
+                    || exceptional_live.contains_key(&block.id)
+                {
+                    let mut snapshot = instruction
+                        .transition_live_registers
+                        .clone()
+                        .unwrap_or_else(|| live.iter().copied().collect::<Vec<_>>());
+                    snapshot.extend(
+                        exceptional_live
+                            .get(&block.id)
+                            .into_iter()
+                            .flatten()
+                            .copied(),
                     );
+                    snapshot.sort_unstable();
+                    snapshot.dedup();
+                    transition_live.insert(instruction.continuation_id, snapshot);
                 }
             }
         }
@@ -9915,10 +11300,6 @@ fn ir_function_requires_non_reference_trampoline(function: &php_ir::IrFunction) 
             matches!(
                 instruction.kind,
                 php_ir::InstructionKind::Yield { .. } | php_ir::InstructionKind::YieldFrom { .. }
-            ) || matches!(
-                &instruction.kind,
-                php_ir::InstructionKind::CallFunction { name, .. }
-                    if name.trim_start_matches('\\').eq_ignore_ascii_case("debug_backtrace")
             )
         })
     }) || function.attributes.iter().any(|attribute| {
@@ -9947,24 +11328,7 @@ fn ir_function_has_exception_handler(function: &php_ir::IrFunction) -> bool {
     })
 }
 
-fn declare_baseline_value_operation(
-    module: &mut JITModule,
-    symbol: &str,
-    arity: u8,
-    address: usize,
-) -> Result<NativeHelper, CraneliftLoweringError> {
-    let pointer_type = module.target_config().pointer_type();
-    let mut signature = module.make_signature();
-    signature.params.push(AbiParam::new(types::I32));
-    for _ in 0..arity {
-        signature.params.push(AbiParam::new(types::I64));
-    }
-    signature.params.push(AbiParam::new(pointer_type));
-    signature.returns.push(AbiParam::new(types::I32));
-    declare_native_helper(module, symbol, &signature, address)
-}
-
-fn declare_exact_value_operation(
+fn declare_native_value_contract(
     module: &mut JITModule,
     symbol: &str,
     arity: u8,
@@ -10001,7 +11365,6 @@ fn declare_native_helper(
     Ok(NativeHelper {
         function,
         terminal_exit: None,
-        inline_runtime_view: false,
         runtime: None,
     })
 }
@@ -10024,7 +11387,6 @@ fn declare_native_pure_handler(
     Ok(NativeHelper {
         function,
         terminal_exit: None,
-        inline_runtime_view: false,
         runtime: None,
     })
 }
@@ -10078,28 +11440,37 @@ pub(super) fn compile_region_graph_native(
         region.compile_metadata.tier,
     )
     .mode();
-    let baseline_helper_imports = compilation_mode
-        == crate::cranelift_lowering::generic_streaming::NativeCompilationMode::StreamingGeneric;
-    let fragment_layout = (plan.fragments.len() > 1
-        || regions
-            .values()
-            .any(|candidate| candidate.compile_metadata.tier == NativeCompilerTier::Generic))
-    .then(|| NativeFunctionFragmentLayout::for_plan(region, &plan))
-    .transpose()?;
+    let baseline_helper_imports = compilation_mode.is_generic();
+    let fragment_layout = (plan.fragments.len() > 1)
+        .then(|| NativeFunctionFragmentLayout::for_plan(region, &plan))
+        .transpose()?;
     let selected_plan = std::cell::RefCell::new(plan.clone());
     let selected_fragment_layout = std::cell::RefCell::new(fragment_layout.clone());
     // Value-flow and executable SSA describe the PHP function, not one native
     // fragment. Build them exactly once after tier selection and Region-block
     // splitting. Recomputing the complete dominator/phi graph inside every
     // fragment lowering made fragmentation multiply whole-function analysis.
+    let function_return_facts = unit
+        .functions
+        .iter()
+        .enumerate()
+        .filter_map(|(index, function)| {
+            let function_id = u32::try_from(index).ok().map(FunctionId::new)?;
+            (!function.returns_by_ref)
+                .then(|| function.return_type.as_ref())
+                .flatten()
+                .and_then(crate::region_ir::value_flow::generated_call_return_fact)
+                .map(|fact| (function_id, fact))
+        })
+        .collect::<BTreeMap<_, _>>();
     let value_flows = regions
         .iter()
         .map(|(function, candidate)| {
-            let flow = if candidate.compile_metadata.tier == NativeCompilerTier::Optimizing {
-                crate::region_ir::analyze_executable_value_flow(candidate, &unit.constants)
-            } else {
-                crate::region_ir::analyze_generic_value_ownership(candidate)
-            };
+            let flow = crate::region_ir::analyze_executable_value_flow_with_function_returns(
+                candidate,
+                &unit.constants,
+                &function_return_facts,
+            );
             flow.verify_ownership(candidate).map_err(|error| {
                 CraneliftLoweringError::new("JIT_CRANELIFT_REJECT_OWNERSHIP", error)
             })?;
@@ -10182,44 +11553,6 @@ pub(super) fn compile_region_graph_native(
             call.args.iter().all(|argument| !argument.unpack)
                 && call.direct_compiled_target().is_some_and(resolver_target)
         })
-    });
-    let is_direct_linked_call = |call: &RegionNativeCall| {
-        direct_linked_signature(call, &request.external_function_signatures).is_some()
-    };
-    let is_direct_linked_variadic_call = |call: &RegionNativeCall| {
-        direct_linked_signature(call, &request.external_function_signatures)
-            .and_then(|signature| signature.native_params.last())
-            .is_some_and(|parameter| parameter.variadic)
-    };
-    let needs_call_trampoline = regions.values().any(|region| {
-        region_contains(region, |kind| {
-            matches!(
-                kind,
-                RegionInstructionKind::NativeCall(call)
-                    if call.direct_compiled_target().is_none()
-                        && !matches!(call.target, RegionCallTarget::Semantic { .. })
-                        && baseline_builtin_helper_id(&call.target).is_none()
-                        && !is_direct_linked_call(call)
-            )
-        }) || region
-            .direct_callees()
-            .iter()
-            .any(|callee| !regions.contains_key(callee) && !resolver_target(*callee))
-            || region_contains(region, |kind| {
-                matches!(
-                    kind,
-                    RegionInstructionKind::NativeCall(call)
-                        if !matches!(call.target, RegionCallTarget::Semantic { .. })
-                            && baseline_builtin_helper_id(&call.target).is_none()
-                            && (matches!(call.result, RegionCallResult::ReferenceLocal(_))
-                            || call.args.iter().any(|argument| {
-                                argument.name.is_some() || argument.unpack
-                            })
-                            || call
-                                .direct_compiled_target()
-                                .is_some_and(|target| trampoline_functions.contains(&target)))
-                )
-            })
     });
     // Exact services are tier-shared.  Shadow the tier flag while collecting
     // their fixed-symbol requirements so Generic and Optimizing publish the
@@ -10347,27 +11680,34 @@ pub(super) fn compile_region_graph_native(
         std::array::from_fn(|index| {
             !baseline_helper_imports
                 && regions.iter().any(|(function, region)| {
-                    let value_flow = &value_flows[function];
-                    region_contains(region, |kind| {
-                        matches!(kind, RegionInstructionKind::NativeCall(call)
-                        if stable_builtin_array_aggregate(&call.target)
-                            .is_some_and(|builtin| builtin.index() == index)
-                            && !(matches!(
-                                stable_builtin_array_aggregate(&call.target),
-                                Some(
-                                    StableArrayAggregateBuiltin::Count
-                                        | StableArrayAggregateBuiltin::SizeOf
-                                )
-                            ) && (call.args.len() == 1
-                                || call.args.len() == 2
-                                    && direct_fixed_builtin_operand(call, 1).is_some_and(
-                                        |mode| value_flow
-                                            .operand_fact(&unit.constants, mode)
-                                            .integer_range
-                                            == Some(
-                                                crate::region_ir::SsaIntegerRange::exact(0),
-                                            ),
-                                    ))))
+                    region.blocks.iter().any(|block| {
+                        block.instructions.iter().any(|instruction| {
+                            let RegionInstructionKind::NativeCall(call) = &instruction.kind else {
+                                return false;
+                            };
+                            let Some(builtin) = stable_builtin_array_aggregate(&call.target) else {
+                                return false;
+                            };
+                            if builtin.index() != index {
+                                return false;
+                            }
+                            if matches!(
+                                builtin,
+                                StableArrayAggregateBuiltin::Count
+                                    | StableArrayAggregateBuiltin::SizeOf
+                            ) && direct_fixed_builtin_operand(call, 0).is_some_and(|operand| {
+                                let fact = lowering_operand_fact(
+                                    &value_flows[function],
+                                    &unit.constants,
+                                    operand,
+                                );
+                                fact.certainty != crate::region_ir::SsaCertainty::Unknown
+                                    && fact.class == SsaValueClass::ArrayHandle
+                            }) {
+                                return false;
+                            }
+                            true
+                        })
                     })
                 })
         });
@@ -10592,6 +11932,16 @@ pub(super) fn compile_region_graph_native(
                     })
                 })
         });
+    let needs_exact_fileinfo: [bool; StableFileinfoBuiltin::COUNT] = std::array::from_fn(|index| {
+        !baseline_helper_imports
+            && regions.values().any(|region| {
+                region_contains(region, |kind| {
+                    matches!(kind, RegionInstructionKind::NativeCall(call)
+                            if stable_builtin_fileinfo(&call.target)
+                                .is_some_and(|builtin| builtin.index() == index))
+                })
+            })
+    });
     let needs_exact_error_state: [bool; StableErrorStateBuiltin::COUNT] =
         std::array::from_fn(|index| {
             !baseline_helper_imports
@@ -10784,6 +12134,231 @@ pub(super) fn compile_region_graph_native(
                     })
                 })
         });
+    let needs_exact_var_dump = !baseline_helper_imports
+        && regions.values().any(|region| {
+            region_contains(region, |kind| {
+                matches!(kind, RegionInstructionKind::NativeCall(call)
+                    if stable_builtin_var_dump(&call.target) && !call.args.is_empty())
+            })
+        });
+    let needs_exact_var_export = !baseline_helper_imports
+        && regions.values().any(|region| {
+            region_contains(region, |kind| {
+                matches!(kind, RegionInstructionKind::NativeCall(call)
+                    if stable_builtin_var_export(&call.target)
+                        && (1..=2).contains(&call.args.len()))
+            })
+        });
+    let needs_exact_mysqli_set_charset = !baseline_helper_imports
+        && regions.values().any(|region| {
+            region_contains(region, |kind| {
+                matches!(kind, RegionInstructionKind::NativeCall(call)
+                    if stable_builtin_mysqli_set_charset(&call.target)
+                        && call.args.len() == 2)
+            })
+        });
+    let needs_exact_mysqli_query = !baseline_helper_imports
+        && regions.values().any(|region| {
+            region_contains(region, |kind| {
+                matches!(kind, RegionInstructionKind::NativeCall(call)
+                    if stable_builtin_mysqli_query(&call.target) && call.args.len() == 2)
+            })
+        });
+    let needs_exact_mysqli_fetch_array = !baseline_helper_imports
+        && regions.values().any(|region| {
+            region_contains(region, |kind| {
+                matches!(kind, RegionInstructionKind::NativeCall(call)
+                    if stable_builtin_mysqli_fetch_array(&call.target)
+                        && (1..=2).contains(&call.args.len()))
+            })
+        });
+    let needs_exact_mysqli_fetch_object = !baseline_helper_imports
+        && regions.values().any(|region| {
+            region_contains(region, |kind| {
+                matches!(kind, RegionInstructionKind::NativeCall(call)
+                    if stable_builtin_mysqli_fetch_object(&call.target)
+                        && (1..=3).contains(&call.args.len()))
+            })
+        });
+    let needs_exact_mysqli_character_set_name = !baseline_helper_imports
+        && regions.values().any(|region| {
+            region_contains(region, |kind| {
+                matches!(kind, RegionInstructionKind::NativeCall(call)
+                    if stable_builtin_mysqli_character_set_name(&call.target)
+                        && call.args.len() == 1)
+            })
+        });
+    let needs_exact_mysqli_result_count: [bool; StableMysqliResultCountBuiltin::COUNT] =
+        std::array::from_fn(|index| {
+            !baseline_helper_imports
+                && regions.values().any(|region| {
+                    region_contains(region, |kind| {
+                        matches!(kind, RegionInstructionKind::NativeCall(call)
+                        if call.args.len() == 1
+                            && stable_builtin_mysqli_result_count(&call.target)
+                                .is_some_and(|operation| operation.index() == index))
+                    })
+                })
+        });
+    let needs_exact_mysqli_fetch_field = !baseline_helper_imports
+        && regions.values().any(|region| {
+            region_contains(region, |kind| {
+                matches!(kind, RegionInstructionKind::NativeCall(call)
+                    if stable_builtin_mysqli_fetch_field(&call.target)
+                        && call.args.len() == 1)
+            })
+        });
+    let needs_exact_mysqli_connect_status: [bool; StableMysqliConnectStatusBuiltin::COUNT] =
+        std::array::from_fn(|index| {
+            !baseline_helper_imports
+                && regions.values().any(|region| {
+                    region_contains(region, |kind| {
+                        matches!(kind, RegionInstructionKind::NativeCall(call)
+                        if call.args.is_empty()
+                            && stable_builtin_mysqli_connect_status(&call.target)
+                                .is_some_and(|operation| operation.index() == index))
+                    })
+                })
+        });
+    let needs_exact_mysqli_close = !baseline_helper_imports
+        && regions.values().any(|region| {
+            region_contains(region, |kind| {
+                matches!(kind, RegionInstructionKind::NativeCall(call)
+                    if stable_builtin_mysqli_close(&call.target)
+                        && call.args.len() == 1)
+            })
+        });
+    let needs_exact_mysqli_get_server_info = !baseline_helper_imports
+        && regions.values().any(|region| {
+            region_contains(region, |kind| {
+                matches!(kind, RegionInstructionKind::NativeCall(call)
+                    if stable_builtin_mysqli_get_server_info(&call.target)
+                        && call.args.len() == 1)
+            })
+        });
+    let needs_exact_mysqli_select_db = !baseline_helper_imports
+        && regions.values().any(|region| {
+            region_contains(region, |kind| {
+                matches!(kind, RegionInstructionKind::NativeCall(call)
+                    if stable_builtin_mysqli_select_db(&call.target) && call.args.len() == 2)
+            })
+        });
+    let needs_exact_mysqli_real_escape_string = !baseline_helper_imports
+        && regions.values().any(|region| {
+            region_contains(region, |kind| {
+                matches!(kind, RegionInstructionKind::NativeCall(call)
+                    if stable_builtin_mysqli_real_escape_string(&call.target)
+                        && call.args.len() == 2)
+            })
+        });
+    let needs_exact_mysqli_connection_status: [bool; StableMysqliConnectionStatusBuiltin::COUNT] =
+        std::array::from_fn(|index| {
+            !baseline_helper_imports
+                && regions.values().any(|region| {
+                    region_contains(region, |kind| {
+                        matches!(kind, RegionInstructionKind::NativeCall(call)
+                        if call.args.len() == 1
+                            && stable_builtin_mysqli_connection_status(&call.target)
+                                .is_some_and(|operation| operation.index() == index))
+                    })
+                })
+        });
+    let needs_exact_mysqli_free_result = !baseline_helper_imports
+        && regions.values().any(|region| {
+            region_contains(region, |kind| {
+                matches!(kind, RegionInstructionKind::NativeCall(call)
+                    if stable_builtin_mysqli_free_result(&call.target)
+                        && call.args.len() == 1)
+            })
+        });
+    let needs_exact_mysqli_more_results = !baseline_helper_imports
+        && regions.values().any(|region| {
+            region_contains(region, |kind| {
+                matches!(kind, RegionInstructionKind::NativeCall(call)
+                    if stable_builtin_mysqli_more_results(&call.target)
+                        && call.args.len() == 1)
+            })
+        });
+    let needs_exact_mysqli_next_result = !baseline_helper_imports
+        && regions.values().any(|region| {
+            region_contains(region, |kind| {
+                matches!(kind, RegionInstructionKind::NativeCall(call)
+                    if stable_builtin_mysqli_next_result(&call.target)
+                        && call.args.len() == 1)
+            })
+        });
+    let needs_exact_mysqli_report = !baseline_helper_imports
+        && regions.values().any(|region| {
+            region_contains(region, |kind| {
+                matches!(kind, RegionInstructionKind::NativeCall(call)
+                    if stable_builtin_mysqli_report(&call.target)
+                        && call.args.len() == 1)
+            })
+        });
+    let needs_exact_mysqli_init = !baseline_helper_imports
+        && regions.values().any(|region| {
+            region_contains(region, |kind| {
+                matches!(kind, RegionInstructionKind::NativeCall(call)
+                    if stable_builtin_mysqli_init(&call.target) && call.args.is_empty())
+            })
+        });
+    let needs_exact_mysqli_options = !baseline_helper_imports
+        && regions.values().any(|region| {
+            region_contains(region, |kind| {
+                matches!(kind, RegionInstructionKind::NativeCall(call)
+                    if stable_builtin_mysqli_options(&call.target) && call.args.len() == 3)
+            })
+        });
+    let needs_exact_mysqli_real_connect = !baseline_helper_imports
+        && regions.values().any(|region| {
+            region_contains(region, |kind| {
+                matches!(kind, RegionInstructionKind::NativeCall(call)
+                    if stable_builtin_mysqli_real_connect(&call.target)
+                        && (1..=8).contains(&call.args.len()))
+            })
+        });
+    let needs_exact_error_log = !baseline_helper_imports
+        && regions.values().any(|region| {
+            region_contains(region, |kind| {
+                matches!(kind, RegionInstructionKind::NativeCall(call)
+                    if stable_builtin_error_log(&call.target)
+                        && (1..=4).contains(&call.args.len()))
+            })
+        });
+    let needs_exact_sleep = !baseline_helper_imports
+        && regions.values().any(|region| {
+            region_contains(region, |kind| {
+                matches!(kind, RegionInstructionKind::NativeCall(call)
+                    if stable_builtin_sleep(&call.target) && call.args.len() == 1)
+            })
+        });
+    let needs_exact_print = !baseline_helper_imports
+        && regions.values().any(|region| {
+            region_contains(region, |kind| {
+                matches!(kind, RegionInstructionKind::NativeCall(call)
+                    if stable_builtin_print(&call.target) && call.args.len() == 1)
+            })
+        });
+    let needs_exact_print_r = !baseline_helper_imports
+        && regions.values().any(|region| {
+            region_contains(region, |kind| {
+                matches!(kind, RegionInstructionKind::NativeCall(call)
+                    if stable_builtin_print_r(&call.target)
+                        && (1..=2).contains(&call.args.len()))
+            })
+        });
+    let needs_exact_throwable_method: [bool; StableThrowableMethod::COUNT] =
+        std::array::from_fn(|index| {
+            !baseline_helper_imports
+                && regions.values().any(|region| {
+                    region_contains(region, |kind| {
+                        matches!(kind, RegionInstructionKind::NativeCall(call)
+                            if call.args.is_empty()
+                                && stable_throwable_method(&call.target)
+                                    .is_some_and(|method| method.index() == index))
+                    })
+                })
+        });
     let needs_exact_pure_math: [bool; StablePureMathBuiltin::COUNT] =
         std::array::from_fn(|index| {
             !baseline_helper_imports
@@ -10826,44 +12401,19 @@ pub(super) fn compile_region_graph_native(
                     })
                 })
         });
-    let needs_exact_semantic: [bool; RegionSemanticOperationId::COUNT] =
-        std::array::from_fn(|index| {
-            regions.values().any(|region| {
-                region_contains(region, |kind| {
-                    matches!(kind, RegionInstructionKind::NativeCall(call)
-                        if matches!(&call.target, RegionCallTarget::Semantic { operation }
-                            if operation.operation_id().index() == index))
-                })
-            })
-        });
-    let needs_frame_arena = runtime_helpers.native_frame_alloc != 0
-        && runtime_helpers.native_frame_release != 0
-        && regions.values().any(|region| {
-            region_contains(region, |kind| {
-                matches!(kind, RegionInstructionKind::NativeCall(call)
-                    if baseline_builtin_helper_id(&call.target).is_none()
-                        && !matches!(call.target, RegionCallTarget::Semantic { .. }))
-            })
-        });
-    if baseline_helper_imports
-        && needs_call_trampoline
-        && runtime_helpers.baseline_call_dispatch == 0
-    {
-        return Err(CraneliftLoweringError::new(
-            "JIT_CRANELIFT_REJECT_NATIVE_CALL_TRAMPOLINE",
-            "dynamic or complex call requires the typed native dispatch trampoline",
-        ));
-    }
+    let needs_frame_arena =
+        runtime_helpers.native_frame_alloc != 0 && runtime_helpers.native_frame_release != 0;
     let needs_dynamic_code = regions.values().any(RegionGraph::has_native_dynamic_code);
-    if baseline_helper_imports && needs_dynamic_code && runtime_helpers.native_dynamic_code == 0 {
+    if baseline_helper_imports
+        && needs_dynamic_code
+        && runtime_helpers.cold_dynamic_unit_resolve == 0
+    {
         return Err(CraneliftLoweringError::new(
             "JIT_CRANELIFT_REJECT_NATIVE_DYNAMIC_CODE",
             "include, eval, or runtime declaration requires the native dynamic-code compiler",
         ));
     }
-    let baseline_call_symbol = BASELINE_NATIVE_CALL_DISPATCH_SYMBOL.to_owned();
-    let native_function_resolve_symbol = NATIVE_FUNCTION_RESOLVE_SYMBOL.to_owned();
-    let native_dynamic_code_symbol = NATIVE_DYNAMIC_CODE_SYMBOL.to_owned();
+    let native_dynamic_code_symbol = COLD_DYNAMIC_UNIT_RESOLVE_SYMBOL.to_owned();
     let mut needs_exact_unary = [false; NATIVE_EXACT_UNARY_COUNT];
     for operation in NATIVE_EXACT_UNARY_OPERATIONS {
         needs_exact_unary[native_exact_unary_index(operation)] = regions.values().any(|region| {
@@ -10874,6 +12424,18 @@ pub(super) fn compile_region_graph_native(
                 )
             })
         });
+    }
+    let mut needs_exact_arithmetic = [false; NATIVE_EXACT_ARITHMETIC_COUNT];
+    for operation in NATIVE_EXACT_ARITHMETIC_OPERATIONS {
+        needs_exact_arithmetic[native_exact_arithmetic_index(operation)] =
+            regions.values().any(|region| {
+                region_contains(region, |kind| {
+                    matches!(
+                        kind,
+                        RegionInstructionKind::Binary { op, .. } if *op == operation
+                    )
+                })
+            });
     }
     let mut needs_exact_compare = [false; NATIVE_EXACT_COMPARE_COUNT];
     for operation in NATIVE_EXACT_COMPARE_OPERATIONS {
@@ -10892,15 +12454,6 @@ pub(super) fn compile_region_graph_native(
                 })
             });
     }
-    let needs_exact_binary: [bool; 12] = std::array::from_fn(|index| {
-        generic_helper_imports
-            && regions.values().any(|region| {
-                region_contains(region, |kind| {
-                    matches!(kind, RegionInstructionKind::Binary { op, .. }
-                    if *op == NATIVE_EXACT_BINARY_OPERATIONS[index])
-                })
-            })
-    });
     let needs_array_union = !baseline_helper_imports
         && regions.iter().any(|(function, region)| {
             let value_flow = &value_flows[function];
@@ -10930,6 +12483,10 @@ pub(super) fn compile_region_graph_native(
                         op: RegionBinaryOp::Concat,
                         ..
                     }
+                ) || matches!(
+                    kind,
+                    RegionInstructionKind::NativeCall(call)
+                        if stable_builtin_call_user_func(&call.target)
                 )
             })
         });
@@ -10963,15 +12520,6 @@ pub(super) fn compile_region_graph_native(
             )
         })
     });
-    let needs_exact_cast: [bool; 7] = std::array::from_fn(|index| {
-        generic_helper_imports
-            && regions.values().any(|region| {
-                region_contains(region, |kind| {
-                    matches!(kind, RegionInstructionKind::Cast { op, .. }
-                        if *op == NATIVE_EXACT_CAST_OPERATIONS[index])
-                })
-            })
-    });
     let needs_float_to_string = regions.iter().any(|(function, region)| {
         let value_flow = &value_flows[function];
         region_contains(region, |kind| {
@@ -10981,6 +12529,9 @@ pub(super) fn compile_region_graph_native(
             ) || matches!(kind, RegionInstructionKind::NativeCall(call)
             if stable_builtin_array_lookup(&call.target).is_some()
                 || stable_builtin_extrema(&call.target).is_some()
+                // `strlen()` shares `echo`'s scalar string coercion, which
+                // routes a float operand through the float-to-string leaf.
+                || stable_builtin_length(&call.target) == Some(StableLengthBuiltin::String)
                 || optimizing_strval_uses_float_handler(
                     call,
                     value_flow,
@@ -11116,14 +12667,24 @@ pub(super) fn compile_region_graph_native(
                         op: RegionCastOp::String,
                         ..
                     }
-                ) || matches!(
-                    kind,
-                    RegionInstructionKind::NativeCall(call)
-                        if stable_builtin_scalar_consumer(&call.target)
-                            == Some(StableScalarConsumerBuiltin::StrVal)
-                            && call.args.len() == 1
-                            && direct_fixed_builtin_operand(call, 0).is_some()
-                )
+                ) || matches!(kind, RegionInstructionKind::Echo { .. })
+                    || matches!(
+                        kind,
+                        RegionInstructionKind::NativeCall(call)
+                            if stable_builtin_scalar_consumer(&call.target)
+                                == Some(StableScalarConsumerBuiltin::StrVal)
+                                && call.args.len() == 1
+                                && direct_fixed_builtin_operand(call, 0).is_some()
+                    )
+                    // `strlen()` counts its argument's string coercion, so an
+                    // operand that is not a proven string handle reaches the
+                    // same exact cast leaves `echo` uses.
+                    || matches!(
+                        kind,
+                        RegionInstructionKind::NativeCall(call)
+                            if stable_builtin_length(&call.target)
+                                == Some(StableLengthBuiltin::String)
+                    )
             })
         });
     let needs_callback_return_string = regions.values().any(|region| {
@@ -11167,8 +12728,27 @@ pub(super) fn compile_region_graph_native(
                     if stable_builtin_get_class(&call.target))
         })
     });
+    let needs_type_name = regions.values().any(|region| {
+        region_contains(region, |kind| {
+            matches!(kind, RegionInstructionKind::NativeCall(call)
+            if matches!(
+                stable_builtin_scalar_consumer(&call.target),
+                Some(
+                    StableScalarConsumerBuiltin::GetType
+                        | StableScalarConsumerBuiltin::GetDebugType
+                )
+            ))
+        })
+    });
     let needs_acquire_callable = !baseline_helper_imports
-        && regions.values().any(|region| {
+        && (unit.functions.iter().any(|function| {
+            function.params.iter().any(|parameter| {
+                matches!(
+                    parameter.type_.as_ref(),
+                    Some(php_ir::IrReturnType::Callable)
+                )
+            })
+        }) || regions.values().any(|region| {
             region_contains(region, |kind| {
                 matches!(
                     kind,
@@ -11176,6 +12756,47 @@ pub(super) fn compile_region_graph_native(
                         target: RegionCallTarget::Semantic {
                             operation: RegionSemanticOp::AcquireCallable { .. }
                         },
+                        ..
+                    })
+                ) || matches!(
+                    kind,
+                    RegionInstructionKind::NativeCall(RegionNativeCall {
+                        target: RegionCallTarget::Semantic {
+                            operation: RegionSemanticOp::ResolveCallable {
+                                callable: php_ir::instruction::CallableKind::FunctionName { name },
+                                ..
+                            }
+                        },
+                        ..
+                    }) if php_std::arginfo::function_metadata_indexed(
+                        name.trim_start_matches('\\')
+                    ).is_some()
+                ) || matches!(
+                    kind,
+                    RegionInstructionKind::NativeCall(RegionNativeCall {
+                        target: RegionCallTarget::Callable { .. }
+                            | RegionCallTarget::Closure { function: None, .. }
+                            | RegionCallTarget::Pipe { .. },
+                        ..
+                    })
+                ) || matches!(
+                    kind,
+                    RegionInstructionKind::NativeCall(RegionNativeCall {
+                        target: RegionCallTarget::Function { function: None, .. },
+                        ..
+                    })
+                ) || matches!(
+                    kind,
+                    RegionInstructionKind::NativeCall(RegionNativeCall {
+                        target: RegionCallTarget::Method { .. }
+                            | RegionCallTarget::StaticMethod { .. },
+                        ..
+                    })
+                ) || matches!(
+                    kind,
+                    RegionInstructionKind::NativeCall(RegionNativeCall {
+                        target: RegionCallTarget::Constructor { .. }
+                            | RegionCallTarget::DynamicConstructor { .. },
                         ..
                     })
                 ) || matches!(
@@ -11189,9 +12810,48 @@ pub(super) fn compile_region_graph_native(
                             entry.callback,
                             RegionArrayCallbackTarget::Runtime(_)
                         ))
+                ) || matches!(
+                    kind,
+                    RegionInstructionKind::CloneObject { plain: false, .. }
                 )
             })
-        });
+        }));
+    let needs_acquire_method_callable = regions.values().any(|region| {
+        region_contains(region, |kind| {
+            matches!(
+                kind,
+                RegionInstructionKind::NativeCall(RegionNativeCall {
+                    target: RegionCallTarget::Method { .. }
+                        | RegionCallTarget::StaticMethod { .. }
+                        | RegionCallTarget::Constructor { .. }
+                        | RegionCallTarget::DynamicConstructor { .. },
+                    ..
+                })
+            ) || matches!(
+                kind,
+                RegionInstructionKind::NativeCall(call)
+                    if matches!(
+                        stable_builtin_array_aggregate(&call.target),
+                        Some(StableArrayAggregateBuiltin::Count | StableArrayAggregateBuiltin::SizeOf)
+                    )
+            ) || matches!(
+                kind,
+                RegionInstructionKind::CloneObject { plain: false, .. }
+            )
+        })
+    });
+    let needs_acquire_class_plan = regions.values().any(|region| {
+        region_contains(region, |kind| {
+            matches!(
+                kind,
+                RegionInstructionKind::NativeCall(RegionNativeCall {
+                    target: RegionCallTarget::Constructor { .. }
+                        | RegionCallTarget::DynamicConstructor { .. },
+                    ..
+                })
+            )
+        })
+    });
     let needs_resolve_callable = !baseline_helper_imports
         && regions.values().any(|region| {
             region_contains(region, |kind| {
@@ -11214,58 +12874,6 @@ pub(super) fn compile_region_graph_native(
             matches!(kind, RegionInstructionKind::Echo { .. })
         })
     });
-    let needs_local_fetch = regions.values().any(|region| {
-        region_contains(region, |kind| {
-            matches!(
-                kind,
-                RegionInstructionKind::LoadLocal { .. }
-                    | RegionInstructionKind::FetchDim {
-                        array: RegionOperand::Local(_),
-                        ..
-                    }
-                    // Every baseline by-value array operand passes through
-                    // the shared reference-payload guard. Even a register or
-                    // constant can hold a compatibility reference after a
-                    // continuation resume, so these instruction families
-                    // need the cold local-fetch boundary as well.
-                    | RegionInstructionKind::ArrayInsert { .. }
-                    | RegionInstructionKind::ArraySpread { .. }
-                    | RegionInstructionKind::AssignDim { .. }
-                    | RegionInstructionKind::AppendDim { .. }
-                    | RegionInstructionKind::UnsetDim { .. }
-                    | RegionInstructionKind::BindReferenceDim { .. }
-                    | RegionInstructionKind::IssetDim { .. }
-                    | RegionInstructionKind::EmptyDim { .. }
-                    | RegionInstructionKind::IssetLocal { .. }
-                    | RegionInstructionKind::EmptyLocal { .. }
-            )
-        })
-    });
-    let needs_local_store = regions.values().any(|region| {
-        region
-            .exception_regions
-            .iter()
-            .any(|handler| handler.catch.is_some() && handler.exception_local.is_some())
-            || region_contains(region, |kind| {
-                matches!(
-                    kind,
-                    RegionInstructionKind::StoreLocal { .. }
-                        | RegionInstructionKind::AssignLocalResult { .. }
-                        | RegionInstructionKind::AssignDim { .. }
-                        | RegionInstructionKind::AppendDim { .. }
-                        | RegionInstructionKind::UnsetDim { .. }
-                        | RegionInstructionKind::BindReferenceDim { .. }
-                )
-            })
-    });
-    let needs_value_release = true;
-    // Local publication is part of the native frame ABI, not just explicit
-    // PHP reference syntax.  Stores, unsets, foreach-by-reference and array
-    // root updates can all publish a local through the same helper.  Keep the
-    // helper available for every executable region so adding publication to a
-    // lowering cannot accidentally make an otherwise supported function
-    // uncompilable.
-    let needs_reference_bind = true;
     let needs_argument_check = regions.values().any(|region| {
         region
             .params
@@ -11278,30 +12886,17 @@ pub(super) fn compile_region_graph_native(
                 .iter()
                 .any(|parameter| parameter.type_.is_some())
         }));
-    let _has_explicit_reference_bind = regions.values().any(|region| {
-        region_contains(region, |kind| {
-            matches!(
-                kind,
-                RegionInstructionKind::BindReference { .. }
-                    | RegionInstructionKind::BindReferenceDim { .. }
-                    | RegionInstructionKind::BindReferenceIntoDim { .. }
-                    | RegionInstructionKind::BindReferenceProperty { .. }
-                    | RegionInstructionKind::BindReferenceFromProperty { .. }
-                    | RegionInstructionKind::BindReferenceFromPropertyDim { .. }
-                    | RegionInstructionKind::BindReferenceIntoPropertyDim { .. }
-                    | RegionInstructionKind::BindReferenceDimFromProperty { .. }
-                    | RegionInstructionKind::InitStaticLocal { .. }
-            ) || matches!(kind, RegionInstructionKind::NativeCall(call) if
-                call.needs_local_reference_binding()
-                    || call.direct_compiled_target().is_some_and(|target| {
-                        regions.get(&target).is_some_and(|callee| {
-                            callee.params.iter().any(|parameter| parameter.by_ref)
-                        })
-                    })
+    let needs_return_check = regions.iter().any(|(function, region)| {
+        let value_flow = &value_flows[function];
+        region.blocks.iter().any(|block| {
+            generic_terminator_requires_return_check(
+                region,
+                &block.terminator,
+                &unit.constants,
+                value_flow,
             )
         })
     });
-    let needs_return_check = true;
     let needs_exception_new = regions.values().any(|region| {
         region_contains(region, |kind| {
             matches!(
@@ -11310,39 +12905,17 @@ pub(super) fn compile_region_graph_native(
             )
         })
     });
-    let needs_array_new = regions.values().any(|region| {
-        region_contains(region, |kind| {
-            matches!(kind, RegionInstructionKind::NewArray { .. })
-                || matches!(kind, RegionInstructionKind::NativeCall(call)
-                    if call.variadic || is_direct_linked_variadic_call(call))
-        })
-    });
     let needs_object_new = regions.values().any(|region| {
         region_contains(region, |kind| {
             matches!(kind, RegionInstructionKind::NewObject { .. })
-        })
-    });
-    let needs_property_fetch = regions.values().any(|region| {
-        region_contains(region, |kind| {
-            matches!(
-                kind,
-                RegionInstructionKind::FetchProperty { .. }
-                    | RegionInstructionKind::FetchDynamicStaticProperty { .. }
-                    | RegionInstructionKind::FetchObjectClassName { .. }
-                    | RegionInstructionKind::BindReferenceIntoPropertyDim { .. }
-                    | RegionInstructionKind::BindReferenceDimFromProperty { .. }
-            )
-        })
-    });
-    let needs_property_assign = regions.values().any(|region| {
-        region_contains(region, |kind| {
-            matches!(
-                kind,
-                RegionInstructionKind::AssignProperty { .. }
-                    | RegionInstructionKind::BindReferenceProperty { .. }
-                    | RegionInstructionKind::BindReferenceIntoPropertyDim { .. }
-                    | RegionInstructionKind::BindReferenceDimFromProperty { .. }
-            )
+                || matches!(
+                    kind,
+                    RegionInstructionKind::NativeCall(RegionNativeCall {
+                        target: RegionCallTarget::Constructor { .. }
+                            | RegionCallTarget::DynamicConstructor { .. },
+                        ..
+                    })
+                )
         })
     });
     let needs_dynamic_property_slot = regions.values().any(|region| {
@@ -11371,6 +12944,111 @@ pub(super) fn compile_region_graph_native(
             ))
         })
     });
+    let needs_static_property_contract = regions.values().any(|region| {
+        region_contains(region, |kind| {
+            matches!(kind, RegionInstructionKind::NativeCall(call)
+            if matches!(
+                &call.target,
+                RegionCallTarget::Semantic {
+                    operation: RegionSemanticOp::StaticPropertyFetch { .. }
+                        | RegionSemanticOp::StaticPropertyAssign { .. }
+                        | RegionSemanticOp::StaticPropertyReference { .. }
+                }
+            ))
+        })
+    });
+    let needs_typed_static_reference_bind = regions.values().any(|region| {
+        region_contains(region, |kind| {
+            matches!(kind, RegionInstructionKind::NativeCall(call)
+            if matches!(
+                &call.target,
+                RegionCallTarget::Semantic {
+                    operation: RegionSemanticOp::StaticPropertyReference { .. }
+                }
+            ))
+        })
+    });
+    let needs_typed_reference_store = regions.iter().any(|(function, region)| {
+        let value_flow = &value_flows[function];
+        region_contains(region, |kind| match kind {
+            RegionInstructionKind::StoreLocal { local, .. }
+            | RegionInstructionKind::AssignLocalResult { local, .. } => {
+                value_flow.local_storage(*local).is_reference_slot()
+            }
+            RegionInstructionKind::ArrayCallback(call)
+                if call.operation == RegionArrayCallbackOperation::PregReplace =>
+            {
+                call.mutable_local
+                    .is_some_and(|local| value_flow.local_storage(local).is_reference_slot())
+            }
+            RegionInstructionKind::PregCallbackArray(call) => call
+                .count_local
+                .is_some_and(|local| value_flow.local_storage(local).is_reference_slot()),
+            _ => false,
+        })
+    });
+    let needs_typed_reference_array_init = regions.values().any(|region| {
+        region_contains(region, |kind| {
+            matches!(
+                kind,
+                RegionInstructionKind::AppendDim { .. }
+                    | RegionInstructionKind::AssignDim { .. }
+                    | RegionInstructionKind::UnsetDim { .. }
+            )
+        })
+    });
+    let needs_undefined_constant = regions.values().any(|region| {
+        region_contains(region, |kind| {
+            matches!(kind, RegionInstructionKind::FetchConst { .. })
+                || matches!(kind, RegionInstructionKind::NativeCall(call)
+                if matches!(
+                    &call.target,
+                    RegionCallTarget::Semantic {
+                        operation: RegionSemanticOp::ClassConstantFetch { .. }
+                    }
+                ))
+        })
+    });
+    let needs_named_dynamic_property_slot = regions.values().any(|region| {
+        region_contains(region, |kind| {
+            matches!(
+                kind,
+                RegionInstructionKind::FetchProperty {
+                    dynamic_stdclass: true,
+                    ..
+                } | RegionInstructionKind::AssignProperty {
+                    dynamic_stdclass: true,
+                    ..
+                } | RegionInstructionKind::NativeCall(RegionNativeCall {
+                    target: RegionCallTarget::Semantic {
+                        operation: RegionSemanticOp::PropertyIsset {
+                            property: RegionPropertyName::FixedDynamic(_),
+                            ..
+                        } | RegionSemanticOp::PropertyEmpty {
+                            property: RegionPropertyName::FixedDynamic(_),
+                            ..
+                        } | RegionSemanticOp::PropertyUnset {
+                            property: RegionPropertyName::FixedDynamic(_),
+                            ..
+                        } | RegionSemanticOp::PropertyDimAssign {
+                            property: RegionPropertyName::FixedDynamic(_),
+                            ..
+                        } | RegionSemanticOp::PropertyDimIsset {
+                            property: RegionPropertyName::FixedDynamic(_),
+                            ..
+                        } | RegionSemanticOp::PropertyDimEmpty {
+                            property: RegionPropertyName::FixedDynamic(_),
+                            ..
+                        } | RegionSemanticOp::PropertyDimUnset {
+                            property: RegionPropertyName::FixedDynamic(_),
+                            ..
+                        },
+                    },
+                    ..
+                })
+            )
+        })
+    });
     let needs_dynamic_property_test_slot = regions.values().any(|region| {
         region_contains(region, |kind| {
             matches!(kind, RegionInstructionKind::NativeCall(call)
@@ -11394,14 +13072,9 @@ pub(super) fn compile_region_graph_native(
             ))
         })
     });
-    let needs_object_clone = regions.values().any(|region| {
-        region_contains(region, |kind| {
-            matches!(kind, RegionInstructionKind::CloneObject { .. })
-        })
-    });
     let needs_plain_object_clone = regions.values().any(|region| {
         region_contains(region, |kind| {
-            matches!(kind, RegionInstructionKind::CloneObject { plain: true, .. })
+            matches!(kind, RegionInstructionKind::CloneObject { .. })
         })
     });
     let needs_prepared_closure_new = regions.values().any(|region| {
@@ -11414,167 +13087,98 @@ pub(super) fn compile_region_graph_native(
             )
         })
     });
-    let needs_object_clone_with = regions.values().any(|region| {
-        region_contains(region, |kind| {
-            matches!(kind, RegionInstructionKind::CloneWith { .. })
-        })
-    });
-    let needs_array_insert = regions.values().any(|region| {
-        region_contains(region, |kind| {
-            matches!(
-                kind,
-                RegionInstructionKind::ArrayInsert { .. }
-                    | RegionInstructionKind::AssignDim { .. }
-                    | RegionInstructionKind::AppendDim { .. }
-                    | RegionInstructionKind::UnsetDim { .. }
-                    | RegionInstructionKind::BindReferenceDim { .. }
-                    | RegionInstructionKind::BindReferenceIntoDim { .. }
-                    | RegionInstructionKind::BindReferenceIntoPropertyDim { .. }
-                    | RegionInstructionKind::BindReferenceDimFromProperty { .. }
-            ) || matches!(kind, RegionInstructionKind::NativeCall(call)
-                if call.variadic || is_direct_linked_variadic_call(call))
-        })
-    });
-    let needs_array_fetch = regions.values().any(|region| {
-        region_contains(region, |kind| {
-            matches!(
-                kind,
-                RegionInstructionKind::FetchDim { .. }
-                    | RegionInstructionKind::AssignDim { .. }
-                    | RegionInstructionKind::AppendDim { .. }
-                    | RegionInstructionKind::IssetDim { .. }
-                    | RegionInstructionKind::EmptyDim { .. }
-                    | RegionInstructionKind::UnsetDim { .. }
-                    | RegionInstructionKind::BindReferenceDim { .. }
-                    | RegionInstructionKind::BindReferenceIntoDim { .. }
-                    | RegionInstructionKind::BindReferenceIntoPropertyDim { .. }
-                    | RegionInstructionKind::BindReferenceDimFromProperty { .. }
-            ) || matches!(kind, RegionInstructionKind::NativeCall(call)
-                if stable_builtin_array_key_exists(&call.target))
-        })
-    });
-    let needs_array_unset = regions.values().any(|region| {
-        region_contains(region, |kind| {
-            matches!(kind, RegionInstructionKind::UnsetDim { .. })
-        })
-    });
-    let needs_array_spread = regions.values().any(|region| {
-        region_contains(region, |kind| {
-            matches!(kind, RegionInstructionKind::ArraySpread { .. })
-        })
-    });
-    let needs_foreach_init = regions.values().any(|region| {
-        region_contains(region, |kind| {
-            matches!(
-                kind,
-                RegionInstructionKind::ForeachInit { .. }
-                    | RegionInstructionKind::ForeachInitRef { .. }
-            )
-        })
-    });
-    let needs_foreach_next = regions.values().any(|region| {
-        region_contains(region, |kind| {
-            matches!(
-                kind,
-                RegionInstructionKind::ForeachNext { .. }
-                    | RegionInstructionKind::ForeachNextRef { .. }
-            )
-        })
-    });
-    let needs_foreach_cleanup = regions.values().any(|region| {
-        region_contains(region, |kind| {
-            matches!(kind, RegionInstructionKind::ForeachCleanup { .. })
-        })
-    });
-    let needs_constant_fetch = regions.values().any(|region| {
-        region_contains(region, |kind| {
-            matches!(kind, RegionInstructionKind::FetchConst { .. })
-        })
-    });
-    let needs_type_predicate = regions.values().any(|region| {
-        region_contains(region, |kind| {
-            matches!(
-                kind,
-                RegionInstructionKind::NativeCall(call)
-                    if stable_builtin_type_predicate(&call.target).is_some()
-                        && call.argument_operand_offset == 0
-                        && call.args.len() == 1
-                        && call.args[0].name.is_none()
-                        && !call.args[0].unpack
-                        && call.operands.len() == 1
-                        && call.operands[0].is_some()
-                        && !matches!(call.result, RegionCallResult::ReferenceLocal(_))
-            )
-        })
-    });
-    let needs_stable_length = regions.values().any(|region| {
-        region_contains(region, |kind| {
-            matches!(
-                kind,
-                RegionInstructionKind::EmptyDim { .. } | RegionInstructionKind::EmptyLocal { .. }
-            ) || matches!(kind, RegionInstructionKind::NativeCall(call) if stable_builtin_length(&call.target).is_some())
-        })
-    });
-    let needs_runtime_fatal = regions.values().any(|region| {
-        region_contains(region, |kind| {
-            matches!(kind, RegionInstructionKind::RuntimeFatal { .. })
-        })
-    });
     let needs_execution_poll = regions
         .values()
         .any(|region| !region.osr_entries().is_empty());
+    let needs_undefined_variable_warning = regions.values().any(|region| {
+        region_contains(region, |kind| {
+            matches!(kind, RegionInstructionKind::LoadLocal { quiet: false, .. })
+        })
+    });
+    let needs_undefined_array_key_warning = regions.values().any(|region| {
+        region_contains(region, |kind| {
+            matches!(
+                kind,
+                RegionInstructionKind::FetchDim {
+                    quiet: false,
+                    mode: php_ir::instruction::DimFetchMode::Read,
+                    ..
+                }
+            )
+        })
+    });
+    let needs_global_binding_unset = regions.values().any(|region| {
+        region.blocks.iter().any(|block| {
+            block.instructions.iter().any(|instruction| {
+                instruction.native_global_name.is_some()
+                    && matches!(
+                        instruction.kind,
+                        RegionInstructionKind::UnsetDim { ref keys, .. } if keys.len() == 1
+                    )
+            })
+        })
+    });
+    let needs_global_binding_rebind = regions.values().any(|region| {
+        region.blocks.iter().any(|block| {
+            block.instructions.iter().any(|instruction| {
+                instruction.native_global_name.is_some()
+                    && matches!(
+                        instruction.kind,
+                        RegionInstructionKind::BindReferenceIntoDim { ref keys, append: false, .. }
+                            if keys.len() == 1
+                    )
+            })
+        })
+    });
     let baseline_helper_imports = generic_helper_imports;
     // Shadow every generic-runtime requirement with the tier capability.  In
     // particular, the optimizing closure below never declares a helper and
     // therefore cannot smuggle one into code through an unused wrapper.
-    let needs_call_trampoline = baseline_helper_imports && needs_call_trampoline;
-    let needs_function_resolver = baseline_helper_imports && needs_function_resolver;
-    let needs_frame_arena = baseline_helper_imports && needs_frame_arena;
+    // Both generated tiers use the same bounded native frame arena. In
+    // particular, final-owner release may call a generated destructor from
+    // either Generic or Optimizing code.
     let needs_dynamic_code = baseline_helper_imports && needs_dynamic_code;
     let _needs_compare = needs_compare;
-    let needs_direct_echo = !baseline_helper_imports && needs_echo;
-    let needs_echo = baseline_helper_imports && needs_echo;
-    let needs_local_fetch = baseline_helper_imports && needs_local_fetch;
-    let needs_local_store = baseline_helper_imports && needs_local_store;
-    let needs_value_release = baseline_helper_imports && needs_value_release;
-    let needs_reference_bind = baseline_helper_imports && needs_reference_bind;
-    let needs_argument_check = baseline_helper_imports && needs_argument_check;
+    // Generic and Optimizing now share the same generated instruction
+    // lowerer. Only function-entry binding, the generated terminator, dynamic
+    // compilation, and publication retain Generic-specific services; ordinary
+    // instruction requirements must select the same exact leaves in both
+    // tiers.
+    let needs_direct_echo = needs_echo;
+    // Declared argument enforcement is shared by both generated entry tiers.
+    // A preferred cell may upgrade after its callers were compiled, so the
+    // Optimizing entry must accept the same weak/strict binding resume IDs.
+    let needs_argument_check = needs_argument_check;
     let needs_return_check = baseline_helper_imports && needs_return_check;
-    let needs_prepared_exception_new = !baseline_helper_imports && needs_exception_new;
-    let needs_exception_new = baseline_helper_imports && needs_exception_new;
-    let needs_array_new = baseline_helper_imports && needs_array_new;
-    let needs_prepared_object_new = !baseline_helper_imports && needs_object_new;
-    let needs_prepared_closure_new = !baseline_helper_imports && needs_prepared_closure_new;
-    let needs_object_new = baseline_helper_imports && needs_object_new;
-    let needs_property_fetch = baseline_helper_imports && needs_property_fetch;
-    let needs_property_assign = baseline_helper_imports && needs_property_assign;
-    let needs_object_clone = baseline_helper_imports && needs_object_clone;
-    let needs_plain_object_clone = !baseline_helper_imports && needs_plain_object_clone;
-    let needs_dynamic_property_slot = !baseline_helper_imports && needs_dynamic_property_slot;
-    let needs_dynamic_property_test_slot =
-        !baseline_helper_imports && needs_dynamic_property_test_slot;
-    let needs_object_clone_with = baseline_helper_imports && needs_object_clone_with;
-    let needs_array_insert = baseline_helper_imports && needs_array_insert;
-    let needs_array_fetch = baseline_helper_imports && needs_array_fetch;
-    let needs_array_unset = baseline_helper_imports && needs_array_unset;
-    let needs_array_spread = baseline_helper_imports && needs_array_spread;
-    let needs_foreach_init = baseline_helper_imports && needs_foreach_init;
-    let needs_foreach_next = baseline_helper_imports && needs_foreach_next;
-    let needs_foreach_cleanup = baseline_helper_imports && needs_foreach_cleanup;
-    let needs_constant_fetch = baseline_helper_imports && needs_constant_fetch;
-    let needs_type_predicate = baseline_helper_imports && needs_type_predicate;
-    let needs_stable_length = baseline_helper_imports && needs_stable_length;
-    let needs_runtime_fatal = baseline_helper_imports && needs_runtime_fatal;
+    let needs_prepared_exception_new = needs_exception_new
+        || regions.values().any(|region| {
+            region_contains(region, |kind| {
+                matches!(
+                    kind,
+                    RegionInstructionKind::NativeCall(call)
+                        if call.args.iter().any(|argument| argument.unpack)
+                            || stable_internal_throwable_constructor(&call.target)
+                            || stable_builtin_call_user_func(&call.target)
+                            || stable_builtin_json(&call.target)
+                                == Some(StableJsonBuiltin::Decode)
+                )
+            })
+        });
+    let needs_static_property_contract = needs_static_property_contract;
+    let needs_typed_static_reference_bind = needs_typed_static_reference_bind;
+    let needs_typed_reference_store = needs_typed_reference_store;
+    let needs_typed_reference_array_init = needs_typed_reference_array_init;
+    let needs_undefined_constant = needs_undefined_constant;
+    let needs_prepared_object_new = needs_object_new;
+    let needs_prepared_closure_new = needs_prepared_closure_new;
+    let needs_plain_object_clone = needs_plain_object_clone;
+    let needs_dynamic_property_slot = needs_dynamic_property_slot;
+    let needs_named_dynamic_property_slot = needs_named_dynamic_property_slot;
+    let needs_dynamic_property_test_slot = needs_dynamic_property_test_slot;
     let mut imports = vec![(
         "region-runtime-helper-abi".to_owned(),
         region.compile_metadata.helper_abi_hash as usize,
     )];
-    if baseline_helper_imports && needs_call_trampoline {
-        imports.push((
-            baseline_call_symbol.clone(),
-            runtime_helpers.baseline_call_dispatch,
-        ));
-    }
     for builtin in StableSymbolQueryBuiltin::all() {
         if !needs_exact_symbol_query[builtin.index()] {
             continue;
@@ -11703,6 +13307,9 @@ pub(super) fn compile_region_graph_native(
             StableHashBuiltin::Hash => runtime_helpers.native_hash,
             StableHashBuiltin::HashHmac => runtime_helpers.native_hash_hmac,
             StableHashBuiltin::HashEquals => runtime_helpers.native_hash_equals,
+            StableHashBuiltin::SodiumGenericHash => {
+                runtime_helpers.native_sodium_crypto_generichash
+            }
         };
         if address == 0 {
             return Err(CraneliftLoweringError::new(
@@ -11739,6 +13346,7 @@ pub(super) fn compile_region_graph_native(
             StableByteCodecBuiltin::QuoteMeta => runtime_helpers.native_quotemeta,
             StableByteCodecBuiltin::Pack => runtime_helpers.native_pack,
             StableByteCodecBuiltin::Unpack => runtime_helpers.native_unpack,
+            StableByteCodecBuiltin::SodiumBin2Base64 => runtime_helpers.native_sodium_bin2base64,
         };
         if address == 0 {
             return Err(CraneliftLoweringError::new(
@@ -12158,6 +13766,22 @@ pub(super) fn compile_region_graph_native(
         }
         imports.push((builtin.symbol().to_owned(), address));
     }
+    for builtin in StableFileinfoBuiltin::all() {
+        if !needs_exact_fileinfo[builtin.index()] {
+            continue;
+        }
+        let address = runtime_helpers.native_fileinfo[builtin.index()];
+        if address == 0 {
+            return Err(CraneliftLoweringError::new(
+                "JIT_CRANELIFT_REJECT_EXACT_FILEINFO",
+                format!(
+                    "prepared fileinfo builtin requires exact handler {}",
+                    builtin.symbol()
+                ),
+            ));
+        }
+        imports.push((builtin.symbol().to_owned(), address));
+    }
     for builtin in StableErrorStateBuiltin::all() {
         if !needs_exact_error_state[builtin.index()] {
             continue;
@@ -12475,6 +14099,7 @@ pub(super) fn compile_region_graph_native(
             StablePathBuiltin::Symlink => runtime_helpers.native_symlink,
             StablePathBuiltin::Readfile => runtime_helpers.native_readfile,
             StablePathBuiltin::IsUploadedFile => runtime_helpers.native_is_uploaded_file,
+            StablePathBuiltin::MoveUploadedFile => runtime_helpers.native_move_uploaded_file,
             StablePathBuiltin::Tempnam => runtime_helpers.native_tempnam,
             StablePathBuiltin::Tmpfile => runtime_helpers.native_tmpfile,
             StablePathBuiltin::Filesize => runtime_helpers.native_filesize,
@@ -12528,27 +14153,343 @@ pub(super) fn compile_region_graph_native(
         }
         imports.push((builtin.symbol().to_owned(), address));
     }
-    for operation in RegionSemanticOperationId::all() {
-        if !baseline_helper_imports || !needs_exact_semantic[operation.index()] {
+    if needs_exact_print {
+        if runtime_helpers.native_print == 0 {
+            return Err(CraneliftLoweringError::new(
+                "JIT_CRANELIFT_REJECT_EXACT_PRINT",
+                "prepared print requires its fixed native scalar handler",
+            ));
+        }
+        imports.push((
+            "phrust_native_print".to_owned(),
+            runtime_helpers.native_print,
+        ));
+    }
+    if needs_exact_print_r {
+        if runtime_helpers.native_print_r == 0 {
+            return Err(CraneliftLoweringError::new(
+                "JIT_CRANELIFT_REJECT_EXACT_PRINT_R",
+                "prepared print_r requires its fixed native formatter",
+            ));
+        }
+        imports.push((
+            "phrust_native_print_r".to_owned(),
+            runtime_helpers.native_print_r,
+        ));
+    }
+    if needs_exact_var_dump {
+        if runtime_helpers.native_var_dump == 0 {
+            return Err(CraneliftLoweringError::new(
+                "JIT_CRANELIFT_REJECT_EXACT_VAR_DUMP",
+                "prepared var_dump requires its fixed native slice handler",
+            ));
+        }
+        imports.push((
+            "phrust_native_var_dump".to_owned(),
+            runtime_helpers.native_var_dump,
+        ));
+    }
+    if needs_exact_var_export {
+        if runtime_helpers.native_var_export == 0 {
+            return Err(CraneliftLoweringError::new(
+                "JIT_CRANELIFT_REJECT_EXACT_VAR_EXPORT",
+                "prepared var_export requires its fixed native formatter",
+            ));
+        }
+        imports.push((
+            "phrust_native_var_export".to_owned(),
+            runtime_helpers.native_var_export,
+        ));
+    }
+    if needs_exact_mysqli_set_charset {
+        if runtime_helpers.native_mysqli_set_charset == 0 {
+            return Err(CraneliftLoweringError::new(
+                "JIT_CRANELIFT_REJECT_EXACT_MYSQLI_SET_CHARSET",
+                "prepared mysqli_set_charset requires its fixed native mutation",
+            ));
+        }
+        imports.push((
+            "phrust_native_mysqli_set_charset".to_owned(),
+            runtime_helpers.native_mysqli_set_charset,
+        ));
+    }
+    if needs_exact_mysqli_query {
+        if runtime_helpers.native_mysqli_query == 0 {
+            return Err(CraneliftLoweringError::new(
+                "JIT_CRANELIFT_REJECT_EXACT_MYSQLI_QUERY",
+                "prepared mysqli_query requires its fixed native query leaf",
+            ));
+        }
+        imports.push((
+            "phrust_native_mysqli_query".to_owned(),
+            runtime_helpers.native_mysqli_query,
+        ));
+    }
+    if needs_exact_mysqli_fetch_array {
+        if runtime_helpers.native_mysqli_fetch_array == 0 {
+            return Err(CraneliftLoweringError::new(
+                "JIT_CRANELIFT_REJECT_EXACT_MYSQLI_FETCH_ARRAY",
+                "prepared mysqli_fetch_array requires its fixed native row leaf",
+            ));
+        }
+        imports.push((
+            "phrust_native_mysqli_fetch_array".to_owned(),
+            runtime_helpers.native_mysqli_fetch_array,
+        ));
+    }
+    if needs_exact_mysqli_fetch_object {
+        if runtime_helpers.native_mysqli_fetch_object == 0 {
+            return Err(CraneliftLoweringError::new(
+                "JIT_CRANELIFT_REJECT_EXACT_MYSQLI_FETCH_OBJECT",
+                "prepared mysqli_fetch_object requires its fixed native object-row leaf",
+            ));
+        }
+        imports.push((
+            "phrust_native_mysqli_fetch_object".to_owned(),
+            runtime_helpers.native_mysqli_fetch_object,
+        ));
+    }
+    if needs_exact_mysqli_character_set_name {
+        if runtime_helpers.native_mysqli_character_set_name == 0 {
+            return Err(CraneliftLoweringError::new(
+                "JIT_CRANELIFT_REJECT_EXACT_MYSQLI_CHARACTER_SET_NAME",
+                "prepared mysqli_character_set_name requires its fixed native string leaf",
+            ));
+        }
+        imports.push((
+            "phrust_native_mysqli_character_set_name".to_owned(),
+            runtime_helpers.native_mysqli_character_set_name,
+        ));
+    }
+    for operation in StableMysqliResultCountBuiltin::all() {
+        if !needs_exact_mysqli_result_count[operation.index()] {
             continue;
         }
-        let configured = runtime_helpers.native_exact_semantic[operation.index()];
+        let address = runtime_helpers.native_mysqli_result_count[operation.index()];
+        if address == 0 {
+            return Err(CraneliftLoweringError::new(
+                "JIT_CRANELIFT_REJECT_EXACT_MYSQLI_RESULT_COUNT",
+                format!(
+                    "prepared mysqli result count requires {}",
+                    operation.symbol()
+                ),
+            ));
+        }
+        imports.push((operation.symbol().to_owned(), address));
+    }
+    if needs_exact_mysqli_fetch_field {
+        if runtime_helpers.native_mysqli_fetch_field == 0 {
+            return Err(CraneliftLoweringError::new(
+                "JIT_CRANELIFT_REJECT_EXACT_MYSQLI_FETCH_FIELD",
+                "prepared mysqli_fetch_field requires its fixed native metadata leaf",
+            ));
+        }
         imports.push((
-            operation.exact_symbol().to_owned(),
-            if configured == 0 {
-                test_native_exact_semantic_fallback as *const () as usize
-            } else {
-                configured
-            },
+            "phrust_native_mysqli_fetch_field".to_owned(),
+            runtime_helpers.native_mysqli_fetch_field,
         ));
     }
-    if baseline_helper_imports && needs_function_resolver {
+    for operation in StableMysqliConnectStatusBuiltin::all() {
+        if !needs_exact_mysqli_connect_status[operation.index()] {
+            continue;
+        }
+        let address = runtime_helpers.native_mysqli_connect_status[operation.index()];
+        if address == 0 {
+            return Err(CraneliftLoweringError::new(
+                "JIT_CRANELIFT_REJECT_EXACT_MYSQLI_CONNECT_STATUS",
+                format!(
+                    "prepared mysqli connect status requires {}",
+                    operation.symbol()
+                ),
+            ));
+        }
+        imports.push((operation.symbol().to_owned(), address));
+    }
+    if needs_exact_mysqli_close {
+        if runtime_helpers.native_mysqli_close == 0 {
+            return Err(CraneliftLoweringError::new(
+                "JIT_CRANELIFT_REJECT_EXACT_MYSQLI_CLOSE",
+                "prepared mysqli_close requires its fixed native close leaf",
+            ));
+        }
         imports.push((
-            native_function_resolve_symbol.clone(),
-            runtime_helpers.native_function_resolve,
+            "phrust_native_mysqli_close".to_owned(),
+            runtime_helpers.native_mysqli_close,
         ));
     }
-    if baseline_helper_imports && needs_frame_arena {
+    if needs_exact_mysqli_get_server_info {
+        if runtime_helpers.native_mysqli_get_server_info == 0 {
+            return Err(CraneliftLoweringError::new(
+                "JIT_CRANELIFT_REJECT_EXACT_MYSQLI_GET_SERVER_INFO",
+                "prepared mysqli_get_server_info requires its fixed native string leaf",
+            ));
+        }
+        imports.push((
+            "phrust_native_mysqli_get_server_info".to_owned(),
+            runtime_helpers.native_mysqli_get_server_info,
+        ));
+    }
+    if needs_exact_mysqli_select_db {
+        if runtime_helpers.native_mysqli_select_db == 0 {
+            return Err(CraneliftLoweringError::new(
+                "JIT_CRANELIFT_REJECT_EXACT_MYSQLI_SELECT_DB",
+                "prepared mysqli_select_db requires its fixed native mutation",
+            ));
+        }
+        imports.push((
+            "phrust_native_mysqli_select_db".to_owned(),
+            runtime_helpers.native_mysqli_select_db,
+        ));
+    }
+    if needs_exact_mysqli_real_escape_string {
+        if runtime_helpers.native_mysqli_real_escape_string == 0 {
+            return Err(CraneliftLoweringError::new(
+                "JIT_CRANELIFT_REJECT_EXACT_MYSQLI_REAL_ESCAPE_STRING",
+                "prepared mysqli_real_escape_string requires its fixed native transform",
+            ));
+        }
+        imports.push((
+            "phrust_native_mysqli_real_escape_string".to_owned(),
+            runtime_helpers.native_mysqli_real_escape_string,
+        ));
+    }
+    for operation in StableMysqliConnectionStatusBuiltin::all() {
+        if !needs_exact_mysqli_connection_status[operation.index()] {
+            continue;
+        }
+        let address = runtime_helpers.native_mysqli_connection_status[operation.index()];
+        if address == 0 {
+            return Err(CraneliftLoweringError::new(
+                "JIT_CRANELIFT_REJECT_EXACT_MYSQLI_CONNECTION_STATUS",
+                format!(
+                    "prepared mysqli connection status requires exact handler {}",
+                    operation.symbol()
+                ),
+            ));
+        }
+        imports.push((operation.symbol().to_owned(), address));
+    }
+    if needs_exact_error_log {
+        if runtime_helpers.native_error_log == 0 {
+            return Err(CraneliftLoweringError::new(
+                "JIT_CRANELIFT_REJECT_EXACT_ERROR_LOG",
+                "prepared error_log requires its fixed native sink",
+            ));
+        }
+        imports.push((
+            "phrust_native_error_log".to_owned(),
+            runtime_helpers.native_error_log,
+        ));
+    }
+    if needs_exact_sleep {
+        if runtime_helpers.native_sleep == 0 {
+            return Err(CraneliftLoweringError::new(
+                "JIT_CRANELIFT_REJECT_EXACT_SLEEP",
+                "prepared sleep requires its fixed native clock operation",
+            ));
+        }
+        imports.push((
+            "phrust_native_sleep".to_owned(),
+            runtime_helpers.native_sleep,
+        ));
+    }
+    if needs_exact_mysqli_free_result {
+        if runtime_helpers.native_mysqli_free_result == 0 {
+            return Err(CraneliftLoweringError::new(
+                "JIT_CRANELIFT_REJECT_EXACT_MYSQLI_FREE_RESULT",
+                "prepared mysqli_free_result requires its fixed native release",
+            ));
+        }
+        imports.push((
+            "phrust_native_mysqli_free_result".to_owned(),
+            runtime_helpers.native_mysqli_free_result,
+        ));
+    }
+    for (needed, symbol, address, message) in [
+        (
+            needs_exact_mysqli_more_results,
+            "phrust_native_mysqli_more_results",
+            runtime_helpers.native_mysqli_more_results,
+            "prepared mysqli_more_results requires its fixed native query",
+        ),
+        (
+            needs_exact_mysqli_next_result,
+            "phrust_native_mysqli_next_result",
+            runtime_helpers.native_mysqli_next_result,
+            "prepared mysqli_next_result requires its fixed native mutation",
+        ),
+    ] {
+        if !needed {
+            continue;
+        }
+        if address == 0 {
+            return Err(CraneliftLoweringError::new(
+                "JIT_CRANELIFT_REJECT_EXACT_MYSQLI_RESULT_SEQUENCE",
+                message,
+            ));
+        }
+        imports.push((symbol.to_owned(), address));
+    }
+    if needs_exact_mysqli_report {
+        if runtime_helpers.native_mysqli_report == 0 {
+            return Err(CraneliftLoweringError::new(
+                "JIT_CRANELIFT_REJECT_EXACT_MYSQLI_REPORT",
+                "prepared mysqli_report requires its fixed native policy mutation",
+            ));
+        }
+        imports.push((
+            "phrust_native_mysqli_report".to_owned(),
+            runtime_helpers.native_mysqli_report,
+        ));
+    }
+    for (needed, symbol, address, message) in [
+        (
+            needs_exact_mysqli_init,
+            "phrust_native_mysqli_init",
+            runtime_helpers.native_mysqli_init,
+            "prepared mysqli_init requires its fixed native allocator",
+        ),
+        (
+            needs_exact_mysqli_options,
+            "phrust_native_mysqli_options",
+            runtime_helpers.native_mysqli_options,
+            "prepared mysqli_options requires its fixed native mutation",
+        ),
+        (
+            needs_exact_mysqli_real_connect,
+            "phrust_native_mysqli_real_connect",
+            runtime_helpers.native_mysqli_real_connect,
+            "prepared mysqli_real_connect requires its fixed native connector",
+        ),
+    ] {
+        if !needed {
+            continue;
+        }
+        if address == 0 {
+            return Err(CraneliftLoweringError::new(
+                "JIT_CRANELIFT_REJECT_EXACT_MYSQLI_CONNECTION_SETUP",
+                message,
+            ));
+        }
+        imports.push((symbol.to_owned(), address));
+    }
+    for method in StableThrowableMethod::all() {
+        if !needs_exact_throwable_method[method.index()] {
+            continue;
+        }
+        let address = runtime_helpers.native_throwable_method[method.index()];
+        if address == 0 {
+            return Err(CraneliftLoweringError::new(
+                "JIT_CRANELIFT_REJECT_EXACT_THROWABLE_METHOD",
+                format!(
+                    "internal Throwable accessor requires exact handler {}",
+                    method.symbol()
+                ),
+            ));
+        }
+        imports.push((method.symbol().to_owned(), address));
+    }
+    if needs_frame_arena {
         imports.push((
             "phrust_native_frame_alloc".to_owned(),
             runtime_helpers.native_frame_alloc,
@@ -12558,132 +14499,42 @@ pub(super) fn compile_region_graph_native(
             runtime_helpers.native_frame_release,
         ));
     }
+    for (symbol, address) in [
+        (
+            "phrust_native_object_release_prepare",
+            runtime_helpers.native_object_release[0],
+        ),
+        (
+            "phrust_native_object_release_finalize",
+            runtime_helpers.native_object_release[1],
+        ),
+        (
+            "phrust_native_object_release_children_drop",
+            runtime_helpers.native_object_release[2],
+        ),
+    ] {
+        if address != 0 {
+            imports.push((symbol.to_owned(), address));
+        }
+    }
     if baseline_helper_imports && needs_dynamic_code {
         imports.push((
             native_dynamic_code_symbol.clone(),
-            runtime_helpers.native_dynamic_code,
+            runtime_helpers.cold_dynamic_unit_resolve,
         ));
     }
     for (needed, configured, fallback, symbol) in [
         (
-            needs_echo,
-            runtime_helpers.native_echo,
-            test_native_echo_fallback as *const () as usize,
-            "phrust_native_echo",
-        ),
-        (
-            needs_value_release,
-            runtime_helpers.native_value_release,
-            test_native_value_release_fallback as *const () as usize,
-            "phrust_native_value_release",
-        ),
-        (
             needs_argument_check,
-            runtime_helpers.native_argument_check,
-            test_native_argument_check_fallback as *const () as usize,
-            "phrust_native_argument_check",
+            runtime_helpers.native_declared_argument_contract,
+            test_native_declared_argument_contract_fallback as *const () as usize,
+            "phrust_native_declared_argument_contract",
         ),
         (
             needs_return_check,
-            runtime_helpers.native_return_check,
-            test_native_return_check_fallback as *const () as usize,
-            "phrust_native_return_check",
-        ),
-        (
-            needs_exception_new,
-            runtime_helpers.native_exception_new,
-            test_native_exception_new_fallback as *const () as usize,
-            "phrust_native_exception_new",
-        ),
-        (
-            needs_array_new,
-            runtime_helpers.native_array_new,
-            test_native_array_new_fallback as *const () as usize,
-            "phrust_native_array_new",
-        ),
-        (
-            needs_object_new,
-            runtime_helpers.native_object_new,
-            test_native_object_new_fallback as *const () as usize,
-            "phrust_native_object_new",
-        ),
-        (
-            needs_property_fetch,
-            runtime_helpers.native_property_fetch,
-            test_native_property_fetch_fallback as *const () as usize,
-            "phrust_native_property_fetch",
-        ),
-        (
-            needs_property_assign,
-            runtime_helpers.native_property_assign,
-            test_native_property_assign_fallback as *const () as usize,
-            "phrust_native_property_assign",
-        ),
-        (
-            needs_object_clone,
-            runtime_helpers.native_object_clone,
-            test_native_object_clone_fallback as *const () as usize,
-            "phrust_native_object_clone",
-        ),
-        (
-            needs_object_clone_with,
-            runtime_helpers.native_object_clone_with,
-            test_native_object_clone_with_fallback as *const () as usize,
-            "phrust_native_object_clone_with",
-        ),
-        (
-            needs_array_unset,
-            runtime_helpers.native_array_unset,
-            test_native_array_unset_fallback as *const () as usize,
-            "phrust_native_array_unset",
-        ),
-        (
-            needs_array_spread,
-            runtime_helpers.native_array_spread,
-            test_native_array_spread_fallback as *const () as usize,
-            "phrust_native_array_spread",
-        ),
-        (
-            needs_foreach_init,
-            runtime_helpers.native_foreach_init,
-            test_native_foreach_init_fallback as *const () as usize,
-            "phrust_native_foreach_init",
-        ),
-        (
-            needs_foreach_next,
-            runtime_helpers.native_foreach_next,
-            test_native_foreach_next_fallback as *const () as usize,
-            "phrust_native_foreach_next",
-        ),
-        (
-            needs_foreach_cleanup,
-            runtime_helpers.native_foreach_cleanup,
-            test_native_foreach_cleanup_fallback as *const () as usize,
-            "phrust_native_foreach_cleanup",
-        ),
-        (
-            needs_constant_fetch,
-            runtime_helpers.native_constant_fetch,
-            test_native_constant_fetch_fallback as *const () as usize,
-            "phrust_native_constant_fetch",
-        ),
-        (
-            needs_type_predicate,
-            runtime_helpers.native_type_predicate,
-            test_native_type_predicate_fallback as *const () as usize,
-            "phrust_native_type_predicate",
-        ),
-        (
-            needs_stable_length,
-            runtime_helpers.native_stable_length,
-            test_native_stable_length_fallback as *const () as usize,
-            "phrust_native_stable_length",
-        ),
-        (
-            needs_runtime_fatal,
-            runtime_helpers.native_runtime_fatal,
-            test_native_runtime_fatal_fallback as *const () as usize,
-            "phrust_native_runtime_fatal",
+            runtime_helpers.native_declared_return_contract,
+            test_native_declared_return_contract_fallback as *const () as usize,
+            "phrust_native_declared_return_contract",
         ),
         (
             needs_execution_poll,
@@ -12692,89 +14543,19 @@ pub(super) fn compile_region_graph_native(
             "phrust_native_execution_poll",
         ),
     ] {
-        if needed && (baseline_helper_imports || symbol == "phrust_native_execution_poll") {
+        if needed
+            && (baseline_helper_imports
+                || matches!(
+                    symbol,
+                    "phrust_native_execution_poll" | "phrust_native_declared_argument_contract"
+                ))
+        {
             let address = if configured == 0 {
                 fallback
             } else {
                 configured
             };
             imports.push((symbol.to_owned(), address));
-        }
-    }
-    if needs_local_fetch {
-        for (index, symbol) in NATIVE_EXACT_LOCAL_FETCH_SYMBOLS.into_iter().enumerate() {
-            imports.push((
-                symbol.to_owned(),
-                if runtime_helpers.native_exact_local_fetch[index] == 0 {
-                    test_native_exact_local_fetch_fallback as *const () as usize
-                } else {
-                    runtime_helpers.native_exact_local_fetch[index]
-                },
-            ));
-        }
-    }
-    if needs_local_store {
-        for (index, symbol) in NATIVE_EXACT_LOCAL_STORE_SYMBOLS.into_iter().enumerate() {
-            imports.push((
-                symbol.to_owned(),
-                if runtime_helpers.native_exact_local_store[index] == 0 {
-                    test_native_exact_local_store_fallback as *const () as usize
-                } else {
-                    runtime_helpers.native_exact_local_store[index]
-                },
-            ));
-        }
-    }
-    if needs_reference_bind {
-        for (index, symbol) in NATIVE_EXACT_REFERENCE_SYMBOLS.into_iter().enumerate() {
-            if index == 5 {
-                continue;
-            }
-            imports.push((
-                symbol.to_owned(),
-                if runtime_helpers.native_exact_reference[index] == 0 {
-                    test_native_exact_reference_fallback as *const () as usize
-                } else {
-                    runtime_helpers.native_exact_reference[index]
-                },
-            ));
-        }
-    }
-    if needs_array_fetch {
-        for (index, symbol) in NATIVE_EXACT_ARRAY_FETCH_SYMBOLS.into_iter().enumerate() {
-            imports.push((
-                symbol.to_owned(),
-                if runtime_helpers.native_exact_array_fetch[index] == 0 {
-                    test_native_exact_array_fetch_fallback as *const () as usize
-                } else {
-                    runtime_helpers.native_exact_array_fetch[index]
-                },
-            ));
-        }
-    }
-    if needs_array_insert {
-        for (index, symbol) in NATIVE_EXACT_ARRAY_INSERT_SYMBOLS.into_iter().enumerate() {
-            imports.push((
-                symbol.to_owned(),
-                if runtime_helpers.native_exact_array_insert[index] == 0 {
-                    test_native_exact_array_insert_fallback as *const () as usize
-                } else {
-                    runtime_helpers.native_exact_array_insert[index]
-                },
-            ));
-        }
-        for (index, symbol) in NATIVE_EXACT_ARRAY_INSERT_LOCAL_SYMBOLS
-            .into_iter()
-            .enumerate()
-        {
-            imports.push((
-                symbol.to_owned(),
-                if runtime_helpers.native_exact_array_insert_local[index] == 0 {
-                    test_native_exact_array_insert_fallback as *const () as usize
-                } else {
-                    runtime_helpers.native_exact_array_insert_local[index]
-                },
-            ));
         }
     }
     for (needed, configured, symbol) in [
@@ -12831,52 +14612,16 @@ pub(super) fn compile_region_graph_native(
             },
         ));
     }
-    for (index, symbol) in NATIVE_EXACT_BINARY_SYMBOLS.into_iter().enumerate() {
-        if !needs_exact_binary[index] {
+    for operation in NATIVE_EXACT_ARITHMETIC_OPERATIONS {
+        let index = native_exact_arithmetic_index(operation);
+        if !needs_exact_arithmetic[index] {
             continue;
         }
-        let configured = runtime_helpers.native_exact_binary[index];
-        let fallback = [
-            test_native_exact_add_fallback as *const () as usize,
-            test_native_exact_subtract_fallback as *const () as usize,
-            test_native_exact_multiply_fallback as *const () as usize,
-            test_native_exact_divide_fallback as *const () as usize,
-            test_native_exact_modulo_fallback as *const () as usize,
-            test_native_exact_concatenate_fallback as *const () as usize,
-            test_native_exact_power_fallback as *const () as usize,
-            test_native_exact_bitwise_and_fallback as *const () as usize,
-            test_native_exact_bitwise_or_fallback as *const () as usize,
-            test_native_exact_bitwise_xor_fallback as *const () as usize,
-            test_native_exact_shift_left_fallback as *const () as usize,
-            test_native_exact_shift_right_fallback as *const () as usize,
-        ][index];
+        let configured = runtime_helpers.native_exact_arithmetic[index];
         imports.push((
-            symbol.to_owned(),
+            native_exact_arithmetic_symbol(operation).to_owned(),
             if configured == 0 {
-                fallback
-            } else {
-                configured
-            },
-        ));
-    }
-    for (index, symbol) in NATIVE_EXACT_CAST_SYMBOLS.into_iter().enumerate() {
-        if !needs_exact_cast[index] {
-            continue;
-        }
-        let configured = runtime_helpers.native_exact_cast[index];
-        let fallback = [
-            test_native_exact_bool_cast_fallback as *const () as usize,
-            test_native_exact_int_cast_fallback as *const () as usize,
-            test_native_exact_float_cast_fallback as *const () as usize,
-            test_native_exact_string_cast_fallback as *const () as usize,
-            test_native_exact_array_cast_fallback as *const () as usize,
-            test_native_exact_object_cast_fallback as *const () as usize,
-            test_native_exact_void_cast_fallback as *const () as usize,
-        ][index];
-        imports.push((
-            symbol.to_owned(),
-            if configured == 0 {
-                fallback
+                test_native_exact_arithmetic_fallback as *const () as usize
             } else {
                 configured
             },
@@ -12905,6 +14650,58 @@ pub(super) fn compile_region_graph_native(
             } else {
                 runtime_helpers.native_echo_bytes
             },
+        ));
+    }
+    if needs_undefined_variable_warning {
+        imports.push((
+            "phrust_native_undefined_variable_warning".to_owned(),
+            if runtime_helpers.native_undefined_variable_warning == 0 {
+                test_native_undefined_variable_warning_fallback as *const () as usize
+            } else {
+                runtime_helpers.native_undefined_variable_warning
+            },
+        ));
+    }
+    if needs_undefined_array_key_warning {
+        imports.push((
+            "phrust_native_undefined_array_key_warning".to_owned(),
+            if runtime_helpers.native_undefined_array_key_warning == 0 {
+                test_native_undefined_array_key_warning_fallback as *const () as usize
+            } else {
+                runtime_helpers.native_undefined_array_key_warning
+            },
+        ));
+        imports.push((
+            "phrust_native_array_offset_warning".to_owned(),
+            if runtime_helpers.native_array_offset_warning == 0 {
+                test_native_array_offset_warning_fallback as *const () as usize
+            } else {
+                runtime_helpers.native_array_offset_warning
+            },
+        ));
+    }
+    if needs_global_binding_unset {
+        if runtime_helpers.native_global_binding_unset == 0 {
+            return Err(CraneliftLoweringError::new(
+                "JIT_CRANELIFT_REJECT_GLOBAL_BINDING_UNSET",
+                "generated top-level global unset requires its exact cold transition",
+            ));
+        }
+        imports.push((
+            "phrust_native_global_binding_unset".to_owned(),
+            runtime_helpers.native_global_binding_unset,
+        ));
+    }
+    if needs_global_binding_rebind {
+        if runtime_helpers.native_global_binding_rebind == 0 {
+            return Err(CraneliftLoweringError::new(
+                "JIT_CRANELIFT_REJECT_GLOBAL_BINDING_REBIND",
+                "generated top-level global rebind requires its exact cold transition",
+            ));
+        }
+        imports.push((
+            "phrust_native_global_binding_rebind".to_owned(),
+            runtime_helpers.native_global_binding_rebind,
         ));
     }
     if needs_float_to_string {
@@ -13021,6 +14818,16 @@ pub(super) fn compile_region_graph_native(
             },
         ));
     }
+    if needs_type_name {
+        imports.push((
+            "phrust_native_type_name".to_owned(),
+            if runtime_helpers.native_type_name == 0 {
+                test_native_type_name_fallback as *const () as usize
+            } else {
+                runtime_helpers.native_type_name
+            },
+        ));
+    }
     if needs_acquire_callable {
         imports.push((
             "phrust_native_acquire_callable".to_owned(),
@@ -13028,6 +14835,26 @@ pub(super) fn compile_region_graph_native(
                 test_native_object_class_name_fallback as *const () as usize
             } else {
                 runtime_helpers.native_acquire_callable
+            },
+        ));
+    }
+    if needs_acquire_method_callable {
+        imports.push((
+            "phrust_native_acquire_method_callable".to_owned(),
+            if runtime_helpers.native_acquire_method_callable == 0 {
+                test_native_object_class_name_fallback as *const () as usize
+            } else {
+                runtime_helpers.native_acquire_method_callable
+            },
+        ));
+    }
+    if needs_acquire_class_plan {
+        imports.push((
+            "phrust_native_acquire_class_plan".to_owned(),
+            if runtime_helpers.native_acquire_class_plan == 0 {
+                test_native_object_class_name_fallback as *const () as usize
+            } else {
+                runtime_helpers.native_acquire_class_plan
             },
         ));
     }
@@ -13071,6 +14898,56 @@ pub(super) fn compile_region_graph_native(
             },
         ));
     }
+    if needs_static_property_contract {
+        imports.push((
+            "phrust_native_static_property_contract".to_owned(),
+            if runtime_helpers.native_static_property_contract == 0 {
+                test_native_static_property_contract_fallback as *const () as usize
+            } else {
+                runtime_helpers.native_static_property_contract
+            },
+        ));
+    }
+    if needs_typed_static_reference_bind {
+        imports.push((
+            "phrust_native_typed_static_reference_bind".to_owned(),
+            if runtime_helpers.native_typed_static_reference_bind == 0 {
+                test_native_typed_static_reference_bind_fallback as *const () as usize
+            } else {
+                runtime_helpers.native_typed_static_reference_bind
+            },
+        ));
+    }
+    if needs_typed_reference_store {
+        imports.push((
+            "phrust_native_typed_reference_store".to_owned(),
+            if runtime_helpers.native_typed_reference_store == 0 {
+                test_native_typed_reference_store_fallback as *const () as usize
+            } else {
+                runtime_helpers.native_typed_reference_store
+            },
+        ));
+    }
+    if needs_typed_reference_array_init {
+        imports.push((
+            "phrust_native_typed_reference_array_init".to_owned(),
+            if runtime_helpers.native_typed_reference_array_init == 0 {
+                test_native_typed_reference_array_init_fallback as *const () as usize
+            } else {
+                runtime_helpers.native_typed_reference_array_init
+            },
+        ));
+    }
+    if needs_undefined_constant {
+        imports.push((
+            "phrust_native_undefined_constant".to_owned(),
+            if runtime_helpers.native_undefined_constant == 0 {
+                test_native_undefined_constant_fallback as *const () as usize
+            } else {
+                runtime_helpers.native_undefined_constant
+            },
+        ));
+    }
     if needs_prepared_closure_new {
         imports.push((
             "phrust_native_prepared_closure_new".to_owned(),
@@ -13098,6 +14975,16 @@ pub(super) fn compile_region_graph_native(
                 test_native_dynamic_property_fallback as *const () as usize
             } else {
                 runtime_helpers.native_dynamic_property_slot
+            },
+        ));
+    }
+    if needs_named_dynamic_property_slot {
+        imports.push((
+            "phrust_native_named_dynamic_property_slot".to_owned(),
+            if runtime_helpers.native_named_dynamic_property_slot == 0 {
+                test_native_dynamic_property_fallback as *const () as usize
+            } else {
+                runtime_helpers.native_named_dynamic_property_slot
             },
         ));
     }
@@ -13143,9 +15030,7 @@ pub(super) fn compile_region_graph_native(
         request,
         function,
         function_key,
-        if compilation_mode
-            == crate::cranelift_lowering::generic_streaming::NativeCompilationMode::StreamingGeneric
-        {
+        if compilation_mode.is_generic() {
             crate::code_manager::NativeCompileAdmission::request_critical(
                 plan.admission_cost_tokens(),
             )
@@ -13165,22 +15050,6 @@ pub(super) fn compile_region_graph_native(
                     .find_map(|(name, address)| (name == symbol).then_some(*address))
                     .expect("required native helper address must be imported")
             };
-            let native_call_helper = if needs_call_trampoline {
-                let pointer_type = module.target_config().pointer_type();
-                let mut signature = module.make_signature();
-                signature.params.push(AbiParam::new(types::I64));
-                signature.params.push(AbiParam::new(pointer_type));
-                signature.params.push(AbiParam::new(pointer_type));
-                signature.returns.push(AbiParam::new(types::I32));
-                Some(declare_native_helper(
-                    module,
-                    &baseline_call_symbol,
-                    &signature,
-                    helper_address(&baseline_call_symbol),
-                )?)
-            } else {
-                None
-            };
             let native_dynamic_code_helper = if needs_dynamic_code {
                 let pointer_type = module.target_config().pointer_type();
                 let mut signature = module.make_signature();
@@ -13198,6 +15067,9 @@ pub(super) fn compile_region_graph_native(
                 None
             };
             let mut native_operations = GenericNativeOperations::default();
+            let mut frame_alloc = None;
+            let mut frame_release = None;
+            let mut execution_poll = None;
             let pointer_type = module.target_config().pointer_type();
             let mut exact_symbol_query = [None; StableSymbolQueryBuiltin::COUNT];
             for builtin in StableSymbolQueryBuiltin::all() {
@@ -13207,6 +15079,19 @@ pub(super) fn compile_region_graph_native(
                 let mut signature = module.make_signature();
                 signature.params.push(AbiParam::new(types::I64));
                 signature.params.push(AbiParam::new(types::I64));
+                if builtin == StableSymbolQueryBuiltin::Define {
+                    signature.params.push(AbiParam::new(types::I64));
+                    signature.params.push(AbiParam::new(types::I64));
+                }
+                if matches!(
+                    builtin,
+                    StableSymbolQueryBuiltin::ClassExists
+                        | StableSymbolQueryBuiltin::InterfaceExists
+                        | StableSymbolQueryBuiltin::TraitExists
+                        | StableSymbolQueryBuiltin::EnumExists
+                ) {
+                    signature.params.push(AbiParam::new(types::I64));
+                }
                 signature.returns.push(AbiParam::new(types::I64));
                 signature.returns.push(AbiParam::new(types::I64));
                 exact_symbol_query[builtin.index()] = Some(declare_native_helper(
@@ -13285,7 +15170,7 @@ pub(super) fn compile_region_graph_native(
                 let arity = match builtin {
                     StableJsonBuiltin::LastError | StableJsonBuiltin::LastErrorMessage => 0,
                     StableJsonBuiltin::Encode | StableJsonBuiltin::Validate => 3,
-                    StableJsonBuiltin::Decode => 4,
+                    StableJsonBuiltin::Decode => 5,
                 };
                 for _ in 0..arity {
                     signature.params.push(AbiParam::new(types::I64));
@@ -13342,6 +15227,7 @@ pub(super) fn compile_region_graph_native(
                     StableHashBuiltin::Md5
                     | StableHashBuiltin::Sha1
                     | StableHashBuiltin::HashEquals => 2,
+                    StableHashBuiltin::SodiumGenericHash => 3,
                     StableHashBuiltin::Hash | StableHashBuiltin::HashHmac => 4,
                 };
                 for _ in 0..arity {
@@ -13374,7 +15260,9 @@ pub(super) fn compile_region_graph_native(
                             signature.params.push(AbiParam::new(types::I64));
                         }
                     }
-                    StableByteCodecBuiltin::Base64Decode | StableByteCodecBuiltin::AddCSlashes => {
+                    StableByteCodecBuiltin::Base64Decode
+                    | StableByteCodecBuiltin::AddCSlashes
+                    | StableByteCodecBuiltin::SodiumBin2Base64 => {
                         for _ in 0..2 {
                             signature.params.push(AbiParam::new(types::I64));
                         }
@@ -13468,6 +15356,7 @@ pub(super) fn compile_region_graph_native(
                     StableHtmlCodecBuiltin::SpecialChars | StableHtmlCodecBuiltin::Entities => 4,
                     StableHtmlCodecBuiltin::EntityDecode => 3,
                     StableHtmlCodecBuiltin::SpecialCharsDecode => 2,
+                    StableHtmlCodecBuiltin::TranslationTable => 3,
                 };
                 for _ in 0..arity {
                     signature.params.push(AbiParam::new(types::I64));
@@ -13511,7 +15400,7 @@ pub(super) fn compile_region_graph_native(
                 let mut signature = module.make_signature();
                 let arity = match builtin {
                     StableArrayAggregateBuiltin::Sum => 1,
-                    StableArrayAggregateBuiltin::Count | StableArrayAggregateBuiltin::SizeOf => 2,
+                    StableArrayAggregateBuiltin::Count | StableArrayAggregateBuiltin::SizeOf => 3,
                 };
                 for _ in 0..arity {
                     signature.params.push(AbiParam::new(types::I64));
@@ -13617,7 +15506,12 @@ pub(super) fn compile_region_graph_native(
                     continue;
                 }
                 let mut signature = module.make_signature();
-                for _ in 0..2 {
+                let arity = if builtin == StableCallbackHandlerBuiltin::TriggerError {
+                    5
+                } else {
+                    2
+                };
+                for _ in 0..arity {
                     signature.params.push(AbiParam::new(types::I64));
                 }
                 signature.returns.push(AbiParam::new(types::I64));
@@ -13724,11 +15618,14 @@ pub(super) fn compile_region_graph_native(
                     | StableMbstringBuiltin::Lcfirst
                     | StableMbstringBuiltin::Ord
                     | StableMbstringBuiltin::Chr
-                    | StableMbstringBuiltin::ParseStr => 2,
+                    | StableMbstringBuiltin::ParseStr
+                    | StableMbstringBuiltin::NormalizerNormalize
+                    | StableMbstringBuiltin::NormalizerIsNormalized => 2,
                     StableMbstringBuiltin::DetectEncoding
                     | StableMbstringBuiltin::ConvertEncoding
                     | StableMbstringBuiltin::SubstrCount
-                    | StableMbstringBuiltin::ConvertCase => 3,
+                    | StableMbstringBuiltin::ConvertCase
+                    | StableMbstringBuiltin::Iconv => 3,
                     StableMbstringBuiltin::Stripos
                     | StableMbstringBuiltin::Strpos
                     | StableMbstringBuiltin::Strripos
@@ -13738,6 +15635,17 @@ pub(super) fn compile_region_graph_native(
                     StableMbstringBuiltin::Strimwidth => 5,
                 };
                 for _ in 0..arity {
+                    signature.params.push(AbiParam::new(types::I64));
+                }
+                if builtin == StableMbstringBuiltin::Iconv {
+                    signature.params.push(AbiParam::new(types::I64));
+                    signature.params.push(AbiParam::new(types::I64));
+                }
+                if matches!(
+                    builtin,
+                    StableMbstringBuiltin::NormalizerNormalize
+                        | StableMbstringBuiltin::NormalizerIsNormalized
+                ) {
                     signature.params.push(AbiParam::new(types::I64));
                 }
                 signature.returns.push(AbiParam::new(types::I64));
@@ -13968,6 +15876,33 @@ pub(super) fn compile_region_graph_native(
                     helper_address(builtin.symbol()),
                 )?);
             }
+            let mut exact_fileinfo = [None; StableFileinfoBuiltin::COUNT];
+            for builtin in StableFileinfoBuiltin::all() {
+                if !needs_exact_fileinfo[builtin.index()] {
+                    continue;
+                }
+                let mut signature = module.make_signature();
+                let arity = match builtin {
+                    StableFileinfoBuiltin::Open => 4,
+                    StableFileinfoBuiltin::Close => 1,
+                    StableFileinfoBuiltin::Buffer | StableFileinfoBuiltin::File => 6,
+                    StableFileinfoBuiltin::SetFlags => 2,
+                    StableFileinfoBuiltin::ExifImageType => 3,
+                    StableFileinfoBuiltin::ImageTypeToMimeType => 1,
+                    StableFileinfoBuiltin::GetImageSize => 4,
+                };
+                for _ in 0..arity {
+                    signature.params.push(AbiParam::new(types::I64));
+                }
+                signature.returns.push(AbiParam::new(types::I64));
+                signature.returns.push(AbiParam::new(types::I64));
+                exact_fileinfo[builtin.index()] = Some(declare_native_helper(
+                    module,
+                    builtin.symbol(),
+                    &signature,
+                    helper_address(builtin.symbol()),
+                )?);
+            }
             let mut exact_error_state = [None; StableErrorStateBuiltin::COUNT];
             for builtin in StableErrorStateBuiltin::all() {
                 if !needs_exact_error_state[builtin.index()] {
@@ -14036,7 +15971,7 @@ pub(super) fn compile_region_graph_native(
                     | StableHttpResponseBuiltin::HeadersSent => 0,
                     StableHttpResponseBuiltin::HeaderRemove
                     | StableHttpResponseBuiltin::ResponseCode => 1,
-                    StableHttpResponseBuiltin::Header => 3,
+                    StableHttpResponseBuiltin::Header => 5,
                 };
                 for _ in 0..arity {
                     signature.params.push(AbiParam::new(types::I64));
@@ -14076,7 +16011,11 @@ pub(super) fn compile_region_graph_native(
                 let mut signature = module.make_signature();
                 let arity = match builtin {
                     StableClockBuiltin::Time => 0,
-                    StableClockBuiltin::Microtime | StableClockBuiltin::Hrtime => 1,
+                    StableClockBuiltin::Microtime
+                    | StableClockBuiltin::Hrtime
+                    | StableClockBuiltin::Usleep
+                    | StableClockBuiltin::SetTimeLimit => 1,
+                    StableClockBuiltin::Uniqid => 2,
                 };
                 for _ in 0..arity {
                     signature.params.push(AbiParam::new(types::I64));
@@ -14097,14 +16036,19 @@ pub(super) fn compile_region_graph_native(
                 }
                 let mut signature = module.make_signature();
                 let arity = match builtin {
-                    StableDateBuiltin::TimezoneIdentifiers => 0,
+                    StableDateBuiltin::TimezoneIdentifiers => 2,
                     StableDateBuiltin::Date
                     | StableDateBuiltin::Gmdate
-                    | StableDateBuiltin::Strtotime => 2,
+                    | StableDateBuiltin::Strtotime
+                    | StableDateBuiltin::DateCreate => 2,
+                    StableDateBuiltin::TimezoneOpen => 1,
                     StableDateBuiltin::Checkdate => 3,
                     StableDateBuiltin::Mktime | StableDateBuiltin::Gmmktime => 6,
                 };
                 for _ in 0..arity {
+                    signature.params.push(AbiParam::new(types::I64));
+                }
+                if builtin == StableDateBuiltin::DateCreate {
                     signature.params.push(AbiParam::new(types::I64));
                 }
                 signature.returns.push(AbiParam::new(types::I64));
@@ -14203,7 +16147,7 @@ pub(super) fn compile_region_graph_native(
             };
             let exact_compact = if needs_exact_compact {
                 let mut signature = module.make_signature();
-                for _ in 0..5 {
+                for _ in 0..4 {
                     signature.params.push(AbiParam::new(types::I64));
                 }
                 signature.returns.push(AbiParam::new(types::I64));
@@ -14226,6 +16170,7 @@ pub(super) fn compile_region_graph_native(
                     StableFrameIntrospectionBuiltin::NumArgs
                     | StableFrameIntrospectionBuiltin::GetArgs => 0,
                     StableFrameIntrospectionBuiltin::GetArg => 1,
+                    StableFrameIntrospectionBuiltin::DebugBacktrace => 3,
                 };
                 for _ in 0..arity {
                     signature.params.push(AbiParam::new(types::I64));
@@ -14350,7 +16295,6 @@ pub(super) fn compile_region_graph_native(
                     | StablePathBuiltin::Filesize
                     | StablePathBuiltin::Filemtime
                     | StablePathBuiltin::Unlink
-                    | StablePathBuiltin::Mkdir
                     | StablePathBuiltin::Rmdir
                     | StablePathBuiltin::Touch
                     | StablePathBuiltin::Fclose
@@ -14389,12 +16333,14 @@ pub(super) fn compile_region_graph_native(
                     | StablePathBuiltin::Chmod
                     | StablePathBuiltin::Symlink
                     | StablePathBuiltin::Tempnam => 2,
+                    StablePathBuiltin::MoveUploadedFile => 4,
                     StablePathBuiltin::Fwrite
                     | StablePathBuiltin::Fseek
                     | StablePathBuiltin::File
                     | StablePathBuiltin::StreamGetContents
                     | StablePathBuiltin::StreamSetTimeout => 3,
-                    StablePathBuiltin::StreamCopyToStream
+                    StablePathBuiltin::Mkdir
+                    | StablePathBuiltin::StreamCopyToStream
                     | StablePathBuiltin::FilePutContents
                     | StablePathBuiltin::StreamContextSetOption
                     | StablePathBuiltin::StreamFilterAppend
@@ -14419,6 +16365,9 @@ pub(super) fn compile_region_graph_native(
                     continue;
                 }
                 let mut signature = module.make_signature();
+                if builtin == StableOutputBufferBuiltin::PhpInfo {
+                    signature.params.push(AbiParam::new(types::I64));
+                }
                 signature.returns.push(AbiParam::new(types::I64));
                 signature.returns.push(AbiParam::new(types::I64));
                 exact_output_buffer[builtin.index()] = Some(declare_native_helper(
@@ -14427,6 +16376,270 @@ pub(super) fn compile_region_graph_native(
                     &signature,
                     helper_address(builtin.symbol()),
                 )?);
+            }
+            let exact_var_dump = if needs_exact_var_dump {
+                let mut signature = module.make_signature();
+                signature.params.push(AbiParam::new(types::I32));
+                signature
+                    .params
+                    .push(AbiParam::new(module.target_config().pointer_type()));
+                signature.returns.push(AbiParam::new(types::I64));
+                signature.returns.push(AbiParam::new(types::I64));
+                Some(declare_native_helper(
+                    module,
+                    "phrust_native_var_dump",
+                    &signature,
+                    helper_address("phrust_native_var_dump"),
+                )?)
+            } else {
+                None
+            };
+            let exact_var_export = if needs_exact_var_export {
+                declare_native_control_handler(module, true, "phrust_native_var_export", 2, || {
+                    helper_address("phrust_native_var_export")
+                })?
+            } else {
+                None
+            };
+            let exact_mysqli_set_charset = if needs_exact_mysqli_set_charset {
+                declare_native_control_handler(
+                    module,
+                    true,
+                    "phrust_native_mysqli_set_charset",
+                    2,
+                    || helper_address("phrust_native_mysqli_set_charset"),
+                )?
+            } else {
+                None
+            };
+            let exact_mysqli_query = if needs_exact_mysqli_query {
+                declare_native_control_handler(
+                    module,
+                    true,
+                    "phrust_native_mysqli_query",
+                    2,
+                    || helper_address("phrust_native_mysqli_query"),
+                )?
+            } else {
+                None
+            };
+            let exact_mysqli_fetch_array = if needs_exact_mysqli_fetch_array {
+                declare_native_control_handler(
+                    module,
+                    true,
+                    "phrust_native_mysqli_fetch_array",
+                    2,
+                    || helper_address("phrust_native_mysqli_fetch_array"),
+                )?
+            } else {
+                None
+            };
+            let exact_mysqli_fetch_object = if needs_exact_mysqli_fetch_object {
+                declare_native_control_handler(
+                    module,
+                    true,
+                    "phrust_native_mysqli_fetch_object",
+                    3,
+                    || helper_address("phrust_native_mysqli_fetch_object"),
+                )?
+            } else {
+                None
+            };
+            let exact_mysqli_character_set_name = if needs_exact_mysqli_character_set_name {
+                declare_native_control_handler(
+                    module,
+                    true,
+                    "phrust_native_mysqli_character_set_name",
+                    1,
+                    || helper_address("phrust_native_mysqli_character_set_name"),
+                )?
+            } else {
+                None
+            };
+            let mut exact_mysqli_result_count = [None; StableMysqliResultCountBuiltin::COUNT];
+            for operation in StableMysqliResultCountBuiltin::all() {
+                if !needs_exact_mysqli_result_count[operation.index()] {
+                    continue;
+                }
+                exact_mysqli_result_count[operation.index()] = Some(
+                    declare_native_control_handler(module, true, operation.symbol(), 1, || {
+                        helper_address(operation.symbol())
+                    })?
+                    .expect("required mysqli result count handler"),
+                );
+            }
+            let exact_mysqli_fetch_field = if needs_exact_mysqli_fetch_field {
+                declare_native_control_handler(
+                    module,
+                    true,
+                    "phrust_native_mysqli_fetch_field",
+                    1,
+                    || helper_address("phrust_native_mysqli_fetch_field"),
+                )?
+            } else {
+                None
+            };
+            let mut exact_mysqli_connect_status = [None; StableMysqliConnectStatusBuiltin::COUNT];
+            for operation in StableMysqliConnectStatusBuiltin::all() {
+                if !needs_exact_mysqli_connect_status[operation.index()] {
+                    continue;
+                }
+                exact_mysqli_connect_status[operation.index()] = Some(
+                    declare_native_control_handler(module, true, operation.symbol(), 0, || {
+                        helper_address(operation.symbol())
+                    })?
+                    .expect("required mysqli connect status handler"),
+                );
+            }
+            let exact_mysqli_close = if needs_exact_mysqli_close {
+                declare_native_control_handler(
+                    module,
+                    true,
+                    "phrust_native_mysqli_close",
+                    1,
+                    || helper_address("phrust_native_mysqli_close"),
+                )?
+            } else {
+                None
+            };
+            let exact_mysqli_get_server_info = if needs_exact_mysqli_get_server_info {
+                declare_native_control_handler(
+                    module,
+                    true,
+                    "phrust_native_mysqli_get_server_info",
+                    1,
+                    || helper_address("phrust_native_mysqli_get_server_info"),
+                )?
+            } else {
+                None
+            };
+            let exact_mysqli_select_db = if needs_exact_mysqli_select_db {
+                declare_native_control_handler(
+                    module,
+                    true,
+                    "phrust_native_mysqli_select_db",
+                    2,
+                    || helper_address("phrust_native_mysqli_select_db"),
+                )?
+            } else {
+                None
+            };
+            let exact_mysqli_real_escape_string = if needs_exact_mysqli_real_escape_string {
+                declare_native_control_handler(
+                    module,
+                    true,
+                    "phrust_native_mysqli_real_escape_string",
+                    2,
+                    || helper_address("phrust_native_mysqli_real_escape_string"),
+                )?
+            } else {
+                None
+            };
+            let mut exact_mysqli_connection_status =
+                [None; StableMysqliConnectionStatusBuiltin::COUNT];
+            for operation in StableMysqliConnectionStatusBuiltin::all() {
+                if !needs_exact_mysqli_connection_status[operation.index()] {
+                    continue;
+                }
+                exact_mysqli_connection_status[operation.index()] = Some(
+                    declare_native_control_handler(module, true, operation.symbol(), 1, || {
+                        helper_address(operation.symbol())
+                    })?
+                    .expect("required mysqli connection status handler"),
+                );
+            }
+            let exact_error_log = if needs_exact_error_log {
+                declare_native_control_handler(module, true, "phrust_native_error_log", 4, || {
+                    helper_address("phrust_native_error_log")
+                })?
+            } else {
+                None
+            };
+            let exact_sleep = declare_native_control_handler(
+                module,
+                needs_exact_sleep,
+                "phrust_native_sleep",
+                1,
+                || helper_address("phrust_native_sleep"),
+            )?;
+            let exact_mysqli_free_result = if needs_exact_mysqli_free_result {
+                declare_native_control_handler(
+                    module,
+                    true,
+                    "phrust_native_mysqli_free_result",
+                    1,
+                    || helper_address("phrust_native_mysqli_free_result"),
+                )?
+            } else {
+                None
+            };
+            let exact_mysqli_more_results = declare_native_control_handler(
+                module,
+                needs_exact_mysqli_more_results,
+                "phrust_native_mysqli_more_results",
+                1,
+                || helper_address("phrust_native_mysqli_more_results"),
+            )?;
+            let exact_mysqli_next_result = declare_native_control_handler(
+                module,
+                needs_exact_mysqli_next_result,
+                "phrust_native_mysqli_next_result",
+                1,
+                || helper_address("phrust_native_mysqli_next_result"),
+            )?;
+            let exact_mysqli_report = declare_native_control_handler(
+                module,
+                needs_exact_mysqli_report,
+                "phrust_native_mysqli_report",
+                1,
+                || helper_address("phrust_native_mysqli_report"),
+            )?;
+            let exact_mysqli_init = declare_native_control_handler(
+                module,
+                needs_exact_mysqli_init,
+                "phrust_native_mysqli_init",
+                0,
+                || helper_address("phrust_native_mysqli_init"),
+            )?;
+            let exact_mysqli_options = declare_native_control_handler(
+                module,
+                needs_exact_mysqli_options,
+                "phrust_native_mysqli_options",
+                3,
+                || helper_address("phrust_native_mysqli_options"),
+            )?;
+            let exact_mysqli_real_connect = declare_native_control_handler(
+                module,
+                needs_exact_mysqli_real_connect,
+                "phrust_native_mysqli_real_connect",
+                8,
+                || helper_address("phrust_native_mysqli_real_connect"),
+            )?;
+            let exact_print = if needs_exact_print {
+                declare_native_control_handler(module, true, "phrust_native_print", 1, || {
+                    helper_address("phrust_native_print")
+                })?
+            } else {
+                None
+            };
+            let exact_print_r = if needs_exact_print_r {
+                declare_native_control_handler(module, true, "phrust_native_print_r", 2, || {
+                    helper_address("phrust_native_print_r")
+                })?
+            } else {
+                None
+            };
+            let mut exact_throwable_method = [None; StableThrowableMethod::COUNT];
+            for method in StableThrowableMethod::all() {
+                if !needs_exact_throwable_method[method.index()] {
+                    continue;
+                }
+                exact_throwable_method[method.index()] = Some(
+                    declare_native_control_handler(module, true, method.symbol(), 1, || {
+                        helper_address(method.symbol())
+                    })?
+                    .expect("required Throwable method handler"),
+                );
             }
             let array_union = declare_native_control_handler(
                 module,
@@ -14470,7 +16683,17 @@ pub(super) fn compile_region_graph_native(
                     || helper_address(native_exact_unary_symbol(operation)),
                 )?;
             }
-            native_operations.exact_unary = exact_unary;
+            let mut exact_arithmetic = [None; NATIVE_EXACT_ARITHMETIC_COUNT];
+            for operation in NATIVE_EXACT_ARITHMETIC_OPERATIONS {
+                let index = native_exact_arithmetic_index(operation);
+                exact_arithmetic[index] = declare_native_control_handler(
+                    module,
+                    needs_exact_arithmetic[index],
+                    native_exact_arithmetic_symbol(operation),
+                    5,
+                    || helper_address(native_exact_arithmetic_symbol(operation)),
+                )?;
+            }
             let mut exact_compare = [None; NATIVE_EXACT_COMPARE_COUNT];
             for operation in NATIVE_EXACT_COMPARE_OPERATIONS {
                 let index = native_exact_compare_index(operation);
@@ -14482,7 +16705,6 @@ pub(super) fn compile_region_graph_native(
                     || helper_address(native_exact_compare_symbol(operation)),
                 )?;
             }
-            native_operations.exact_compare = exact_compare;
             let echo_bytes = if needs_direct_echo {
                 let mut bytes_signature = module.make_signature();
                 bytes_signature.params.push(AbiParam::new(pointer_type));
@@ -14494,6 +16716,79 @@ pub(super) fn compile_region_graph_native(
                     helper_address("phrust_native_echo_bytes"),
                 )?;
                 Some(bytes)
+            } else {
+                None
+            };
+            let undefined_variable_warning = if needs_undefined_variable_warning {
+                let mut signature = module.make_signature();
+                signature.params.push(AbiParam::new(pointer_type));
+                signature.params.push(AbiParam::new(types::I64));
+                signature.params.push(AbiParam::new(types::I64));
+                signature.params.push(AbiParam::new(types::I64));
+                signature.returns.push(AbiParam::new(types::I32));
+                Some(declare_native_helper(
+                    module,
+                    "phrust_native_undefined_variable_warning",
+                    &signature,
+                    helper_address("phrust_native_undefined_variable_warning"),
+                )?)
+            } else {
+                None
+            };
+            let undefined_array_key_warning = if needs_undefined_array_key_warning {
+                let mut signature = module.make_signature();
+                signature.params.push(AbiParam::new(types::I64));
+                signature.params.push(AbiParam::new(types::I64));
+                signature.params.push(AbiParam::new(types::I64));
+                signature.returns.push(AbiParam::new(types::I32));
+                Some(declare_native_helper(
+                    module,
+                    "phrust_native_undefined_array_key_warning",
+                    &signature,
+                    helper_address("phrust_native_undefined_array_key_warning"),
+                )?)
+            } else {
+                None
+            };
+            let array_offset_warning = if needs_undefined_array_key_warning {
+                let mut signature = module.make_signature();
+                signature.params.push(AbiParam::new(types::I64));
+                signature.params.push(AbiParam::new(types::I64));
+                signature.params.push(AbiParam::new(types::I64));
+                signature.returns.push(AbiParam::new(types::I32));
+                Some(declare_native_helper(
+                    module,
+                    "phrust_native_array_offset_warning",
+                    &signature,
+                    helper_address("phrust_native_array_offset_warning"),
+                )?)
+            } else {
+                None
+            };
+            let global_binding_unset = if needs_global_binding_unset {
+                let mut signature = module.make_signature();
+                signature.params.push(AbiParam::new(types::I64));
+                signature.returns.push(AbiParam::new(types::I32));
+                Some(declare_native_helper(
+                    module,
+                    "phrust_native_global_binding_unset",
+                    &signature,
+                    helper_address("phrust_native_global_binding_unset"),
+                )?)
+            } else {
+                None
+            };
+            let global_binding_rebind = if needs_global_binding_rebind {
+                let mut signature = module.make_signature();
+                signature.params.push(AbiParam::new(types::I64));
+                signature.params.push(AbiParam::new(types::I64));
+                signature.returns.push(AbiParam::new(types::I32));
+                Some(declare_native_helper(
+                    module,
+                    "phrust_native_global_binding_rebind",
+                    &signature,
+                    helper_address("phrust_native_global_binding_rebind"),
+                )?)
             } else {
                 None
             };
@@ -14628,6 +16923,13 @@ pub(super) fn compile_region_graph_native(
             } else {
                 None
             };
+            let type_name = declare_native_control_handler(
+                module,
+                needs_type_name,
+                "phrust_native_type_name",
+                2,
+                || helper_address("phrust_native_type_name"),
+            )?;
             let acquire_callable = declare_native_control_handler(
                 module,
                 needs_acquire_callable,
@@ -14635,11 +16937,25 @@ pub(super) fn compile_region_graph_native(
                 1,
                 || helper_address("phrust_native_acquire_callable"),
             )?;
+            let acquire_method_callable = declare_native_control_handler(
+                module,
+                needs_acquire_method_callable,
+                "phrust_native_acquire_method_callable",
+                5,
+                || helper_address("phrust_native_acquire_method_callable"),
+            )?;
+            let acquire_class_plan = declare_native_control_handler(
+                module,
+                needs_acquire_class_plan,
+                "phrust_native_acquire_class_plan",
+                2,
+                || helper_address("phrust_native_acquire_class_plan"),
+            )?;
             let resolve_callable = declare_native_control_handler(
                 module,
                 needs_resolve_callable,
                 "phrust_native_resolve_callable",
-                5,
+                9,
                 || helper_address("phrust_native_resolve_callable"),
             )?;
             let prepared_object_new = if needs_prepared_object_new {
@@ -14660,6 +16976,8 @@ pub(super) fn compile_region_graph_native(
                 let mut signature = module.make_signature();
                 signature.params.push(AbiParam::new(types::I64));
                 signature.params.push(AbiParam::new(types::I64));
+                signature.params.push(AbiParam::new(types::I64));
+                signature.params.push(AbiParam::new(types::I64));
                 signature.returns.push(AbiParam::new(types::I64));
                 signature.returns.push(AbiParam::new(types::I64));
                 Some(declare_native_helper(
@@ -14671,6 +16989,41 @@ pub(super) fn compile_region_graph_native(
             } else {
                 None
             };
+            let static_property_contract = declare_native_control_handler(
+                module,
+                needs_static_property_contract,
+                "phrust_native_static_property_contract",
+                2,
+                || helper_address("phrust_native_static_property_contract"),
+            )?;
+            let typed_static_reference_bind = declare_native_control_handler(
+                module,
+                needs_typed_static_reference_bind,
+                "phrust_native_typed_static_reference_bind",
+                2,
+                || helper_address("phrust_native_typed_static_reference_bind"),
+            )?;
+            let typed_reference_store = declare_native_control_handler(
+                module,
+                needs_typed_reference_store,
+                "phrust_native_typed_reference_store",
+                2,
+                || helper_address("phrust_native_typed_reference_store"),
+            )?;
+            let typed_reference_array_init = declare_native_control_handler(
+                module,
+                needs_typed_reference_array_init,
+                "phrust_native_typed_reference_array_init",
+                1,
+                || helper_address("phrust_native_typed_reference_array_init"),
+            )?;
+            let undefined_constant = declare_native_control_handler(
+                module,
+                needs_undefined_constant,
+                "phrust_native_undefined_constant",
+                1,
+                || helper_address("phrust_native_undefined_constant"),
+            )?;
             let prepared_closure_new = if needs_prepared_closure_new {
                 let mut signature = module.make_signature();
                 signature.params.push(AbiParam::new(types::I64));
@@ -14708,6 +17061,13 @@ pub(super) fn compile_region_graph_native(
                 2,
                 || helper_address("phrust_native_dynamic_property_slot"),
             )?;
+            let named_dynamic_property_slot = declare_native_control_handler(
+                module,
+                needs_named_dynamic_property_slot,
+                "phrust_native_named_dynamic_property_slot",
+                3,
+                || helper_address("phrust_native_named_dynamic_property_slot"),
+            )?;
             let dynamic_property_test_slot = declare_native_control_handler(
                 module,
                 needs_dynamic_property_test_slot,
@@ -14715,42 +17075,13 @@ pub(super) fn compile_region_graph_native(
                 2,
                 || helper_address("phrust_native_dynamic_property_test_slot"),
             )?;
-            for operation in RegionSemanticOperationId::all() {
-                if !baseline_helper_imports || !needs_exact_semantic[operation.index()] {
-                    continue;
-                }
-                let mut signature = module.make_signature();
-                signature.params.push(AbiParam::new(pointer_type));
-                signature.params.push(AbiParam::new(types::I32));
-                signature.params.push(AbiParam::new(pointer_type));
-                signature.params.push(AbiParam::new(pointer_type));
-                signature.returns.push(AbiParam::new(types::I32));
-                native_operations.exact_semantic[operation.index()] = Some(declare_native_helper(
-                    module,
-                    operation.exact_symbol(),
-                    &signature,
-                    helper_address(operation.exact_symbol()),
-                )?);
-            }
-            if needs_function_resolver {
-                let mut signature = module.make_signature();
-                signature.params.push(AbiParam::new(types::I64));
-                signature.params.push(AbiParam::new(types::I64));
-                signature.returns.push(AbiParam::new(types::I32));
-                native_operations.function_resolve = Some(declare_native_helper(
-                    module,
-                    &native_function_resolve_symbol,
-                    &signature,
-                    helper_address(&native_function_resolve_symbol),
-                )?);
-            }
             if needs_frame_arena {
                 let mut alloc_signature = module.make_signature();
                 alloc_signature.params.push(AbiParam::new(types::I64));
                 alloc_signature.params.push(AbiParam::new(types::I64));
                 alloc_signature.params.push(AbiParam::new(types::I64));
                 alloc_signature.returns.push(AbiParam::new(pointer_type));
-                native_operations.frame_alloc = Some(declare_native_helper(
+                frame_alloc = Some(declare_native_helper(
                     module,
                     "phrust_native_frame_alloc",
                     &alloc_signature,
@@ -14760,278 +17091,74 @@ pub(super) fn compile_region_graph_native(
                 release_signature.params.push(AbiParam::new(types::I64));
                 release_signature.params.push(AbiParam::new(pointer_type));
                 release_signature.returns.push(AbiParam::new(types::I32));
-                native_operations.frame_release = Some(declare_native_helper(
+                frame_release = Some(declare_native_helper(
                     module,
                     "phrust_native_frame_release",
                     &release_signature,
                     helper_address("phrust_native_frame_release"),
                 )?);
             }
-            for (index, symbol) in NATIVE_EXACT_BINARY_SYMBOLS.into_iter().enumerate() {
-                if needs_exact_binary[index] {
-                    native_operations.exact_binary.0[index] = Some(declare_exact_value_operation(
-                        module,
-                        symbol,
-                        3,
-                        helper_address(symbol),
-                    )?);
-                }
-            }
-            for (index, symbol) in NATIVE_EXACT_CAST_SYMBOLS.into_iter().enumerate() {
-                if needs_exact_cast[index] {
-                    native_operations.exact_cast.0[index] = Some(declare_exact_value_operation(
-                        module,
-                        symbol,
-                        2,
-                        helper_address(symbol),
-                    )?);
-                }
-            }
-            if needs_echo {
+            let object_release_prepare = if runtime_helpers.native_object_release[0] != 0 {
+                let mut signature = module.make_signature();
+                signature.params.push(AbiParam::new(types::I64));
+                signature.params.push(AbiParam::new(pointer_type));
+                signature.returns.push(AbiParam::new(types::I32));
+                Some(declare_native_helper(
+                    module,
+                    "phrust_native_object_release_prepare",
+                    &signature,
+                    runtime_helpers.native_object_release[0],
+                )?)
+            } else {
+                None
+            };
+            let object_release_finalize = if runtime_helpers.native_object_release[1] != 0 {
+                let mut signature = module.make_signature();
+                signature.params.push(AbiParam::new(types::I64));
+                signature.params.push(AbiParam::new(pointer_type));
+                signature.returns.push(AbiParam::new(types::I32));
+                Some(declare_native_helper(
+                    module,
+                    "phrust_native_object_release_finalize",
+                    &signature,
+                    runtime_helpers.native_object_release[1],
+                )?)
+            } else {
+                None
+            };
+            let object_release_children_drop = if runtime_helpers.native_object_release[2] != 0 {
                 let mut signature = module.make_signature();
                 signature.params.push(AbiParam::new(types::I64));
                 signature.returns.push(AbiParam::new(types::I32));
-                native_operations.echo = Some(declare_native_helper(
+                Some(declare_native_helper(
                     module,
-                    "phrust_native_echo",
+                    "phrust_native_object_release_children_drop",
                     &signature,
-                    helper_address("phrust_native_echo"),
-                )?);
-            }
-            if needs_local_fetch {
-                for (index, symbol) in NATIVE_EXACT_LOCAL_FETCH_SYMBOLS.into_iter().enumerate() {
-                    native_operations.local_fetch[index] = Some(declare_exact_value_operation(
-                        module,
-                        symbol,
-                        5,
-                        helper_address(symbol),
-                    )?);
-                }
-            }
-            if needs_local_store {
-                for (index, symbol) in NATIVE_EXACT_LOCAL_STORE_SYMBOLS.into_iter().enumerate() {
-                    native_operations.local_store[index] = Some(declare_exact_value_operation(
-                        module,
-                        symbol,
-                        4,
-                        helper_address(symbol),
-                    )?);
-                }
-            }
-            if needs_value_release {
-                let mut signature = module.make_signature();
-                signature.params.push(AbiParam::new(types::I64));
-                signature.returns.push(AbiParam::new(types::I32));
-                native_operations.value_release = Some(declare_native_helper(
-                    module,
-                    "phrust_native_value_release",
-                    &signature,
-                    helper_address("phrust_native_value_release"),
-                )?);
-            }
-            if needs_reference_bind {
-                for (index, symbol) in NATIVE_EXACT_REFERENCE_SYMBOLS.into_iter().enumerate() {
-                    if index == 5 {
-                        continue;
-                    }
-                    native_operations.reference_bind[index] = Some(declare_exact_value_operation(
-                        module,
-                        symbol,
-                        3,
-                        helper_address(symbol),
-                    )?);
-                }
-            }
+                    runtime_helpers.native_object_release[2],
+                )?)
+            } else {
+                None
+            };
             if needs_argument_check {
-                native_operations.argument_check = Some(declare_baseline_value_operation(
+                native_operations.argument_check = Some(declare_native_value_contract(
                     module,
-                    "phrust_native_argument_check",
-                    5,
-                    helper_address("phrust_native_argument_check"),
+                    "phrust_native_declared_argument_contract",
+                    3,
+                    helper_address("phrust_native_declared_argument_contract"),
                 )?);
             }
             if needs_return_check {
-                native_operations.return_check = Some(declare_baseline_value_operation(
+                native_operations.return_check = Some(declare_native_value_contract(
                     module,
-                    "phrust_native_return_check",
+                    "phrust_native_declared_return_contract",
                     2,
-                    helper_address("phrust_native_return_check"),
-                )?);
-            }
-            if needs_exception_new {
-                native_operations.exception_new = Some(declare_baseline_value_operation(
-                    module,
-                    "phrust_native_exception_new",
-                    3,
-                    helper_address("phrust_native_exception_new"),
-                )?);
-            }
-            if needs_array_new {
-                native_operations.array_new = Some(declare_baseline_value_operation(
-                    module,
-                    "phrust_native_array_new",
-                    0,
-                    helper_address("phrust_native_array_new"),
-                )?);
-            }
-            if needs_object_new {
-                native_operations.object_new = Some(declare_baseline_value_operation(
-                    module,
-                    "phrust_native_object_new",
-                    0,
-                    helper_address("phrust_native_object_new"),
-                )?);
-            }
-            if needs_property_fetch {
-                native_operations.property_fetch = Some(declare_baseline_value_operation(
-                    module,
-                    "phrust_native_property_fetch",
-                    3,
-                    helper_address("phrust_native_property_fetch"),
-                )?);
-            }
-            if needs_property_assign {
-                native_operations.property_assign = Some(declare_baseline_value_operation(
-                    module,
-                    "phrust_native_property_assign",
-                    4,
-                    helper_address("phrust_native_property_assign"),
-                )?);
-            }
-            if needs_object_clone {
-                native_operations.object_clone = Some(declare_baseline_value_operation(
-                    module,
-                    "phrust_native_object_clone",
-                    1,
-                    helper_address("phrust_native_object_clone"),
-                )?);
-            }
-            if needs_object_clone_with {
-                native_operations.object_clone_with = Some(declare_baseline_value_operation(
-                    module,
-                    "phrust_native_object_clone_with",
-                    2,
-                    helper_address("phrust_native_object_clone_with"),
-                )?);
-            }
-            if needs_array_insert {
-                for (index, symbol) in NATIVE_EXACT_ARRAY_INSERT_SYMBOLS.into_iter().enumerate() {
-                    native_operations.array_insert.0[index] = Some(declare_exact_value_operation(
-                        module,
-                        symbol,
-                        3,
-                        helper_address(symbol),
-                    )?);
-                }
-                for (index, symbol) in NATIVE_EXACT_ARRAY_INSERT_LOCAL_SYMBOLS
-                    .into_iter()
-                    .enumerate()
-                {
-                    native_operations.array_insert_local.0[index] = Some(
-                        declare_exact_value_operation(module, symbol, 3, helper_address(symbol))?,
-                    );
-                }
-            }
-            if needs_array_fetch {
-                for (index, symbol) in NATIVE_EXACT_ARRAY_FETCH_SYMBOLS.into_iter().enumerate() {
-                    native_operations.array_fetch.0[index] = Some(declare_exact_value_operation(
-                        module,
-                        symbol,
-                        2,
-                        helper_address(symbol),
-                    )?);
-                }
-            }
-            if needs_array_unset {
-                native_operations.array_unset = Some(declare_baseline_value_operation(
-                    module,
-                    "phrust_native_array_unset",
-                    2,
-                    helper_address("phrust_native_array_unset"),
-                )?);
-            }
-            if needs_array_spread {
-                native_operations.array_spread = Some(declare_baseline_value_operation(
-                    module,
-                    "phrust_native_array_spread",
-                    2,
-                    helper_address("phrust_native_array_spread"),
-                )?);
-            }
-            if needs_foreach_init {
-                native_operations.foreach_init = Some(declare_baseline_value_operation(
-                    module,
-                    "phrust_native_foreach_init",
-                    3,
-                    helper_address("phrust_native_foreach_init"),
-                )?);
-            }
-            if needs_foreach_next {
-                let mut signature = module.make_signature();
-                signature.params.push(AbiParam::new(types::I64));
-                signature.params.push(AbiParam::new(pointer_type));
-                signature.params.push(AbiParam::new(pointer_type));
-                signature.params.push(AbiParam::new(pointer_type));
-                signature.params.push(AbiParam::new(pointer_type));
-                signature.returns.push(AbiParam::new(types::I32));
-                native_operations.foreach_next = Some(declare_native_helper(
-                    module,
-                    "phrust_native_foreach_next",
-                    &signature,
-                    helper_address("phrust_native_foreach_next"),
-                )?);
-            }
-            if needs_foreach_cleanup {
-                let mut signature = module.make_signature();
-                signature.params.push(AbiParam::new(types::I64));
-                signature.returns.push(AbiParam::new(types::I32));
-                native_operations.foreach_cleanup = Some(declare_native_helper(
-                    module,
-                    "phrust_native_foreach_cleanup",
-                    &signature,
-                    helper_address("phrust_native_foreach_cleanup"),
-                )?);
-            }
-            if needs_constant_fetch {
-                native_operations.constant_fetch = Some(declare_baseline_value_operation(
-                    module,
-                    "phrust_native_constant_fetch",
-                    2,
-                    helper_address("phrust_native_constant_fetch"),
-                )?);
-            }
-            if needs_type_predicate {
-                native_operations.type_predicate = Some(declare_baseline_value_operation(
-                    module,
-                    "phrust_native_type_predicate",
-                    1,
-                    helper_address("phrust_native_type_predicate"),
-                )?);
-            }
-            if needs_stable_length {
-                native_operations.stable_length = Some(declare_baseline_value_operation(
-                    module,
-                    "phrust_native_stable_length",
-                    3,
-                    helper_address("phrust_native_stable_length"),
-                )?);
-            }
-            if needs_runtime_fatal {
-                let mut signature = module.make_signature();
-                signature.params.push(AbiParam::new(types::I32));
-                signature.params.push(AbiParam::new(types::I32));
-                signature.returns.push(AbiParam::new(types::I32));
-                native_operations.runtime_fatal = Some(declare_native_helper(
-                    module,
-                    "phrust_native_runtime_fatal",
-                    &signature,
-                    helper_address("phrust_native_runtime_fatal"),
+                    helper_address("phrust_native_declared_return_contract"),
                 )?);
             }
             if needs_execution_poll {
                 let mut signature = module.make_signature();
                 signature.returns.push(AbiParam::new(types::I32));
-                native_operations.execution_poll = Some(declare_native_helper(
+                execution_poll = Some(declare_native_helper(
                     module,
                     "phrust_native_execution_poll",
                     &signature,
@@ -15064,17 +17191,25 @@ pub(super) fn compile_region_graph_native(
             })?;
             let mut next_synthetic = synthetic_base;
             macro_rules! exact_operations {
-                ($array_ensure_unique:expr, $array_ensure_unique_symbol:expr,
+                ($array_allocate:expr, $array_allocate_symbol:expr,
+                 $array_lookup:expr, $array_lookup_symbol:expr,
+                 $array_ensure_unique:expr, $array_ensure_unique_symbol:expr,
                  $array_child_entry:expr, $array_child_entry_symbol:expr,
                  $value_release_commit:expr, $value_release_commit_symbol:expr) => {
                     NativeOptimizingOperations {
-                        execution_poll: native_operations.execution_poll,
+                        execution_poll,
                         array_union,
                         concat,
                         string_bitwise,
                         exact_unary,
+                        exact_arithmetic,
                         exact_compare,
                         echo_bytes,
+                        undefined_variable_warning,
+                        undefined_array_key_warning,
+                        array_offset_warning,
+                        global_binding_unset,
+                        global_binding_rebind,
                         float_to_string,
                         numeric_string,
                         fmod_f64,
@@ -15087,13 +17222,22 @@ pub(super) fn compile_region_graph_native(
                         callback_return_string,
                         object_cast,
                         object_class_name,
+                        type_name,
                         acquire_callable,
+                        acquire_method_callable,
+                        acquire_class_plan,
                         resolve_callable,
                         prepared_object_new,
                         prepared_exception_new,
+                        static_property_contract,
+                        typed_static_reference_bind,
+                        typed_reference_store,
+                        typed_reference_array_init,
+                        undefined_constant,
                         prepared_closure_new,
                         plain_object_clone,
                         dynamic_property_slot,
+                        named_dynamic_property_slot,
                         dynamic_property_test_slot,
                         exact_symbol_query,
                         exact_pcre,
@@ -15129,6 +17273,7 @@ pub(super) fn compile_region_graph_native(
                         exact_memory_query,
                         exact_gc,
                         exact_resource_query,
+                        exact_fileinfo,
                         exact_error_state,
                         exact_settype,
                         exact_configuration,
@@ -15148,6 +17293,42 @@ pub(super) fn compile_region_graph_native(
                         exact_compression_codec,
                         exact_path,
                         exact_output_buffer,
+                        exact_print,
+                        exact_print_r,
+                        exact_var_dump,
+                        exact_var_export,
+                        exact_mysqli_set_charset,
+                        exact_mysqli_query,
+                        exact_mysqli_fetch_array,
+                        exact_mysqli_fetch_object,
+                        exact_mysqli_character_set_name,
+                        exact_mysqli_result_count,
+                        exact_mysqli_fetch_field,
+                        exact_mysqli_connect_status,
+                        exact_mysqli_close,
+                        exact_mysqli_get_server_info,
+                        exact_mysqli_select_db,
+                        exact_mysqli_real_escape_string,
+                        exact_mysqli_connection_status,
+                        exact_error_log,
+                        exact_sleep,
+                        exact_mysqli_free_result,
+                        exact_mysqli_more_results,
+                        exact_mysqli_next_result,
+                        exact_mysqli_report,
+                        exact_mysqli_init,
+                        exact_mysqli_options,
+                        exact_mysqli_real_connect,
+                        exact_throwable_method,
+                        frame_alloc,
+                        frame_release,
+                        object_release_prepare,
+                        object_release_finalize,
+                        object_release_children_drop,
+                        array_allocate: $array_allocate,
+                        array_allocate_symbol: $array_allocate_symbol,
+                        array_lookup: $array_lookup,
+                        array_lookup_symbol: $array_lookup_symbol,
                         array_ensure_unique: $array_ensure_unique,
                         array_ensure_unique_symbol: $array_ensure_unique_symbol,
                         array_child_entry: $array_child_entry,
@@ -15157,7 +17338,49 @@ pub(super) fn compile_region_graph_native(
                     }
                 };
             }
+            let array_allocate_symbol = FunctionId::new(next_synthetic);
+            next_synthetic = next_synthetic.checked_add(1).ok_or_else(|| {
+                CraneliftLoweringError::new(
+                    "JIT_CRANELIFT_FRAGMENT_SYMBOL_LIMIT",
+                    "native direct-array allocator symbol id overflowed",
+                )
+            })?;
+            let symbol = format!("{name}.native.array_allocate");
+            let array_allocate = module
+                .declare_function(
+                    &symbol,
+                    Linkage::Local,
+                    &direct_array_allocate_signature(module),
+                )
+                .map_err(|error| {
+                    CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_REJECT_DECLARE",
+                        format!("failed to declare {symbol}: {error}"),
+                    )
+                })?;
+            functions.insert(array_allocate_symbol, array_allocate);
             let tier_operations = if baseline_helper_imports {
+                let array_lookup_symbol = FunctionId::new(next_synthetic);
+                next_synthetic = next_synthetic.checked_add(1).ok_or_else(|| {
+                    CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_FRAGMENT_SYMBOL_LIMIT",
+                        "native exact array-lookup symbol id overflowed",
+                    )
+                })?;
+                let symbol = format!("{name}.native.array_lookup");
+                let array_lookup = module
+                    .declare_function(
+                        &symbol,
+                        Linkage::Local,
+                        &direct_array_lookup_signature(module),
+                    )
+                    .map_err(|error| {
+                        CraneliftLoweringError::new(
+                            "JIT_CRANELIFT_REJECT_DECLARE",
+                            format!("failed to declare {symbol}: {error}"),
+                        )
+                    })?;
+                functions.insert(array_lookup_symbol, array_lookup);
                 let array_ensure_unique_symbol = FunctionId::new(next_synthetic);
                 next_synthetic = next_synthetic.checked_add(1).ok_or_else(|| {
                     CraneliftLoweringError::new(
@@ -15219,10 +17442,13 @@ pub(super) fn compile_region_graph_native(
                     })?;
                 functions.insert(value_release_commit_symbol, value_release_commit);
                 NativeTierOperations::Generic {
-                    call: native_call_helper,
                     dynamic_code: native_dynamic_code_helper,
                     operations: native_operations,
                     exact_operations: exact_operations!(
+                        array_allocate,
+                        array_allocate_symbol,
+                        array_lookup,
+                        array_lookup_symbol,
                         array_ensure_unique,
                         array_ensure_unique_symbol,
                         array_child_entry,
@@ -15233,6 +17459,24 @@ pub(super) fn compile_region_graph_native(
                     value_release_commit,
                 }
             } else {
+                let array_lookup_symbol = FunctionId::new(next_synthetic);
+                next_synthetic = next_synthetic.checked_add(1).ok_or_else(|| {
+                    CraneliftLoweringError::new(
+                        "JIT_CRANELIFT_FRAGMENT_SYMBOL_LIMIT",
+                        "native optimizing array-lookup symbol id overflowed",
+                    )
+                })?;
+                let symbol = format!("{name}.native.array_lookup");
+                let signature = direct_array_lookup_signature(module);
+                let array_lookup = module
+                    .declare_function(&symbol, Linkage::Local, &signature)
+                    .map_err(|error| {
+                        CraneliftLoweringError::new(
+                            "JIT_CRANELIFT_REJECT_DECLARE",
+                            format!("failed to declare {symbol}: {error}"),
+                        )
+                    })?;
+                functions.insert(array_lookup_symbol, array_lookup);
                 let array_ensure_unique_symbol = FunctionId::new(next_synthetic);
                 next_synthetic = next_synthetic.checked_add(1).ok_or_else(|| {
                     CraneliftLoweringError::new(
@@ -15289,13 +17533,21 @@ pub(super) fn compile_region_graph_native(
                 functions.insert(value_release_commit_symbol, value_release_commit);
                 NativeTierOperations::Optimizing {
                     operations: NativeOptimizingOperations {
-                        execution_poll: native_operations.execution_poll,
+                        execution_poll,
+                        frame_alloc,
+                        frame_release,
                         array_union,
                         concat,
                         string_bitwise,
                         exact_unary,
+                        exact_arithmetic,
                         exact_compare,
                         echo_bytes,
+                        undefined_variable_warning,
+                        undefined_array_key_warning,
+                        array_offset_warning,
+                        global_binding_unset,
+                        global_binding_rebind,
                         float_to_string,
                         numeric_string,
                         fmod_f64,
@@ -15308,13 +17560,22 @@ pub(super) fn compile_region_graph_native(
                         callback_return_string,
                         object_cast,
                         object_class_name,
+                        type_name,
                         acquire_callable,
+                        acquire_method_callable,
+                        acquire_class_plan,
                         resolve_callable,
                         prepared_object_new,
                         prepared_exception_new,
+                        static_property_contract,
+                        typed_static_reference_bind,
+                        typed_reference_store,
+                        typed_reference_array_init,
+                        undefined_constant,
                         prepared_closure_new,
                         plain_object_clone,
                         dynamic_property_slot,
+                        named_dynamic_property_slot,
                         dynamic_property_test_slot,
                         exact_symbol_query,
                         exact_pcre,
@@ -15350,6 +17611,7 @@ pub(super) fn compile_region_graph_native(
                         exact_memory_query,
                         exact_gc,
                         exact_resource_query,
+                        exact_fileinfo,
                         exact_error_state,
                         exact_settype,
                         exact_configuration,
@@ -15369,6 +17631,40 @@ pub(super) fn compile_region_graph_native(
                         exact_compression_codec,
                         exact_path,
                         exact_output_buffer,
+                        exact_print,
+                        exact_print_r,
+                        exact_var_dump,
+                        exact_var_export,
+                        exact_mysqli_set_charset,
+                        exact_mysqli_query,
+                        exact_mysqli_fetch_array,
+                        exact_mysqli_fetch_object,
+                        exact_mysqli_character_set_name,
+                        exact_mysqli_result_count,
+                        exact_mysqli_fetch_field,
+                        exact_mysqli_connect_status,
+                        exact_mysqli_close,
+                        exact_mysqli_get_server_info,
+                        exact_mysqli_select_db,
+                        exact_mysqli_real_escape_string,
+                        exact_mysqli_connection_status,
+                        exact_error_log,
+                        exact_sleep,
+                        exact_mysqli_free_result,
+                        exact_mysqli_more_results,
+                        exact_mysqli_next_result,
+                        exact_mysqli_report,
+                        exact_mysqli_init,
+                        exact_mysqli_options,
+                        exact_mysqli_real_connect,
+                        exact_throwable_method,
+                        object_release_prepare,
+                        object_release_finalize,
+                        object_release_children_drop,
+                        array_allocate,
+                        array_allocate_symbol,
+                        array_lookup,
+                        array_lookup_symbol,
                         array_ensure_unique,
                         array_ensure_unique_symbol,
                         array_child_entry,
@@ -15376,6 +17672,7 @@ pub(super) fn compile_region_graph_native(
                         value_release_commit,
                         value_release_commit_symbol,
                     },
+                    argument_contract: native_operations.argument_check,
                 }
             };
             let (mut fragment_functions, mut fragment_symbols) = declare_fragment_functions(
@@ -15452,7 +17749,12 @@ pub(super) fn compile_region_graph_native(
                     NativeFunctionMetadata {
                         name: ir_function.name.clone(),
                         params: region.params.clone(),
-                        requires_trampoline: trampoline_functions.contains(function),
+                        // A generated callee that can throw still has a complete
+                        // native control result: the direct caller dispatches
+                        // THROW through its published catch/finally route or
+                        // propagates it. Only generator/deprecation entry
+                        // semantics require the separate typed trampoline.
+                        requires_trampoline: ir_function_requires_trampoline(ir_function),
                         native_arity: region.arity(),
                         reference_only_trampoline: (ir_function
                             .params
@@ -15468,6 +17770,7 @@ pub(super) fn compile_region_graph_native(
             }));
             let mut preflighted_whole = None;
             let mut preflighted_fragments = BTreeMap::<u32, DefinedRegionFunction>::new();
+            let mut function_pre_regalloc_replans = 0_usize;
             // A planner-admitted whole optimizing function still needs exact
             // CLIF preflight. Direct calls, ownership, and guards can expand
             // one Region instruction into enough backend state to exceed the
@@ -15504,37 +17807,24 @@ pub(super) fn compile_region_graph_native(
                     )
                 });
                 match preflight {
-                    Ok(defined)
-                        if defined
-                            .pre_regalloc
-                            .exceeds_replan_margin(region.compile_metadata.tier) =>
-                    {
-                        active_plan = NativeCompilePlan::for_bounded_fragments(region);
-                        active_fragment_layout = Some(NativeFunctionFragmentLayout::for_plan(
-                            region,
-                            &active_plan,
-                        )?);
-                        compiled_pre_regalloc_replans
-                            .set(compiled_pre_regalloc_replans.get().saturating_add(1));
-                        (fragment_functions, fragment_symbols) = declare_fragment_functions(
-                            module,
-                            name,
-                            region,
-                            active_fragment_layout.as_ref(),
-                            0,
-                            &mut next_synthetic,
-                            &mut functions,
-                        )?;
-                    }
+                    // Exact preflight has already enforced every backend
+                    // hard ceiling. Keep the ordinary whole-function form
+                    // whenever it succeeds; the planning headroom is a
+                    // diagnostic, not an optimizer-admission rule.
                     Ok(defined) => preflighted_whole = Some(defined),
                     Err(error) if error.code == "JIT_CRANELIFT_PRE_REGALLOC_BUDGET" => {
-                        active_plan = NativeCompilePlan::for_bounded_fragments(region);
+                        let pieces = error.required_pre_regalloc_pieces.unwrap_or(2);
+                        active_plan = active_plan
+                            .refine_fragment_into(region, 0, pieces)
+                            .unwrap_or_else(|| NativeCompilePlan::for_bounded_fragments(region));
                         active_fragment_layout = Some(NativeFunctionFragmentLayout::for_plan(
                             region,
                             &active_plan,
                         )?);
                         compiled_pre_regalloc_replans
                             .set(compiled_pre_regalloc_replans.get().saturating_add(1));
+                        function_pre_regalloc_replans =
+                            function_pre_regalloc_replans.saturating_add(1);
                         (fragment_functions, fragment_symbols) = declare_fragment_functions(
                             module,
                             name,
@@ -15555,8 +17845,11 @@ pub(super) fn compile_region_graph_native(
             // underestimated fragment rejects the complete artifact only
             // after all preceding fragments have already been compiled.
             if active_fragment_layout.is_some() {
-                let remaining_replan_attempts = MAX_PRE_REGALLOC_REPLAN_ATTEMPTS
-                    .saturating_sub(compiled_pre_regalloc_replans.get());
+                // Whole-function preflight may have created the first natural
+                // partition above. That is not a refinement of an already
+                // measured child: charge the bounded refinement allowance
+                // only after fragment preflight identifies exact offenders.
+                let remaining_replan_attempts = MAX_PRE_REGALLOC_FRAGMENT_REFINEMENT_ATTEMPTS;
                 for replan_attempt in 0..=remaining_replan_attempts {
                     let mut offending_fragments = Vec::new();
                     let mut round_preflighted = BTreeMap::new();
@@ -15599,27 +17892,20 @@ pub(super) fn compile_region_graph_native(
                                 )
                             });
                             match preflight {
-                                Ok(defined)
-                                    if defined
-                                        .pre_regalloc
-                                        .exceeds_replan_margin(region.compile_metadata.tier) =>
-                                {
-                                    offending_fragments.push((
-                                        fragment.id,
-                                        defined
-                                            .pre_regalloc
-                                            .minimum_fragment_count(region.compile_metadata.tier),
-                                    ));
-                                }
                                 Ok(defined) => {
                                     round_preflighted.insert(fragment.id, defined);
                                 }
                                 Err(error) if error.code == "JIT_CRANELIFT_PRE_REGALLOC_BUDGET" => {
                                     // A hard-limit rejection does not expose
-                                    // trustworthy metrics. Bisect it and let
-                                    // the next exact preflight size both
-                                    // children before any regalloc work.
-                                    offending_fragments.push((fragment.id, 2));
+                                    // a safe artifact, but exact structural
+                                    // measurement does expose the minimum
+                                    // natural partition count. Refine to that
+                                    // count once and preflight every resulting
+                                    // child before any regalloc work.
+                                    offending_fragments.push((
+                                        fragment.id,
+                                        error.required_pre_regalloc_pieces.unwrap_or(2),
+                                    ));
                                 }
                                 Err(error) => return Err(error),
                             }
@@ -15633,7 +17919,7 @@ pub(super) fn compile_region_graph_native(
                         return Err(CraneliftLoweringError::new(
                             "JIT_CRANELIFT_PRE_REGALLOC_REPLAN_LIMIT",
                             format!(
-                                "fragments {offending_fragments:?} still exceed the exact pre-regalloc safety margin after the single permitted deterministic natural split"
+                                "fragments {offending_fragments:?} still exceed the exact pre-regalloc hard ceiling after the permitted deterministic fragment-refinement round"
                             ),
                         ));
                     }
@@ -15699,7 +17985,7 @@ pub(super) fn compile_region_graph_native(
                             CraneliftLoweringError::new(
                                 "JIT_CRANELIFT_PRE_REGALLOC_UNSPLITTABLE",
                                 format!(
-                                    "function {} fragment {fragment_id} exceeds the exact pre-regalloc safety margin and contains no safe Region-block cut (block:instruction-count={block_shape})",
+                                    "function {} fragment {fragment_id} exceeds the exact pre-regalloc hard ceiling and contains no safe Region-block cut (block:instruction-count={block_shape})",
                                     region.function_name,
                                 ),
                             )
@@ -15707,6 +17993,7 @@ pub(super) fn compile_region_graph_native(
                     }
                     compiled_pre_regalloc_replans
                         .set(compiled_pre_regalloc_replans.get().saturating_add(1));
+                    function_pre_regalloc_replans = function_pre_regalloc_replans.saturating_add(1);
                     active_fragment_layout = Some(NativeFunctionFragmentLayout::for_plan(
                         region,
                         &active_plan,
@@ -15961,18 +18248,48 @@ pub(super) fn compile_region_graph_native(
                 }
                 let referenced = referenced_internal_functions.borrow().clone();
                 match tier_operations {
-                    NativeTierOperations::Optimizing { operations } => {
+                    NativeTierOperations::Optimizing { operations, .. } => {
                         // Optimizing support functions are part of an artifact only
                         // when its emitted CLIF actually relocates to them. The old
                         // unconditional bundle compiled and published all five
                         // bodies even for pure scalar functions. Keep the exact
                         // native dependency closure for the emitted direct paths.
+                        let needs_allocate = referenced.contains(&operations.array_allocate_symbol);
+                        let needs_lookup = referenced.contains(&operations.array_lookup_symbol);
                         let needs_ensure =
                             referenced.contains(&operations.array_ensure_unique_symbol);
                         let needs_child = referenced.contains(&operations.array_child_entry_symbol);
-                        let needs_commit =
-                            referenced.contains(&operations.value_release_commit_symbol);
+                        // The emitted-relocation scan is a sound dependency
+                        // signal for the array leaves, but not for the release
+                        // commit: some regions reach it through a path whose
+                        // call site never surfaces a captured relocation, and
+                        // finalization then rejects the whole region for an
+                        // unresolved local symbol. Define it whenever its exact
+                        // lifecycle leaves exist, which production publishes
+                        // unconditionally.
+                        let needs_commit = referenced
+                            .contains(&operations.value_release_commit_symbol)
+                            || native_lifecycle_leaves_available(&operations);
 
+                        if needs_allocate {
+                            let defined = define_direct_array_allocate_function(
+                                module,
+                                codegen_context,
+                                builder_context,
+                                operations.array_allocate,
+                            )?;
+                            let _ =
+                                append_defined(operations.array_allocate_symbol, 0, 0, defined)?;
+                        }
+                        if needs_lookup {
+                            let defined = define_direct_array_lookup_function(
+                                module,
+                                codegen_context,
+                                builder_context,
+                                operations.array_lookup,
+                            )?;
+                            let _ = append_defined(operations.array_lookup_symbol, 0, 0, defined)?;
+                        }
                         if needs_ensure {
                             let defined = define_direct_array_ensure_unique_function(
                                 module,
@@ -16004,6 +18321,11 @@ pub(super) fn compile_region_graph_native(
                                 builder_context,
                                 operations.value_release_commit,
                                 operations.value_release_commit_symbol,
+                                operations.frame_alloc,
+                                operations.frame_release,
+                                operations.object_release_prepare,
+                                operations.object_release_finalize,
+                                operations.object_release_children_drop,
                             )?;
                             let _ = append_defined(
                                 operations.value_release_commit_symbol,
@@ -16017,6 +18339,25 @@ pub(super) fn compile_region_graph_native(
                         exact_operations: operations,
                         ..
                     } => {
+                        if referenced.contains(&operations.array_allocate_symbol) {
+                            let defined = define_direct_array_allocate_function(
+                                module,
+                                codegen_context,
+                                builder_context,
+                                operations.array_allocate,
+                            )?;
+                            let _ =
+                                append_defined(operations.array_allocate_symbol, 0, 0, defined)?;
+                        }
+                        if referenced.contains(&operations.array_lookup_symbol) {
+                            let defined = define_direct_array_lookup_function(
+                                module,
+                                codegen_context,
+                                builder_context,
+                                operations.array_lookup,
+                            )?;
+                            let _ = append_defined(operations.array_lookup_symbol, 0, 0, defined)?;
+                        }
                         if referenced.contains(&operations.array_ensure_unique_symbol) {
                             let defined = define_direct_array_ensure_unique_function(
                                 module,
@@ -16041,13 +18382,20 @@ pub(super) fn compile_region_graph_native(
                             let _ =
                                 append_defined(operations.array_child_entry_symbol, 0, 0, defined)?;
                         }
-                        if referenced.contains(&operations.value_release_commit_symbol) {
+                        if referenced.contains(&operations.value_release_commit_symbol)
+                            || native_lifecycle_leaves_available(&operations)
+                        {
                             let defined = define_direct_value_release_commit_function(
                                 module,
                                 codegen_context,
                                 builder_context,
                                 operations.value_release_commit,
                                 operations.value_release_commit_symbol,
+                                operations.frame_alloc,
+                                operations.frame_release,
+                                operations.object_release_prepare,
+                                operations.object_release_finalize,
+                                operations.object_release_children_drop,
                             )?;
                             let _ = append_defined(
                                 operations.value_release_commit_symbol,
@@ -16236,6 +18584,16 @@ pub(super) fn compile_region_graph_native(
                         crate::JitRelocatableTarget::Helper(symbol)
                             if matches!(
                                 symbol.as_str(),
+                                "phrust_native_acquire_callable"
+                                    | "phrust_native_acquire_method_callable"
+                                    | "phrust_native_acquire_class_plan"
+                            ) =>
+                        {
+                            None
+                        }
+                        crate::JitRelocatableTarget::Helper(symbol)
+                            if matches!(
+                                symbol.as_str(),
                                 "phrust_native_define"
                                     | "phrust_native_defined"
                                     | "phrust_native_constant"
@@ -16268,14 +18626,19 @@ pub(super) fn compile_region_graph_native(
                                     | "phrust_native_spaceship"
                                     | "phrust_native_object_cast"
                                     | "phrust_native_object_class_name"
-                                    | "phrust_native_acquire_callable"
                                     | "phrust_native_is_callable"
                                     | "phrust_native_resolve_callable"
                                     | "phrust_native_prepared_object_new"
                                     | "phrust_native_prepared_exception_new"
+                                    | "phrust_native_static_property_contract"
+                                    | "phrust_native_typed_static_reference_bind"
+                                    | "phrust_native_typed_reference_store"
+                                    | "phrust_native_typed_reference_array_init"
+                                    | "phrust_native_undefined_constant"
                                     | "phrust_native_prepared_closure_new"
                                     | "phrust_native_plain_object_clone"
                                     | "phrust_native_dynamic_property_slot"
+                                    | "phrust_native_named_dynamic_property_slot"
                                     | "phrust_native_dynamic_property_test_slot"
                                     | "phrust_native_function_exists"
                                     | "phrust_native_class_exists"
@@ -16285,6 +18648,16 @@ pub(super) fn compile_region_graph_native(
                                     | "phrust_native_method_exists"
                                     | "phrust_native_property_exists"
                                     | "phrust_native_execution_poll"
+                                    | "phrust_native_frame_alloc"
+                                    | "phrust_native_frame_release"
+                                    | "phrust_native_object_release_prepare"
+                                    | "phrust_native_object_release_finalize"
+                                    | "phrust_native_object_release_children_drop"
+                                    | "phrust_native_undefined_variable_warning"
+                                    | "phrust_native_undefined_array_key_warning"
+                                    | "phrust_native_array_offset_warning"
+                                    | "phrust_native_global_binding_unset"
+                                    | "phrust_native_global_binding_rebind"
                             )
                                 || symbol.starts_with("phrust_native_preg_")
                                 || symbol.starts_with("phrust_native_json_")
@@ -16418,6 +18791,8 @@ pub(super) fn compile_region_graph_native(
                                         | "phrust_native_hash"
                                         | "phrust_native_hash_hmac"
                                         | "phrust_native_hash_equals"
+                                        | "phrust_native_sodium_crypto_generichash"
+                                        | "phrust_native_sodium_bin2base64"
                                         | "phrust_native_base64_encode"
                                         | "phrust_native_base64_decode"
                                         | "phrust_native_bin2hex"
@@ -16479,6 +18854,7 @@ pub(super) fn compile_region_graph_native(
                                         | "phrust_native_symlink"
                                         | "phrust_native_readfile"
                                         | "phrust_native_is_uploaded_file"
+                                        | "phrust_native_move_uploaded_file"
                                         | "phrust_native_tempnam"
                                         | "phrust_native_tmpfile"
                                         | "phrust_native_filesize"
@@ -16512,7 +18888,48 @@ pub(super) fn compile_region_graph_native(
                                         | "phrust_native_ob_get_level"
                                         | "phrust_native_ob_end_flush"
                                         | "phrust_native_ob_end_clean"
+                                        | "phrust_native_print"
+                                        | "phrust_native_print_r"
+                                        | "phrust_native_var_dump"
+                                        | "phrust_native_var_export"
+                                        | "phrust_native_mysqli_set_charset"
+                                        | "phrust_native_mysqli_query"
+                                        | "phrust_native_mysqli_fetch_array"
+                                        | "phrust_native_mysqli_fetch_object"
+                                        | "phrust_native_mysqli_character_set_name"
+                                        | "phrust_native_mysqli_num_fields"
+                                        | "phrust_native_mysqli_num_rows"
+                                        | "phrust_native_mysqli_fetch_field"
+                                        | "phrust_native_mysqli_connect_errno"
+                                        | "phrust_native_mysqli_connect_error"
+                                        | "phrust_native_mysqli_close"
+                                        | "phrust_native_mysqli_get_server_info"
+                                        | "phrust_native_mysqli_select_db"
+                                        | "phrust_native_mysqli_real_escape_string"
+                                        | "phrust_native_error_log"
+                                        | "phrust_native_sleep"
+                                        | "phrust_native_mysqli_free_result"
+                                        | "phrust_native_mysqli_more_results"
+                                        | "phrust_native_mysqli_next_result"
+                                        | "phrust_native_mysqli_report"
+                                        | "phrust_native_mysqli_init"
+                                        | "phrust_native_mysqli_options"
+                                        | "phrust_native_mysqli_real_connect"
                                 ) =>
+                        {
+                            None
+                        }
+                        crate::JitRelocatableTarget::Helper(symbol)
+                            if StableThrowableMethod::all()
+                                .iter()
+                                .any(|method| method.symbol() == symbol) =>
+                        {
+                            None
+                        }
+                        crate::JitRelocatableTarget::Helper(symbol)
+                            if StableMysqliConnectionStatusBuiltin::all()
+                                .iter()
+                                .any(|operation| operation.symbol() == symbol) =>
                         {
                             None
                         }
@@ -16586,7 +19003,8 @@ pub(super) fn select_native_region_tier(
                 // this local continuation instead of rejecting the function.
                 instruction.optimizer_transition_entry =
                     crate::region_ir::generic_instruction_lowering(&instruction.source_kind)
-                        .requires_safepoint;
+                        .requires_safepoint
+                        || instruction_can_require_local_generic_continuation(&instruction.kind);
                 instruction.transition_live_registers = None;
             }
         }
@@ -16998,6 +19416,26 @@ fn region_graph_signature(
     Ok(native_php_entry_signature(module))
 }
 
+fn direct_array_allocate_signature(module: &JITModule) -> Signature {
+    let pointer_type = module.target_config().pointer_type();
+    let mut signature = module.make_signature();
+    signature.params.push(AbiParam::new(pointer_type));
+    signature.params.push(AbiParam::new(types::I64));
+    signature.returns.push(AbiParam::new(types::I64));
+    signature
+}
+
+fn direct_array_lookup_signature(module: &JITModule) -> Signature {
+    let pointer_type = module.target_config().pointer_type();
+    let mut signature = module.make_signature();
+    signature.params.push(AbiParam::new(pointer_type));
+    signature.params.push(AbiParam::new(types::I64));
+    signature.params.push(AbiParam::new(types::I64));
+    signature.returns.push(AbiParam::new(types::I8));
+    signature.returns.push(AbiParam::new(types::I64));
+    signature
+}
+
 fn direct_array_ensure_unique_signature(module: &JITModule) -> Signature {
     let pointer_type = module.target_config().pointer_type();
     let mut signature = module.make_signature();
@@ -17024,6 +19462,7 @@ fn direct_array_child_entry_signature(module: &JITModule) -> Signature {
 fn direct_value_release_signature(module: &JITModule) -> Signature {
     let pointer_type = module.target_config().pointer_type();
     let mut signature = module.make_signature();
+    signature.params.push(AbiParam::new(pointer_type));
     signature.params.push(AbiParam::new(pointer_type));
     signature.params.push(AbiParam::new(types::I64));
     signature.returns.push(AbiParam::new(types::I8));
@@ -17114,25 +19553,15 @@ pub(super) struct DefinedRegionFunction {
 }
 
 const MAX_NATIVE_SPILL_FRAME_BYTES: u32 = 1024 * 1024;
-const MAX_FRAGMENT_CLIF_BLOCKS: usize = 768;
-const MAX_OPTIMIZING_CLIF_BLOCKS: usize = 4_096;
-const MAX_FRAGMENT_CLIF_VALUES: usize = 16_384;
-const MAX_OPTIMIZING_CLIF_VALUES: usize = 65_536;
-const MAX_FRAGMENT_CLIF_INSTRUCTIONS: usize = 32_768;
-const MAX_OPTIMIZING_CLIF_INSTRUCTIONS: usize = 65_536;
-const MAX_FRAGMENT_BLOCK_PARAMETERS: usize = 4_096;
-const MAX_OPTIMIZING_BLOCK_PARAMETERS: usize = 16_384;
-// Exact CLIF must retain 30% headroom below the absolute backend ceiling.
-// This is intentionally stricter than merely avoiding a hard rejection: it
-// keeps the admitted regalloc graph away from the nonlinear edge while the
-// planner's cheaper estimate remains calibrated independently.
-const PRE_REGALLOC_REPLAN_MARGIN_PERCENT: usize = 70;
-// The planner admits at most 64 Region blocks per fragment. Six bisection
-// rounds are therefore sufficient to reduce every splittable offender to one
-// Exact backend measurement may trigger one deterministic natural split. A
-// remaining offender is structurally unsplittable and is rejected before
-// regalloc; compiling progressively smaller guesses is not a routine plan.
-const MAX_PRE_REGALLOC_REPLAN_ATTEMPTS: usize = 1;
+const MAX_NATIVE_CLIF_BLOCKS: usize = 16_384;
+const MAX_NATIVE_CLIF_VALUES: usize = 262_144;
+const MAX_NATIVE_CLIF_INSTRUCTIONS: usize = 262_144;
+const MAX_NATIVE_BLOCK_PARAMETERS: usize = 65_536;
+// After an optional whole-function partition, exact child measurement may
+// trigger one deterministic fragment-refinement round. A remaining
+// hard-ceiling offender is rejected before regalloc; progressively smaller
+// guesses are not a routine plan.
+const MAX_PRE_REGALLOC_FRAGMENT_REFINEMENT_ATTEMPTS: usize = 1;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(super) struct PreRegallocMetrics {
@@ -17147,55 +19576,18 @@ pub(super) struct PreRegallocMetrics {
 }
 
 impl PreRegallocMetrics {
-    fn limits(tier: NativeCompilerTier) -> (usize, usize, usize, usize) {
-        if tier == NativeCompilerTier::Optimizing {
-            (
-                MAX_OPTIMIZING_CLIF_BLOCKS,
-                MAX_OPTIMIZING_CLIF_VALUES,
-                MAX_OPTIMIZING_CLIF_INSTRUCTIONS,
-                MAX_OPTIMIZING_BLOCK_PARAMETERS,
-            )
-        } else {
-            (
-                MAX_FRAGMENT_CLIF_BLOCKS,
-                MAX_FRAGMENT_CLIF_VALUES,
-                MAX_FRAGMENT_CLIF_INSTRUCTIONS,
-                MAX_FRAGMENT_BLOCK_PARAMETERS,
-            )
-        }
-    }
-
-    fn exceeds_replan_margin(self, tier: NativeCompilerTier) -> bool {
-        let (blocks, values, instructions, parameters) = Self::limits(tier);
-        self.blocks.saturating_mul(100) > blocks.saturating_mul(PRE_REGALLOC_REPLAN_MARGIN_PERCENT)
-            || self.values.saturating_mul(100)
-                > values.saturating_mul(PRE_REGALLOC_REPLAN_MARGIN_PERCENT)
-            || self.instructions.saturating_mul(100)
-                > instructions.saturating_mul(PRE_REGALLOC_REPLAN_MARGIN_PERCENT)
-            || self.block_parameters.saturating_mul(100)
-                > parameters.saturating_mul(PRE_REGALLOC_REPLAN_MARGIN_PERCENT)
-    }
-
-    /// Minimum number of approximately balanced fragments required by the
-    /// largest exact CLIF dimension. This is a planning hint only: every
-    /// resulting fragment is exact-preflighted again before regalloc.
-    fn minimum_fragment_count(self, tier: NativeCompilerTier) -> usize {
-        let percent = PRE_REGALLOC_REPLAN_MARGIN_PERCENT;
-        let (blocks, values, instructions, parameters) = Self::limits(tier);
-        let block_limit = blocks.saturating_mul(percent) / 100;
-        let value_limit = values.saturating_mul(percent) / 100;
-        let instruction_limit = instructions.saturating_mul(percent) / 100;
-        let parameter_limit = parameters.saturating_mul(percent) / 100;
-        [
-            self.blocks.div_ceil(block_limit.max(1)),
-            self.values.div_ceil(value_limit.max(1)),
-            self.instructions.div_ceil(instruction_limit.max(1)),
-            self.block_parameters.div_ceil(parameter_limit.max(1)),
-        ]
-        .into_iter()
-        .max()
-        .unwrap_or(2)
-        .max(2)
+    fn limits(_tier: NativeCompilerTier) -> (usize, usize, usize, usize) {
+        // Generic and Optimizing are code-quality variants of the same
+        // generated function architecture. Applying the former streaming
+        // fragment ceiling to Generic forced otherwise backend-safe bodies
+        // into artificial fragments as soon as an exact out-of-line call
+        // path was present.
+        (
+            MAX_NATIVE_CLIF_BLOCKS,
+            MAX_NATIVE_CLIF_VALUES,
+            MAX_NATIVE_CLIF_INSTRUCTIONS,
+            MAX_NATIVE_BLOCK_PARAMETERS,
+        )
     }
 
     fn max_assign(&mut self, other: Self) {
@@ -17243,34 +19635,41 @@ pub(super) fn validate_pre_regalloc_structure(
         }
     }
     let (maximum_blocks, maximum_values, maximum_instructions, maximum_block_parameters) =
-        if region.compile_metadata.tier == NativeCompilerTier::Optimizing {
-            (
-                MAX_OPTIMIZING_CLIF_BLOCKS,
-                MAX_OPTIMIZING_CLIF_VALUES,
-                MAX_OPTIMIZING_CLIF_INSTRUCTIONS,
-                MAX_OPTIMIZING_BLOCK_PARAMETERS,
-            )
-        } else {
-            (
-                MAX_FRAGMENT_CLIF_BLOCKS,
-                MAX_FRAGMENT_CLIF_VALUES,
-                MAX_FRAGMENT_CLIF_INSTRUCTIONS,
-                MAX_FRAGMENT_BLOCK_PARAMETERS,
-            )
-        };
+        PreRegallocMetrics::limits(region.compile_metadata.tier);
     if blocks > maximum_blocks
         || values > maximum_values
         || instructions > maximum_instructions
         || block_parameters > maximum_block_parameters
     {
-        return Err(CraneliftLoweringError::new(
-            "JIT_CRANELIFT_PRE_REGALLOC_BUDGET",
-            format!(
-                "function {} fragment={} exceeds the pre-regalloc ceiling: clif_blocks={blocks}/{maximum_blocks} clif_values={values}/{maximum_values} clif_instructions={instructions}/{maximum_instructions} block_parameters={block_parameters}/{maximum_block_parameters}",
-                region.function_name,
-                fragment.map_or_else(|| "whole".to_owned(), |id| id.to_string()),
-            ),
-        ));
+        // A child machine function has its own entry/exit and fragment-frame
+        // scaffolding, so partitioning a whole function at the bare observed
+        // ratio can leave every child exactly at (or just above) the same hard
+        // ceiling. Reserve deterministic 25% structural headroom while still
+        // deriving the partition count from finished CLIF, not source chunks.
+        let pieces_with_headroom = |observed: usize, maximum: usize| {
+            observed
+                .saturating_mul(5)
+                .div_ceil(maximum.saturating_mul(4))
+        };
+        let required_pieces = pieces_with_headroom(blocks, maximum_blocks)
+            .max(pieces_with_headroom(values, maximum_values))
+            .max(pieces_with_headroom(instructions, maximum_instructions))
+            .max(pieces_with_headroom(
+                block_parameters,
+                maximum_block_parameters,
+            ))
+            .max(2);
+        return Err(
+            CraneliftLoweringError::new(
+                "JIT_CRANELIFT_PRE_REGALLOC_BUDGET",
+                format!(
+                    "function {} fragment={} exceeds the pre-regalloc ceiling: clif_blocks={blocks}/{maximum_blocks} clif_values={values}/{maximum_values} clif_instructions={instructions}/{maximum_instructions} block_parameters={block_parameters}/{maximum_block_parameters}",
+                    region.function_name,
+                    fragment.map_or_else(|| "whole".to_owned(), |id| id.to_string()),
+                ),
+            )
+            .with_required_pre_regalloc_pieces(required_pieces),
+        );
     }
     Ok(PreRegallocMetrics {
         blocks,
@@ -17282,6 +19681,20 @@ pub(super) fn validate_pre_regalloc_structure(
         loads_per_source_instruction_milli: 0,
         stores_per_source_instruction_milli: 0,
     })
+}
+
+/// Reports whether every exact leaf the generated release commit needs was
+/// declared for this compile.
+///
+/// Production publishes all five addresses unconditionally, so this is true for
+/// every real request. Embedders that supply no lifecycle leaves keep the
+/// symbol undeclared-and-undefined instead of failing finalization.
+fn native_lifecycle_leaves_available(operations: &NativeOptimizingOperations) -> bool {
+    operations.frame_alloc.is_some()
+        && operations.frame_release.is_some()
+        && operations.object_release_prepare.is_some()
+        && operations.object_release_finalize.is_some()
+        && operations.object_release_children_drop.is_some()
 }
 
 fn compile_preflighted_region_function(
@@ -17392,20 +19805,21 @@ fn define_region_fragment_wrapper(
         if region.compile_metadata.tier == NativeCompilerTier::Generic {
             lower_generic_function_entry(&mut builder, deopt_out, region.function)?;
         }
-        let (arguments, resume_id) = if region.compile_metadata.tier == NativeCompilerTier::Generic
+        let argument_contract = match tier_operations {
+            NativeTierOperations::Generic { operations, .. } => operations.argument_check,
+            NativeTierOperations::Optimizing {
+                argument_contract, ..
+            } => argument_contract,
+        };
+        let (arguments, resume_id) = if region
+            .params
+            .iter()
+            .any(|parameter| parameter.type_.is_some())
         {
-            let NativeTierOperations::Generic { operations, .. } = tier_operations else {
-                return Err(CraneliftLoweringError::new(
-                    "JIT_CRANELIFT_NATIVE_ENTRY_BINDING",
-                    "baseline fragment wrapper has no baseline operation plane",
-                ));
-            };
             lower_generic_bind_packed_arguments(
                 module,
                 &mut builder,
-                operations
-                    .argument_check
-                    .map(|helper| helper.with_runtime(runtime)),
+                argument_contract.map(|helper| helper.with_runtime(runtime)),
                 &region.params,
                 region
                     .parameter_locals
@@ -17846,109 +20260,6 @@ fn lower_entry_array_source(
     }
 }
 
-fn emit_optimizing_entry_direct_array_descriptor(
-    builder: &mut FunctionBuilder<'_>,
-    array: ir::Value,
-    deopt_out: ir::Value,
-    rejected: ir::Block,
-) -> (ir::Value, ir::Value, ir::Value) {
-    let pointer_type = builder.func.dfg.value_type(deopt_out);
-    let inspect_index = builder.create_block();
-    let inspect_slot = builder.create_block();
-    let accepted = builder.create_block();
-    builder.append_block_param(inspect_slot, types::I64);
-    builder.append_block_param(accepted, pointer_type);
-    builder.append_block_param(accepted, types::I64);
-    builder.append_block_param(accepted, pointer_type);
-
-    let tagged = lower_value_has_tag(builder, array, crate::JIT_VALUE_RUNTIME_ARRAY_TAG);
-    let encoded_index = builder.ins().ireduce(types::I32, array);
-    let direct_index = builder.ins().icmp_imm(
-        IntCC::UnsignedGreaterThanOrEqual,
-        encoded_index,
-        i64::from(crate::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE),
-    );
-    let direct = builder.ins().band(tagged, direct_index);
-    builder
-        .ins()
-        .brif(direct, inspect_index, &[], rejected, &[]);
-
-    builder.switch_to_block(inspect_index);
-    let index = builder.ins().iadd_imm(
-        encoded_index,
-        -i64::from(crate::JIT_NATIVE_DIRECT_VALUE_INDEX_BASE),
-    );
-    let in_bounds = builder.ins().icmp_imm(
-        IntCC::UnsignedLessThan,
-        index,
-        crate::JIT_NATIVE_DIRECT_VALUE_CAPACITY as i64,
-    );
-    builder
-        .ins()
-        .brif(in_bounds, inspect_slot, &[array.into()], rejected, &[]);
-
-    builder.switch_to_block(inspect_slot);
-    let array = builder.block_params(inspect_slot)[0];
-    let slot = lower_optimizing_slot_address(builder, array, deopt_out);
-    let kind = builder.ins().load(
-        types::I32,
-        MemFlagsData::new(),
-        slot,
-        std::mem::offset_of!(crate::JitNativeValueSlot, kind) as i32,
-    );
-    let length = builder.ins().load(
-        types::I64,
-        MemFlagsData::new(),
-        slot,
-        std::mem::offset_of!(crate::JitNativeValueSlot, payload) as i32,
-    );
-    let entries = builder.ins().load(
-        pointer_type,
-        MemFlagsData::new(),
-        slot,
-        std::mem::offset_of!(crate::JitNativeValueSlot, aux) as i32,
-    );
-    let flags = builder.ins().load(
-        types::I32,
-        MemFlagsData::new(),
-        slot,
-        std::mem::offset_of!(crate::JitNativeValueSlot, flags) as i32,
-    );
-    let direct_kind = builder.ins().icmp_imm(
-        IntCC::Equal,
-        kind,
-        i64::from(crate::JIT_NATIVE_VALUE_VIEW_DIRECT_ARRAY),
-    );
-    let abi_mask = (1_i64 << crate::JIT_NATIVE_DIRECT_ARRAY_CURSOR_SHIFT) - 1;
-    let abi = builder.ins().band_imm(flags, abi_mask);
-    let abi_matches = builder.ins().icmp_imm(
-        IntCC::Equal,
-        abi,
-        i64::from(crate::JIT_NATIVE_DIRECT_ARRAY_ABI_VERSION),
-    );
-    let bounded = builder.ins().icmp_imm(
-        IntCC::UnsignedLessThanOrEqual,
-        length,
-        crate::JIT_NATIVE_DIRECT_ARRAY_ENTRY_CAPACITY as i64,
-    );
-    let admitted = builder.ins().band(direct_kind, abi_matches);
-    let admitted = builder.ins().band(admitted, bounded);
-    builder.ins().brif(
-        admitted,
-        accepted,
-        &[slot.into(), length.into(), entries.into()],
-        rejected,
-        &[],
-    );
-
-    builder.switch_to_block(accepted);
-    (
-        builder.block_params(accepted)[0],
-        builder.block_params(accepted)[1],
-        builder.block_params(accepted)[2],
-    )
-}
-
 fn lower_optimizing_entry_array_key(
     builder: &mut FunctionBuilder<'_>,
     key: &NativeEntryArrayKey,
@@ -17991,13 +20302,24 @@ fn emit_optimizing_entry_array_probe_paths(
                 length = child_length;
                 entries = child_entries;
             } else {
-                if path.leaf == NativeEntryArrayProbeLeaf::PlainValue {
-                    let reference =
-                        lower_value_has_tag(builder, value, crate::JIT_VALUE_RUNTIME_REFERENCE_TAG);
-                    let plain = builder.ins().icmp_imm(IntCC::Equal, reference, 0);
-                    let value_ready = builder.create_block();
-                    builder.ins().brif(plain, value_ready, &[], rejected, &[]);
-                    builder.switch_to_block(value_ready);
+                match path.leaf {
+                    NativeEntryArrayProbeLeaf::ExistsOnly => {}
+                    NativeEntryArrayProbeLeaf::PlainValue => {
+                        let reference = lower_value_has_tag(
+                            builder,
+                            value,
+                            crate::JIT_VALUE_RUNTIME_REFERENCE_TAG,
+                        );
+                        let plain = builder.ins().icmp_imm(IntCC::Equal, reference, 0);
+                        let value_ready = builder.create_block();
+                        builder.ins().brif(plain, value_ready, &[], rejected, &[]);
+                        builder.switch_to_block(value_ready);
+                    }
+                    NativeEntryArrayProbeLeaf::DirectArray => {
+                        let _ = emit_optimizing_entry_direct_array_descriptor(
+                            builder, value, deopt_out, rejected,
+                        );
+                    }
                 }
                 builder.ins().jump(path_done, &[]);
             }
@@ -18256,7 +20578,7 @@ fn emit_optimizing_entry_property_slot(
         .ins()
         .iadd_imm(plan_base, i64::from(requirement.continuation_id));
     let wide_plan_index = builder.ins().uextend(pointer_type, plan_index);
-    let plan_offset = builder.ins().ishl_imm(wide_plan_index, 4);
+    let plan_offset = builder.ins().ishl_imm(wide_plan_index, 5);
     let plan = builder.ins().iadd(plans, plan_offset);
     let state = builder.ins().load(
         types::I32,
@@ -18455,7 +20777,7 @@ fn emit_optimizing_entry_static_property(
         .ins()
         .iadd_imm(plan_base, i64::from(requirement.continuation_id));
     let wide_plan_index = builder.ins().uextend(pointer_type, plan_index);
-    let plan_offset = builder.ins().ishl_imm(wide_plan_index, 3);
+    let plan_offset = builder.ins().ishl_imm(wide_plan_index, 4);
     let plan = builder.ins().iadd(plans, plan_offset);
     let state = builder.ins().load(
         types::I32,
@@ -19228,8 +21550,14 @@ fn emit_optimizing_entry_native_value_guard(
         current,
         crate::jit_encode_constant(crate::JIT_VALUE_TRUE),
     );
+    let uninitialized = builder.ins().icmp_imm(
+        IntCC::Equal,
+        current,
+        crate::jit_encode_constant(crate::JIT_VALUE_UNINITIALIZED),
+    );
     let singleton = builder.ins().bor(null, false_value);
     let singleton = builder.ins().bor(singleton, true_value);
+    let singleton = builder.ins().bor(singleton, uninitialized);
     let immediate_total = builder.ins().bor(ordinary, singleton);
     builder
         .ins()
@@ -19614,7 +21942,7 @@ fn emit_optimizing_entry_guards(
             arguments,
             deopt_out,
             requirement.parameter_index,
-            crate::JIT_NATIVE_OBJECT_STDCLASS,
+            crate::JIT_NATIVE_OBJECT_ALLOWS_DYNAMIC_PROPERTIES,
             rejected,
             "dynamic property",
         )?;
@@ -20088,6 +22416,12 @@ fn emit_optimizing_entry_guards(
             state,
             i64::from(crate::JIT_NATIVE_TRUSTED_CONSTANT_PUBLISHED),
         );
+        let semantic_error = builder.ins().icmp_imm(
+            IntCC::Equal,
+            state,
+            i64::from(crate::JIT_NATIVE_TRUSTED_CONSTANT_ERROR),
+        );
+        let published = builder.ins().bor(published, semantic_error);
         let next = builder.create_block();
         builder.ins().brif(published, next, &[], rejected, &[]);
         builder.switch_to_block(next);
@@ -21219,6 +23553,7 @@ fn lower_optimizing_generic_continuation(
     live_registers: &[RegId],
     native_version: u32,
     canonical_entry: bool,
+    handler_resume: Option<(BlockId, ir::Value, ir::Value)>,
 ) -> Result<(), CraneliftLoweringError> {
     publish_native_continuation_state(
         builder,
@@ -21253,10 +23588,43 @@ fn lower_optimizing_generic_continuation(
     let address = builder
         .ins()
         .atomic_load(pointer_type, MemFlagsData::new(), entry_cell);
-    let resume_id = builder.ins().iconst(
-        types::I32,
-        i64::from(crate::native_transition_resume_id(continuation_id)),
-    );
+    let resume_id = if let Some((handler, pending_status, pending_value)) = handler_resume {
+        // The Optimizing handler loader has already selected and bound this
+        // exceptional edge. If its first instruction takes the function's
+        // single Generic continuation, enter the matching Generic handler
+        // loader as well. An instruction continuation is not valid here: the
+        // ordinary Generic lowering has no transition entry for a directly
+        // lowered catch instruction, and its resume default is the function
+        // entry. Using that default replayed the protected call indefinitely.
+        builder.ins().store(
+            MemFlagsData::new(),
+            pending_status,
+            deopt_out,
+            std::mem::offset_of!(crate::JitDeoptState, control_status) as i32,
+        );
+        builder.ins().store(
+            MemFlagsData::new(),
+            pending_value,
+            deopt_out,
+            std::mem::offset_of!(crate::JitDeoptState, control_value) as i32,
+        );
+        let clear_reserved = builder.ins().iconst(types::I32, 0);
+        builder.ins().store(
+            MemFlagsData::new(),
+            clear_reserved,
+            deopt_out,
+            std::mem::offset_of!(crate::JitDeoptState, control_reserved) as i32,
+        );
+        builder.ins().iconst(
+            types::I32,
+            i64::from(crate::native_handler_resume_id(handler)),
+        )
+    } else {
+        builder.ins().iconst(
+            types::I32,
+            i64::from(crate::native_transition_resume_id(continuation_id)),
+        )
+    };
     let signature = builder.import_signature(native_php_entry_signature(module));
     let call = builder.ins().call_indirect(
         signature,
@@ -21276,6 +23644,85 @@ fn lower_optimizing_generic_continuation(
     let unreachable = builder.create_block();
     builder.set_cold_block(unreachable);
     builder.switch_to_block(unreachable);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn propagate_generated_release_control(
+    builder: &mut FunctionBuilder<'_>,
+    deopt_out: ir::Value,
+    terminal_exit: ir::Block,
+    function: FunctionId,
+    local_count: u32,
+    continuation_id: u32,
+    live_locals: &[LocalId],
+    locals: &NativeLocalMap,
+    registers: &NativeRegisterMap,
+    live_registers: &[RegId],
+    native_version: u32,
+) -> Result<(), CraneliftLoweringError> {
+    // Resolve the semantic live set before splitting the control edge. Using
+    // frontend Variables for the first time in the cold propagation sibling
+    // can make the frontend alias that sibling's value into the normal path,
+    // producing a non-dominating use in the following PHP instruction.
+    let live_values = live_registers
+        .iter()
+        .copied()
+        .map(|register| Ok((register, use_region_register(builder, registers, register)?)))
+        .collect::<Result<Vec<_>, CraneliftLoweringError>>()?;
+    let propagate = builder.create_block();
+    let continue_execution = builder.create_block();
+    let detail = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        deopt_out,
+        std::mem::offset_of!(crate::JitDeoptState, control_reserved) as i32,
+    );
+    let pending = builder.ins().icmp_imm(
+        IntCC::Equal,
+        detail,
+        i64::from(crate::JIT_NATIVE_GENERATED_RELEASE_CONTROL_DETAIL),
+    );
+    builder
+        .ins()
+        .brif(pending, propagate, &[], continue_execution, &[]);
+
+    builder.switch_to_block(propagate);
+    let status = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        deopt_out,
+        std::mem::offset_of!(crate::JitDeoptState, control_status) as i32,
+    );
+    let value = builder.ins().load(
+        types::I64,
+        MemFlagsData::new(),
+        deopt_out,
+        std::mem::offset_of!(crate::JitDeoptState, control_value) as i32,
+    );
+    publish_native_continuation_state(
+        builder,
+        deopt_out,
+        function,
+        local_count,
+        continuation_id,
+        live_locals,
+        locals,
+        native_version,
+    )?;
+    publish_native_register_values(builder, deopt_out, &live_values)?;
+    let clear = builder.ins().iconst(types::I32, 0);
+    builder.ins().store(
+        MemFlagsData::new(),
+        clear,
+        deopt_out,
+        std::mem::offset_of!(crate::JitDeoptState, control_reserved) as i32,
+    );
+    builder
+        .ins()
+        .jump(terminal_exit, &[status.into(), value.into()]);
+
+    builder.switch_to_block(continue_execution);
     Ok(())
 }
 
@@ -21302,21 +23749,35 @@ fn define_region_graph_function(
     preflight_only: bool,
 ) -> Result<DefinedRegionFunction, CraneliftLoweringError> {
     let pointer_type = module.target_config().pointer_type();
-    let (optimizing_assumptions, needs_local_generic_continuation) =
-        if region.compile_metadata.tier == NativeCompilerTier::Optimizing {
-            match collect_optimizing_assumptions(
-                region,
-                constants,
-                value_flow,
-                function_params,
-                external_function_signatures,
-            ) {
-                Ok(admission) => (admission, false),
-                Err(_) => (NativeOptimizingAssumptions::default(), true),
+    let mut forced_generic_continuations = BTreeSet::new();
+    let rejection_continuation = Cell::new(None);
+    let collected_assumptions = loop {
+        match collect_optimizing_assumptions(
+            region,
+            constants,
+            value_flow,
+            function_params,
+            external_function_signatures,
+            &forced_generic_continuations,
+            &rejection_continuation,
+        ) {
+            Err(error) if region.compile_metadata.tier == NativeCompilerTier::Optimizing => {
+                let local_boundary = rejection_continuation_id(&error)
+                    .or(rejection_continuation.get())
+                    .and_then(|continuation_id| {
+                        local_generic_boundary_for_rejection(region, continuation_id)
+                    });
+                if local_boundary.is_some_and(|continuation_id| {
+                    forced_generic_continuations.insert(continuation_id)
+                }) {
+                    continue;
+                }
+                break Err(error);
             }
-        } else {
-            (NativeOptimizingAssumptions::default(), false)
-        };
+            outcome => break outcome,
+        }
+    };
+    let optimizing_assumptions = collected_assumptions?;
     let mut maximum_temporary_cache_entries = 0_usize;
     let mut production_lowering = Vec::new();
     ctx.func.signature = if fragment.is_some() && !inline_fragment_entry {
@@ -21539,15 +24000,13 @@ fn define_region_graph_function(
             lower_generic_function_entry(&mut builder, deopt_out, region.function)?;
         }
         let (
-            native_call_helper,
             native_dynamic_code_helper,
-            mut generic_operations,
+            generic_operations,
             generic_value_release_commit,
             execution_poll,
             generic_exact_operations,
         ) = match tier_operations {
             NativeTierOperations::Generic {
-                call,
                 dynamic_code,
                 operations,
                 exact_operations,
@@ -21560,21 +24019,25 @@ fn define_region_graph_function(
                         .with_terminal_exit(NativeTerminalExit {
                             block: terminal_exit,
                         });
+                let exact_operations =
+                    exact_operations
+                        .with_runtime(runtime)
+                        .with_terminal_exit(NativeTerminalExit {
+                            block: terminal_exit,
+                        });
                 (
-                    call.map(|helper| helper.with_runtime(runtime)),
                     dynamic_code.map(|helper| helper.with_runtime(runtime)),
                     Some(operations),
                     Some(module.declare_func_in_func(value_release_commit, builder.func)),
-                    operations.execution_poll,
-                    Some(exact_operations.with_runtime(runtime)),
+                    exact_operations.execution_poll,
+                    Some(exact_operations),
                 )
             }
             NativeTierOperations::Optimizing { .. } => {
-                let NativeTierOperations::Optimizing { operations } = tier_operations else {
+                let NativeTierOperations::Optimizing { operations, .. } = tier_operations else {
                     unreachable!("optimizing tier was matched above")
                 };
                 (
-                    None,
                     None,
                     None,
                     None,
@@ -21590,35 +24053,6 @@ fn define_region_graph_function(
                 )
             }
         };
-        // These guards read the request-owned runtime view directly and only
-        // call Rust for reference, warning, destructor, or unsupported dynamic
-        // cases. Baseline code needs the same fast paths: forcing every local,
-        // scalar comparison, and retain/release through helpers dominated warm
-        // execution long after compilation had finished.
-        if let Some(native_operations) = generic_operations.as_mut() {
-            native_operations.value_release = native_operations
-                .value_release
-                .map(NativeHelper::with_inline_runtime_view);
-            native_operations.local_fetch = native_operations
-                .local_fetch
-                .map(|helper| helper.map(NativeHelper::with_inline_runtime_view));
-            native_operations.local_store = native_operations
-                .local_store
-                .map(|helper| helper.map(NativeHelper::with_inline_runtime_view));
-            native_operations.type_predicate = native_operations
-                .type_predicate
-                .map(NativeHelper::with_inline_runtime_view);
-            native_operations.stable_length = native_operations
-                .stable_length
-                .map(NativeHelper::with_inline_runtime_view);
-            native_operations.array_fetch.0 = native_operations
-                .array_fetch
-                .0
-                .map(|helper| helper.map(NativeHelper::with_inline_runtime_view));
-            native_operations.foreach_next = native_operations
-                .foreach_next
-                .map(NativeHelper::with_inline_runtime_view);
-        }
         let (arguments, resume_id) = if region.compile_metadata.tier == NativeCompilerTier::Generic
             && (fragment.is_none() || inline_fragment_entry)
         {
@@ -21650,7 +24084,7 @@ fn define_region_graph_function(
             },
             |fragment| fragment.fragment.locals.clone(),
         );
-        let locals = if let Some(frame) = streaming_state_frame {
+        let mut locals = if let Some(frame) = streaming_state_frame {
             let layout = frame_layout.expect("streaming frame layout");
             local_ids
                 .into_iter()
@@ -21675,6 +24109,25 @@ fn define_region_graph_function(
                 })
                 .collect::<NativeLocalMap>()
         };
+        for local in locals.keys().copied().collect::<Vec<_>>() {
+            if !matches!(
+                value_flow.local_storage(local),
+                crate::region_ir::LocalStorageClass::RequestGlobal
+                    | crate::region_ir::LocalStorageClass::Superglobal
+            ) {
+                continue;
+            }
+            let cache = match locals[&local] {
+                NativeLocalStorage::Variable(variable) => NativeLocalCache::Variable(variable),
+                NativeLocalStorage::FrameSlot { frame, offset } => {
+                    NativeLocalCache::FrameSlot { frame, offset }
+                }
+                NativeLocalStorage::RequestGlobal { .. } => unreachable!(),
+            };
+            let slot =
+                lower_trusted_request_local_slot(&mut builder, deopt_out, region.function, local);
+            locals.insert(local, NativeLocalStorage::RequestGlobal { cache, slot });
+        }
         let streaming_call_exit = streaming_state_frame
             .filter(|_| {
                 owned_blocks.iter().any(|block| {
@@ -21698,6 +24151,13 @@ fn define_region_graph_function(
         let register_types = region_register_types(region);
         let register_live_in = &register_liveness.block_live_in;
         let transition_register_liveness = &register_liveness.transition_live;
+        let handler_live_registers = region
+            .exception_regions
+            .iter()
+            .flat_map(|handler| [handler.catch, handler.finally].into_iter().flatten())
+            .filter_map(|target| register_live_in.get(&target))
+            .flat_map(|registers| registers.iter().copied())
+            .collect::<BTreeSet<_>>();
         let register_ids = fragment.map_or_else(
             || {
                 (0..region.register_count)
@@ -21724,6 +24184,22 @@ fn define_region_graph_function(
                                 type_,
                             }
                         })
+                } else if handler_live_registers.contains(&register) {
+                    // Exception entries are independent native invocations.
+                    // Keep values live across those entries in an explicit
+                    // generated spill slot rather than relying on a frontend
+                    // Variable phi whose ordinary predecessor was lowered
+                    // before the exceptional backedge.
+                    let slot = builder.create_sized_stack_slot(StackSlotData::new(
+                        StackSlotKind::ExplicitSlot,
+                        8,
+                        3,
+                    ));
+                    NativeRegisterStorage::SpillSlot {
+                        frame: builder.ins().stack_addr(pointer_type, slot, 0),
+                        offset: 0,
+                        type_,
+                    }
                 } else {
                     NativeRegisterStorage::Variable(builder.declare_var(type_))
                 };
@@ -21798,23 +24274,28 @@ fn define_region_graph_function(
             types::I64,
             crate::jit_encode_constant(crate::JIT_VALUE_UNINITIALIZED),
         );
-        for (local, storage) in &locals {
-            if let NativeLocalStorage::Variable(variable) = *storage {
-                let initial = if matches!(
-                    value_flow.local_storage(*local),
-                    crate::region_ir::LocalStorageClass::RequestGlobal
-                        | crate::region_ir::LocalStorageClass::Superglobal
-                ) {
-                    lower_trusted_request_local_reference(
-                        &mut builder,
-                        deopt_out,
-                        region.function,
-                        *local,
-                    )
-                } else {
-                    uninitialized_value
-                };
-                builder.def_var(variable, initial);
+        for storage in locals.values() {
+            match *storage {
+                NativeLocalStorage::Variable(variable) => {
+                    builder.def_var(variable, uninitialized_value);
+                }
+                NativeLocalStorage::RequestGlobal {
+                    cache: NativeLocalCache::Variable(variable),
+                    slot,
+                } => {
+                    let initial = builder.ins().load(
+                        types::I64,
+                        MemFlagsData::new(),
+                        slot,
+                        std::mem::offset_of!(crate::JitNativeRequestLocalSlot, encoded) as i32,
+                    );
+                    builder.def_var(variable, initial);
+                }
+                NativeLocalStorage::FrameSlot { .. }
+                | NativeLocalStorage::RequestGlobal {
+                    cache: NativeLocalCache::FrameSlot { .. },
+                    ..
+                } => {}
             }
         }
         if matches!(tier_operations, NativeTierOperations::Optimizing { .. })
@@ -22075,8 +24556,8 @@ fn define_region_graph_function(
             None
         };
 
-        for target in handler_resume_blocks {
-            let loader = handler_resume_loaders[&target];
+        for target in &handler_resume_blocks {
+            let loader = handler_resume_loaders[target];
             builder.switch_to_block(loader);
             builder.set_cold_block(loader);
             let status = builder.ins().load(
@@ -22105,19 +24586,64 @@ fn define_region_graph_function(
                 .copied()
                 .chain(
                     handler_exception_locals
-                        .get(&target)
+                        .get(target)
                         .into_iter()
                         .flatten()
                         .copied(),
                 )
-                .collect::<std::collections::BTreeSet<_>>();
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
             if streaming_state_frame.is_none() {
                 restore_native_local_state_values(
                     &mut builder,
                     resume_state,
                     &locals,
-                    &resume_locals.into_iter().collect::<Vec<_>>(),
+                    &resume_locals,
                 )?;
+            }
+            let mut restored_registers = register_variables.clone();
+            for (snapshot_slot, register) in register_live_in
+                .get(target)
+                .into_iter()
+                .flatten()
+                .enumerate()
+            {
+                let type_ = register_types.get(register).copied().unwrap_or(types::I64);
+                let offset = std::mem::offset_of!(crate::JitDeoptState, registers)
+                    .saturating_add(snapshot_slot.saturating_mul(8));
+                let value = builder.ins().load(
+                    types::I64,
+                    MemFlagsData::new(),
+                    resume_state,
+                    offset as i32,
+                );
+                let value = if type_ == types::I64 {
+                    value
+                } else {
+                    builder.ins().ireduce(type_, value)
+                };
+                if let Some(frame) = streaming_state_frame {
+                    builder.ins().store(
+                        MemFlagsData::new(),
+                        value,
+                        frame,
+                        frame_layout
+                            .expect("streaming handler frame layout")
+                            .register_offset(
+                                fragment.expect("streaming handler fragment").fragment.id,
+                                *register,
+                            )?,
+                    );
+                } else {
+                    define_region_register(
+                        &mut builder,
+                        &register_variables,
+                        &mut restored_registers,
+                        *register,
+                        value,
+                    )?;
+                }
             }
             // A call-originated throw reaches a handler through the published
             // control value, not through a pre-existing caller local slot.
@@ -22125,33 +24651,36 @@ fn define_region_graph_function(
             // catch local after restoring the caller frame. Restoring the
             // uninitialized snapshot slot here previously replaced every
             // caught Error with NULL.
-            if let Some(exception_locals) = handler_exception_locals.get(&target) {
-                if matches!(tier_operations, NativeTierOperations::Optimizing { .. }) {
-                    for local in exception_locals {
-                        define_local_variable(&mut builder, &locals, *local, value)?;
-                    }
-                } else {
-                    for local in exception_locals {
-                        let current = use_local_variable(&mut builder, &locals, *local)?;
-                        let function = builder
-                            .ins()
-                            .iconst(types::I64, i64::from(region.function.raw()));
-                        let local_value = builder.ins().iconst(types::I64, i64::from(local.raw()));
-                        let stored = lower_exact_native_value_operation(
-                            module,
-                            &mut builder,
-                            generic_operations
-                                .expect("Generic catch binding requires Generic operations")
-                                .local_store[2],
-                            &[current, value, function, local_value],
-                            result_out,
-                            "local store",
-                        )?;
-                        define_local_variable(&mut builder, &locals, *local, stored)?;
-                    }
+            if let Some(exception_locals) = handler_exception_locals.get(target) {
+                for local in exception_locals {
+                    define_local_variable(&mut builder, &locals, *local, value)?;
                 }
             }
-            builder.ins().jump(cranelift_block(&blocks, target)?, &[]);
+            if region.compile_metadata.tier == NativeCompilerTier::Optimizing {
+                let live_registers = register_live_in
+                    .get(target)
+                    .map(|registers| registers.iter().copied().collect::<Vec<_>>())
+                    .unwrap_or_default();
+                lower_optimizing_generic_continuation(
+                    module,
+                    &mut builder,
+                    runtime,
+                    arguments,
+                    result_out,
+                    deopt_out,
+                    region.function,
+                    region.local_count,
+                    target_block.entry_continuation_id,
+                    &resume_locals,
+                    &locals,
+                    &restored_registers,
+                    &live_registers,
+                    native_version,
+                    canonical_entry,
+                    Some((*target, status, value)),
+                )?;
+            }
+            builder.ins().jump(cranelift_block(&blocks, *target)?, &[]);
         }
         for region_block in &owned_blocks {
             for instruction in &region_block.instructions {
@@ -22563,7 +25092,7 @@ fn define_region_graph_function(
                 builder.switch_to_block(continue_execution);
             }
             let mut terminated = false;
-            for instruction in &region_block.instructions {
+            for (instruction_index, instruction) in region_block.instructions.iter().enumerate() {
                 let transition_block = transition_blocks.get(&instruction.continuation_id).copied();
                 if let Some(transition_block) = transition_block {
                     builder.ins().jump(transition_block, &[]);
@@ -22605,7 +25134,14 @@ fn define_region_graph_function(
                         RegionInstructionKind::NativeCall(call)
                             if (call.direct_compiled_target().is_none()
                                 && !matches!(call.target, RegionCallTarget::Semantic { .. })
+                                && !optimizing_dynamic_call_has_generated_spine(
+                                    call,
+                                    external_function_signatures,
+                                )
                                 && baseline_builtin_helper_id(&call.target).is_none()
+                                && !optimizing_assumptions.fixed_builtin_call_is_proven(
+                                    instruction.continuation_id,
+                                )
                                     && direct_linked_signature(
                                         call,
                                         external_function_signatures,
@@ -22615,9 +25151,19 @@ fn define_region_graph_function(
                                     && !optimizing_assumptions.fixed_builtin_call_is_proven(
                                         instruction.continuation_id,
                                     ))
-                    ) || needs_local_generic_continuation
-                        && instruction.optimizer_transition_entry)
+                    ))
+                    || optimizing_assumptions
+                        .generic_continuation_is_required(instruction.continuation_id)
                 {
+                    let handler_resume = (instruction_index == 0
+                        && handler_resume_blocks.contains(&region_block.id))
+                    .then(|| {
+                        (
+                            region_block.id,
+                            builder.use_var(pending_status),
+                            builder.use_var(pending_value),
+                        )
+                    });
                     lower_optimizing_generic_continuation(
                         module,
                         &mut builder,
@@ -22634,6 +25180,7 @@ fn define_region_graph_function(
                         transition_live_registers,
                         native_version,
                         canonical_entry,
+                        handler_resume,
                     )?;
                     production_lowering.push(crate::JitProductionLoweringMetadata {
                         function: region.function,
@@ -22652,7 +25199,7 @@ fn define_region_graph_function(
                     continue;
                 }
                 match tier_operations {
-                    NativeTierOperations::Optimizing { operations } => {
+                    NativeTierOperations::Optimizing { operations, .. } => {
                         lower_optimizing_region_instruction(
                             module,
                             &mut builder,
@@ -22664,8 +25211,16 @@ fn define_region_graph_function(
                             instruction,
                             transition_live_registers,
                             optimizing_assumptions.array_call_is_proven(instruction.continuation_id),
+                            countable_object_is_possible(
+                                region,
+                                instruction,
+                                value_flow,
+                                constants,
+                            ),
                             optimizing_assumptions
                                 .fixed_builtin_call_is_proven(instruction.continuation_id),
+                            optimizing_assumptions
+                                .throwable_method_call_is_proven(instruction.continuation_id),
                             optimizing_assumptions
                                 .array_instruction_is_proven(instruction.continuation_id),
                             optimizing_assumptions.array_instruction_root_is_by_reference(
@@ -22674,24 +25229,22 @@ fn define_region_graph_function(
                             optimizing_assumptions
                                 .binary_instruction_is_proven(instruction.continuation_id),
                             optimizing_assumptions
+                                .numeric_binary_instruction_is_proven(instruction.continuation_id),
+                            optimizing_assumptions
                                 .binary_instruction_operand_classes(instruction.continuation_id),
                             optimizing_assumptions
                                 .scalar_control_instruction_is_proven(instruction.continuation_id),
                             optimizing_assumptions
                                 .array_instruction_is_fresh(instruction.continuation_id),
+                            optimizing_assumptions
+                                .fresh_unique_array_key(instruction.continuation_id),
                             optimizing_assumptions.fresh_array_capacity(instruction.continuation_id),
                             optimizing_assumptions.local_load_is_proven(instruction.continuation_id),
                             optimizing_assumptions
                                 .request_local_store_is_proven(instruction.continuation_id),
                             optimizing_assumptions
                                 .return_reference_store_is_proven(instruction.continuation_id),
-                            optimizing_assumptions
-                                .reference_payload_proof()
-                                .or_else(|| {
-                                    needs_local_generic_continuation
-                                        .then_some(NativeReferencePayloadProof(()))
-                                })
-                                .ok_or_else(|| {
+                            optimizing_assumptions.reference_payload_proof().ok_or_else(|| {
                                     CraneliftLoweringError::new(
                                         "JIT_CRANELIFT_REFERENCE_PAYLOAD_PUBLICATION",
                                         "optimizing lowering requires total reference payload publication",
@@ -22711,9 +25264,14 @@ fn define_region_graph_function(
                             region.function,
                             region.local_count,
                             region.flags.is_top_level,
+                            &region.locals,
                             native_version,
                             unit_identity,
-                            operations.with_runtime(runtime),
+                            operations
+                                .with_runtime(runtime)
+                                .with_terminal_exit(NativeTerminalExit {
+                                    block: terminal_exit,
+                                }),
                         )
                         .map(|emitted| {
                             production_lowering.push(crate::JitProductionLoweringMetadata {
@@ -22729,13 +25287,39 @@ fn define_region_graph_function(
                         })
                     }
                     NativeTierOperations::Generic { .. }
-                        if matches!(&instruction.kind,
-                            RegionInstructionKind::NativeCall(call)
-                                if baseline_builtin_helper_id(&call.target).is_some())
-                            || matches!(&instruction.kind,
-                                RegionInstructionKind::ArrayCallback(_)
-                                    | RegionInstructionKind::PregCallbackArray(_)) =>
+                        if !matches!(
+                            &instruction.kind,
+                            RegionInstructionKind::NativeDynamicCode(_)
+                        ) =>
                     {
+                        let generated_fresh_array = matches!(
+                            instruction.kind,
+                            RegionInstructionKind::ArrayInsert { .. }
+                                | RegionInstructionKind::ArraySpread { .. }
+                        );
+                        let generated_foreach_array = match instruction.kind {
+                            RegionInstructionKind::ForeachInit { source, .. } => {
+                                let fact = lowering_operand_fact(value_flow, constants, source);
+                                fact.certainty != crate::region_ir::SsaCertainty::Unknown
+                                    && fact.class == SsaValueClass::ArrayHandle
+                            }
+                            RegionInstructionKind::ForeachNext { .. }
+                            | RegionInstructionKind::ForeachCleanup { .. } => true,
+                            _ => false,
+                        };
+                        let generated_total_instruction = generated_fresh_array
+                            || generated_foreach_array
+                            || matches!(
+                                instruction.kind,
+                                RegionInstructionKind::BindReference { .. }
+                                    | RegionInstructionKind::BindReferenceDim { .. }
+                                    | RegionInstructionKind::BindReferenceIntoDim { .. }
+                                    | RegionInstructionKind::BindReferenceProperty { .. }
+                                    | RegionInstructionKind::BindReferenceFromProperty { .. }
+                                    | RegionInstructionKind::BindReferenceFromPropertyDim { .. }
+                                    | RegionInstructionKind::BindReferenceIntoPropertyDim { .. }
+                                    | RegionInstructionKind::BindReferenceDimFromProperty { .. }
+                            );
                         lower_optimizing_region_instruction(
                             module,
                             &mut builder,
@@ -22746,22 +25330,36 @@ fn define_region_graph_function(
                             &mut registers,
                             instruction,
                             transition_live_registers,
-                            true,
+                            optimizing_assumptions
+                                .array_call_is_proven(instruction.continuation_id),
+                            countable_object_is_possible(
+                                region,
+                                instruction,
+                                value_flow,
+                                constants,
+                            ),
                             true,
                             optimizing_assumptions
-                                .array_instruction_is_proven(instruction.continuation_id),
+                                .throwable_method_call_is_proven(instruction.continuation_id),
+                            generated_total_instruction
+                                || optimizing_assumptions
+                                    .array_instruction_is_proven(instruction.continuation_id),
                             optimizing_assumptions.array_instruction_root_is_by_reference(
                                 instruction.continuation_id,
                             ),
                             optimizing_assumptions
                                 .binary_instruction_is_proven(instruction.continuation_id),
+                            optimizing_assumptions
+                                .numeric_binary_instruction_is_proven(instruction.continuation_id),
                             optimizing_assumptions.binary_instruction_operand_classes(
                                 instruction.continuation_id,
                             ),
                             optimizing_assumptions
                                 .scalar_control_instruction_is_proven(instruction.continuation_id),
-                            optimizing_assumptions
-                                .array_instruction_is_fresh(instruction.continuation_id),
+                            generated_fresh_array
+                                || optimizing_assumptions
+                                    .array_instruction_is_fresh(instruction.continuation_id),
+                            None,
                             optimizing_assumptions.fresh_array_capacity(
                                 instruction.continuation_id,
                             ),
@@ -22789,6 +25387,7 @@ fn define_region_graph_function(
                             region.function,
                             region.local_count,
                             region.flags.is_top_level,
+                            &region.locals,
                             native_version,
                             unit_identity,
                             generic_exact_operations
@@ -22807,41 +25406,19 @@ fn define_region_graph_function(
                             });
                         })
                     }
-                    NativeTierOperations::Generic { .. } => lower_generic_region_instruction(
+                    NativeTierOperations::Generic { .. } => lower_generic_dynamic_code_instruction(
                         module,
                         &mut builder,
-                        functions,
-                        inline_constants,
-                        function_params,
-                        external_function_signatures,
-                        native_call_helper,
                         native_dynamic_code_helper,
-                        generic_operations
-                            .expect("Generic instruction requires Generic operations"),
                         generic_value_release_commit,
-                        &register_variables,
-                        &blocks,
-                        &suspension_blocks,
                         &locals,
+                        &register_variables,
                         &mut registers,
-                        region_block.source_block,
                         instruction,
-                        transition_live_registers,
-                        constants,
-                        value_flow,
-                        streaming_call_exit,
                         result_out,
+                        runtime,
                         deopt_out,
-                        resume_state,
-                        pending_status,
-                        pending_value,
                         region.function,
-                        region.return_type.is_some(),
-                        region.local_count,
-                        native_version,
-                        region.flags.is_top_level,
-                        &region.locals,
-                        unit_identity,
                         pointer_type,
                     ),
                 }
@@ -22857,13 +25434,35 @@ fn define_region_graph_function(
                         ),
                     )
                 })?;
+                // A generated runtime fatal already published its control
+                // result and returned, so the edge after it is unreachable and
+                // has no continuation to propagate a pending release into.
+                // Emitting the check anyway leaves its continue-execution
+                // successor created and branched to but never filled, which
+                // the verifier rejects as an invalid block reference.
+                let fatal = matches!(instruction.kind, RegionInstructionKind::RuntimeFatal { .. });
+                if !fatal {
+                    propagate_generated_release_control(
+                        &mut builder,
+                        deopt_out,
+                        terminal_exit,
+                        region.function,
+                        region.local_count,
+                        instruction.continuation_id,
+                        &instruction.live_locals,
+                        &locals,
+                        &registers,
+                        transition_live_registers,
+                        native_version,
+                    )?;
+                }
                 maximum_temporary_cache_entries = maximum_temporary_cache_entries.max(
                     registers
                         .values()
                         .filter(|storage| matches!(storage, NativeRegisterStorage::Cached(_)))
                         .count(),
                 );
-                if matches!(instruction.kind, RegionInstructionKind::RuntimeFatal { .. }) {
+                if fatal {
                     terminated = true;
                     break;
                 }
@@ -22886,13 +25485,23 @@ fn define_region_graph_function(
             builder.set_srcloc(ir::SourceLoc::new(
                 region_block.terminator_continuation_id.saturating_add(1),
             ));
-            if needs_local_generic_continuation
-                && matches!(tier_operations, NativeTierOperations::Optimizing { .. })
+            if matches!(tier_operations, NativeTierOperations::Optimizing { .. })
+                && !optimizing_assumptions
+                    .terminator_is_proven(region_block.terminator_continuation_id)
             {
                 let live_registers = transition_register_liveness
                     .get(&region_block.terminator_continuation_id)
                     .map(Vec::as_slice)
                     .unwrap_or_default();
+                let handler_resume = (region_block.instructions.is_empty()
+                    && handler_resume_blocks.contains(&region_block.id))
+                .then(|| {
+                    (
+                        region_block.id,
+                        builder.use_var(pending_status),
+                        builder.use_var(pending_value),
+                    )
+                });
                 lower_optimizing_generic_continuation(
                     module,
                     &mut builder,
@@ -22909,6 +25518,7 @@ fn define_region_graph_function(
                     live_registers,
                     native_version,
                     canonical_entry,
+                    handler_resume,
                 )?;
                 production_lowering.push(crate::JitProductionLoweringMetadata {
                     function: region.function,
@@ -22928,7 +25538,7 @@ fn define_region_graph_function(
             // code and execution traffic; successor blocks already reload the
             // authoritative slots above.
             match tier_operations {
-                NativeTierOperations::Optimizing { operations } => {
+                NativeTierOperations::Optimizing { operations, .. } => {
                     let value_release_commit =
                         module.declare_func_in_func(operations.value_release_commit, builder.func);
                     debug_assert!(
@@ -22942,6 +25552,7 @@ fn define_region_graph_function(
                         &locals,
                         &registers,
                         result_out,
+                        runtime,
                         deopt_out,
                         value_release_commit,
                         optimizing_assumptions.return_plan(region_block.terminator_continuation_id),
@@ -22988,11 +25599,19 @@ fn define_region_graph_function(
                     pending_value,
                     module,
                     generic_operations.expect("Generic terminator requires Generic operations"),
+                    runtime,
+                    generic_value_release_commit
+                        .expect("Generic terminator requires generated value release"),
                     region.function,
                     region.local_count,
                     region_block.terminator_continuation_id,
                     native_version,
-                    region.return_type.is_some(),
+                    generic_terminator_requires_return_check(
+                        region,
+                        &region_block.terminator,
+                        constants,
+                        value_flow,
+                    ),
                     &region_block.terminator,
                     constants,
                     value_flow,
@@ -23212,9 +25831,44 @@ fn define_region_graph_function(
     }
     let verifier_flags = settings::Flags::new(settings::builder());
     if let Err(error) = verify_function(&ctx.func, &verifier_flags) {
+        let operand_evidence = error
+            .0
+            .iter()
+            .filter_map(|error| match error.location {
+                cranelift_codegen::ir::entities::AnyEntity::Inst(instruction) => {
+                    let use_block = ctx.func.layout.inst_block(instruction);
+                    let operands = ctx
+                        .func
+                        .dfg
+                        .inst_args(instruction)
+                        .iter()
+                        .map(|operand| {
+                            let definition = ctx.func.dfg.value_def(*operand);
+                            let definition_block = match definition {
+                                ir::ValueDef::Result(instruction, _) => {
+                                    ctx.func.layout.inst_block(instruction)
+                                }
+                                ir::ValueDef::Param(block, _) => Some(block),
+                                ir::ValueDef::Union(_, _) => None,
+                            };
+                            format!("{operand}={definition:?}@{definition_block:?}")
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    Some(format!(
+                        "{instruction}@{use_block:?} src={:?} operands=[{operands}]",
+                        ctx.func.srcloc(instruction),
+                    ))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
         let error = CraneliftLoweringError::new(
             "JIT_CRANELIFT_REJECT_VERIFIER",
-            format!("Cranelift verifier rejected executable Region IR: {error}"),
+            format!(
+                "Cranelift verifier rejected executable Region IR: {error}; {operand_evidence}"
+            ),
         );
         module.clear_context(ctx);
         return Err(error);
@@ -23336,6 +25990,15 @@ fn region_graph_metadata<'a>(
             (region.function, liveness)
         })
         .collect::<BTreeMap<_, _>>();
+    let handler_liveness = regions
+        .iter()
+        .map(|region| {
+            (
+                region.function,
+                NativeRegisterLiveness::analyze(region).block_live_in,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
     let continuations = regions
         .iter()
         .flat_map(|region| {
@@ -23427,6 +26090,7 @@ fn region_graph_metadata<'a>(
         exception_handlers: regions
             .iter()
             .flat_map(|region| {
+                let live_in = &handler_liveness[&region.function];
                 region.exception_regions.iter().filter_map(move |handler| {
                     let enter_continuation = region
                         .blocks
@@ -23441,7 +26105,15 @@ fn region_graph_metadata<'a>(
                         protected_blocks: handler.protected_blocks.clone(),
                         catch: handler.catch,
                         catch_types: handler.catch_types.clone(),
+                        catch_live_registers: handler
+                            .catch
+                            .and_then(|block| live_in.get(&block))
+                            .map_or_else(Vec::new, |registers| registers.iter().copied().collect()),
                         finally: handler.finally,
+                        finally_live_registers: handler
+                            .finally
+                            .and_then(|block| live_in.get(&block))
+                            .map_or_else(Vec::new, |registers| registers.iter().copied().collect()),
                         after: handler.after,
                         exception_local: handler.exception_local,
                     })
@@ -23784,7 +26456,7 @@ mod tests {
     }
 
     #[test]
-    fn debug_backtrace_requires_a_complete_native_frame_trampoline() {
+    fn debug_backtrace_uses_the_generated_shadow_stack_without_a_trampoline() {
         let mut builder = php_ir::IrBuilder::new(php_ir::UnitId::new(7_004));
         let file = builder.add_file("native-debug-backtrace-frame.php");
         let span = php_ir::IrSpan::new(file, 0, 1);
@@ -23814,8 +26486,8 @@ mod tests {
 
         let unit = builder.finish();
         let function = &unit.functions[function.index()];
-        assert!(ir_function_requires_non_reference_trampoline(function));
-        assert!(ir_function_requires_trampoline(function));
+        assert!(!ir_function_requires_non_reference_trampoline(function));
+        assert!(!ir_function_requires_trampoline(function));
     }
 
     #[test]

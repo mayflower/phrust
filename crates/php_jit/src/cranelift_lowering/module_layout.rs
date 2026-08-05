@@ -8,7 +8,7 @@ use crate::region_ir::{RegionBlock, RegionGraph, RegionTerminator, generic_instr
 use php_ir::{BlockId, FunctionId};
 use std::collections::BTreeSet;
 
-pub const BASELINE_FRAGMENT_MAX_PHP_BLOCKS: usize = 64;
+pub const NATIVE_FRAGMENT_HARD_MAX_PHP_BLOCKS: usize = 64;
 /// Persistent schema for deterministic native fragment boundaries and frame
 /// traffic. Increment whenever planning can change emitted fragment code.
 pub const NATIVE_FRAGMENT_PLAN_SCHEMA_VERSION: u32 = 11;
@@ -16,12 +16,12 @@ pub const NATIVE_FRAGMENT_PLAN_SCHEMA_VERSION: u32 = 11;
 // limits. Planning must leave enough headroom for helper continuations,
 // resume loaders, and frontend SSA edge splitting. The finished CLIF function
 // is checked again before `define_function` can enter regalloc2.
-pub const BASELINE_FRAGMENT_MAX_IR_INSTRUCTIONS: usize = 400;
-pub const BASELINE_SINGLE_BLOCK_MAX_IR_INSTRUCTIONS: usize = 512;
-pub const BASELINE_FRAGMENT_MAX_ESTIMATED_CLIF_BLOCKS: usize = 450;
-pub const BASELINE_SINGLE_BLOCK_MAX_ESTIMATED_CLIF_BLOCKS: usize = 537;
-pub const BASELINE_FRAGMENT_MAX_ESTIMATED_LIVE_SET: usize = 384;
-pub const BASELINE_FRAGMENT_MAX_SAFEPOINT_LIVE_SUM: usize = 4_096;
+pub const NATIVE_FRAGMENT_HARD_MAX_IR_INSTRUCTIONS: usize = 400;
+pub const NATIVE_SINGLE_BLOCK_HARD_MAX_IR_INSTRUCTIONS: usize = 512;
+pub const NATIVE_FRAGMENT_HARD_MAX_ESTIMATED_CLIF_BLOCKS: usize = 450;
+pub const NATIVE_SINGLE_BLOCK_HARD_MAX_ESTIMATED_CLIF_BLOCKS: usize = 537;
+pub const NATIVE_FRAGMENT_HARD_MAX_ESTIMATED_LIVE_SET: usize = 384;
+pub const NATIVE_FRAGMENT_HARD_MAX_SAFEPOINT_LIVE_SUM: usize = 4_096;
 pub const OPTIMIZING_REGION_MAX_PHP_BLOCKS: usize = 256;
 pub const OPTIMIZING_REGION_MAX_IR_INSTRUCTIONS: usize = 1_500;
 pub const OPTIMIZING_REGION_MAX_VIRTUAL_VALUES: usize = 768;
@@ -44,7 +44,7 @@ fn estimated_instruction_clif_blocks(instruction: &crate::region_ir::RegionInstr
         // order of magnitude.
         crate::region_ir::RegionInstructionKind::NativeCall(call) => 12_usize
             .saturating_add(call.operands.len())
-            .min(BASELINE_FRAGMENT_MAX_ESTIMATED_CLIF_BLOCKS),
+            .min(NATIVE_FRAGMENT_HARD_MAX_ESTIMATED_CLIF_BLOCKS),
         // Locals and value copies may carry reference, ownership, and
         // lifecycle guards even when the source instruction is not itself a
         // safepoint. Account for those continuation blocks up front so exact
@@ -126,7 +126,7 @@ fn estimated_region_block_clif_blocks(block: &RegionBlock) -> usize {
         // one invalid mega-fragment.
         // Fragment accounting adds its synthetic entry block after summing
         // member blocks, so reserve that final slot here.
-        estimate.min(BASELINE_SINGLE_BLOCK_MAX_ESTIMATED_CLIF_BLOCKS.saturating_sub(1))
+        estimate.min(NATIVE_SINGLE_BLOCK_HARD_MAX_ESTIMATED_CLIF_BLOCKS.saturating_sub(1))
     } else {
         estimate
     }
@@ -267,16 +267,17 @@ impl FragmentPlanningCost {
     }
 
     fn is_within_budget(self) -> bool {
-        self.blocks <= BASELINE_FRAGMENT_MAX_PHP_BLOCKS
-            && (self.instructions <= BASELINE_FRAGMENT_MAX_IR_INSTRUCTIONS
+        self.blocks <= NATIVE_FRAGMENT_HARD_MAX_PHP_BLOCKS
+            && (self.instructions <= NATIVE_FRAGMENT_HARD_MAX_IR_INSTRUCTIONS
                 || (self.blocks == 1
-                    && self.instructions <= BASELINE_SINGLE_BLOCK_MAX_IR_INSTRUCTIONS))
-            && (self.clif_blocks.saturating_add(1) <= BASELINE_FRAGMENT_MAX_ESTIMATED_CLIF_BLOCKS
+                    && self.instructions <= NATIVE_SINGLE_BLOCK_HARD_MAX_IR_INSTRUCTIONS))
+            && (self.clif_blocks.saturating_add(1)
+                <= NATIVE_FRAGMENT_HARD_MAX_ESTIMATED_CLIF_BLOCKS
                 || (self.blocks == 1
                     && self.clif_blocks.saturating_add(1)
-                        <= BASELINE_SINGLE_BLOCK_MAX_ESTIMATED_CLIF_BLOCKS))
-            && self.maximum_live_set <= BASELINE_FRAGMENT_MAX_ESTIMATED_LIVE_SET
-            && self.safepoint_live_sum <= BASELINE_FRAGMENT_MAX_SAFEPOINT_LIVE_SUM
+                        <= NATIVE_SINGLE_BLOCK_HARD_MAX_ESTIMATED_CLIF_BLOCKS))
+            && self.maximum_live_set <= NATIVE_FRAGMENT_HARD_MAX_ESTIMATED_LIVE_SET
+            && self.safepoint_live_sum <= NATIVE_FRAGMENT_HARD_MAX_SAFEPOINT_LIVE_SUM
     }
 }
 
@@ -421,16 +422,16 @@ pub struct NativeFragmentPlan {
 impl NativeFragmentPlan {
     #[must_use]
     pub fn is_within_budget(&self) -> bool {
-        self.blocks.len() <= BASELINE_FRAGMENT_MAX_PHP_BLOCKS
-            && (self.ir_instructions <= BASELINE_FRAGMENT_MAX_IR_INSTRUCTIONS
+        self.blocks.len() <= NATIVE_FRAGMENT_HARD_MAX_PHP_BLOCKS
+            && (self.ir_instructions <= NATIVE_FRAGMENT_HARD_MAX_IR_INSTRUCTIONS
                 || (self.blocks.len() == 1
-                    && self.ir_instructions <= BASELINE_SINGLE_BLOCK_MAX_IR_INSTRUCTIONS))
-            && (self.estimated_clif_blocks <= BASELINE_FRAGMENT_MAX_ESTIMATED_CLIF_BLOCKS
+                    && self.ir_instructions <= NATIVE_SINGLE_BLOCK_HARD_MAX_IR_INSTRUCTIONS))
+            && (self.estimated_clif_blocks <= NATIVE_FRAGMENT_HARD_MAX_ESTIMATED_CLIF_BLOCKS
                 || (self.blocks.len() == 1
                     && self.estimated_clif_blocks
-                        <= BASELINE_SINGLE_BLOCK_MAX_ESTIMATED_CLIF_BLOCKS))
-            && self.maximum_estimated_live_set <= BASELINE_FRAGMENT_MAX_ESTIMATED_LIVE_SET
-            && self.safepoint_live_set_sum <= BASELINE_FRAGMENT_MAX_SAFEPOINT_LIVE_SUM
+                        <= NATIVE_SINGLE_BLOCK_HARD_MAX_ESTIMATED_CLIF_BLOCKS))
+            && self.maximum_estimated_live_set <= NATIVE_FRAGMENT_HARD_MAX_ESTIMATED_LIVE_SET
+            && self.safepoint_live_set_sum <= NATIVE_FRAGMENT_HARD_MAX_SAFEPOINT_LIVE_SUM
     }
 }
 
@@ -548,7 +549,7 @@ impl NativeCompilePlan {
             let start = group.first()?.index();
             let end = group.last()?.index().checked_add(1)?;
             let cut = (start + 1..end).min_by_key(|cut| {
-                let left_cost = fragment_boundary_cost(
+                let left_boundary_cost = fragment_boundary_cost(
                     region,
                     &successors,
                     &live_in,
@@ -556,7 +557,7 @@ impl NativeCompilePlan {
                     start,
                     *cut,
                 );
-                let right_cost = fragment_boundary_cost(
+                let right_boundary_cost = fragment_boundary_cost(
                     region,
                     &successors,
                     &live_in,
@@ -564,12 +565,39 @@ impl NativeCompilePlan {
                     *cut,
                     end,
                 );
-                let balance = cut.saturating_sub(start).abs_diff(end.saturating_sub(*cut));
+                let left = fragment_plan_for_blocks(
+                    region,
+                    0,
+                    region.blocks[start..*cut]
+                        .iter()
+                        .map(|block| block.id)
+                        .collect(),
+                );
+                let right = fragment_plan_for_blocks(
+                    region,
+                    0,
+                    region.blocks[*cut..end]
+                        .iter()
+                        .map(|block| block.id)
+                        .collect(),
+                );
+                let clif_balance = left
+                    .estimated_clif_blocks
+                    .abs_diff(right.estimated_clif_blocks);
+                let instruction_balance = left.ir_instructions.abs_diff(right.ir_instructions);
                 // Exact recovery must make structural progress first. Giving
                 // frame traffic priority can repeatedly peel off one cheap
                 // block while leaving nearly the complete oversized CLIF
-                // graph intact, forcing another full lowering round.
-                (balance, left_cost.saturating_add(right_cost), *cut)
+                // graph intact, forcing another full lowering round. Balance
+                // the planner's backend-expansion estimate rather than raw
+                // block count; call and exception blocks have very different
+                // generated costs.
+                (
+                    clif_balance,
+                    instruction_balance,
+                    left_boundary_cost.saturating_add(right_boundary_cost),
+                    *cut,
+                )
             })?;
             let offset = cut.saturating_sub(start);
             let right = replacement[split_position].split_off(offset);
@@ -588,11 +616,11 @@ impl NativeCompilePlan {
             .enumerate()
             .map(|(id, blocks)| fragment_plan_for_blocks(region, id, blocks))
             .collect();
-        refined
-            .fragments
-            .iter()
-            .all(NativeFragmentPlan::is_within_budget)
-            .then_some(refined)
+        // This path is driven by exact finished-CLIF measurement. The source
+        // estimator must not veto the measured natural partition or replace
+        // it with arbitrary instruction chunks; the caller immediately
+        // preflights every child against the real backend ceilings.
+        Some(refined)
     }
 
     /// Builds the mandatory plan for one already verified Region graph.
@@ -625,7 +653,7 @@ impl NativeCompilePlan {
             .max()
             .unwrap_or(0)
             .max(region.params.len());
-        // The baseline admission plan only needs a conservative phi-cost
+        // The function-scoped admission plan only needs a conservative phi-cost
         // estimate. Building full dominator/frontier SSA here made every cold
         // function pay optimizing-tier analysis before fragmentation. Every
         // materialized local at a multi-predecessor block is a safe upper
@@ -696,24 +724,14 @@ impl NativeCompilePlan {
             .saturating_add(resume_dispatch_points.saturating_mul(2))
             .saturating_add(estimated_helper_branches.saturating_mul(2))
             .saturating_add(4);
-        let whole_region_optimizing = region.compile_metadata.tier
-            == crate::region_ir::NativeCompilerTier::Optimizing
-            && region.blocks.len() <= OPTIMIZING_REGION_MAX_PHP_BLOCKS
-            && instructions.len() <= OPTIMIZING_REGION_MAX_IR_INSTRUCTIONS
-            && region.register_count as usize <= OPTIMIZING_REGION_MAX_VIRTUAL_VALUES;
-        let fragments = if whole_region_optimizing {
-            vec![fragment_plan_for_blocks(
-                region,
-                0,
-                region.blocks.iter().map(|block| block.id).collect(),
-            )]
-        } else {
-            cost_aware_fragment_blocks(region)
-                .into_iter()
-                .enumerate()
-                .map(|(id, blocks)| fragment_plan_for_blocks(region, id, blocks))
-                .collect()
-        };
+        // A plan always begins as one complete PHP machine function. Only an
+        // exact finished-CLIF hard-limit result may call
+        // `for_bounded_fragments` or `refine_fragment_into` later.
+        let fragments = vec![fragment_plan_for_blocks(
+            region,
+            0,
+            region.blocks.iter().map(|block| block.id).collect(),
+        )];
 
         Self {
             function: region.function,

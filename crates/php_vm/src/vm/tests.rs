@@ -11,39 +11,21 @@ fn production_and_diagnostic_helpers_use_distinct_tables() {
     let production = runtime_helper_addresses(false);
     let diagnostic = runtime_helper_addresses(true);
 
-    assert_ne!(production.native_array_fetch, diagnostic.native_array_fetch);
     assert_ne!(
-        production.native_value_release,
-        diagnostic.native_value_release
+        production.native_execution_poll,
+        diagnostic.native_execution_poll
     );
-    assert_ne!(
-        production.native_foreach_next,
-        diagnostic.native_foreach_next
-    );
-    assert_ne!(
-        production.baseline_call_dispatch,
-        diagnostic.baseline_call_dispatch
-    );
-    assert_ne!(
-        production.baseline_builtin_dispatch,
-        diagnostic.baseline_builtin_dispatch
-    );
-    assert_ne!(
-        production.baseline_semantic_dispatch,
-        diagnostic.baseline_semantic_dispatch
-    );
-
-    let array_fetch = php_jit::lookup_helper_by_name("phrust_native_array_fetch")
-        .expect("array-fetch helper is registered")
+    let execution_poll = php_jit::lookup_helper_by_name("phrust_native_execution_poll")
+        .expect("execution-poll helper is registered")
         .id
         .0;
     assert_eq!(
-        resolve_native_cache_helper(array_fetch, false),
-        Some(production.native_array_fetch)
+        resolve_native_cache_helper(execution_poll, false),
+        Some(production.native_execution_poll)
     );
     assert_eq!(
-        resolve_native_cache_helper(array_fetch, true),
-        Some(diagnostic.native_array_fetch)
+        resolve_native_cache_helper(execution_poll, true),
+        Some(diagnostic.native_execution_poll)
     );
 }
 
@@ -180,6 +162,7 @@ fn native_compile_descriptor_attributes_identity_trigger_and_publication() {
     assert_eq!(descriptor.replan_index, 0);
     assert!(descriptor.generic_key.ends_with(":generic"));
     assert_eq!(descriptor.external_signatures_hash, 0);
+    assert_eq!(descriptor.receiver_layout_hash, 0);
     assert!(descriptor.code_bytes > 0);
 }
 
@@ -2873,7 +2856,7 @@ fn baseline_does_not_inline_or_widen_for_constant_wrapper() {
 
 #[test]
 #[cfg(target_arch = "x86_64")]
-fn warmed_method_pic_reclassifies_stable_call_as_direct() {
+fn generated_method_resolution_calls_published_generic_entry() {
     let vm = Vm::with_options(VmOptions {
         collect_counters: true,
         ..VmOptions::default()
@@ -2883,17 +2866,17 @@ fn warmed_method_pic_reclassifies_stable_call_as_direct() {
 
     assert_eq!(result.return_value, Some(Value::Int(7)), "{result:#?}");
     let counters = result.counters.expect("diagnostic counters");
-    assert!(counters.native_method_monomorphic_eligible >= 2);
-    assert!(counters.native_method_monomorphic_executed >= 1);
-    assert!(counters.native_call_direct >= 2);
+    assert_eq!(counters.native_method_monomorphic_eligible, 0);
+    assert_eq!(counters.native_method_monomorphic_executed, 0);
+    assert_eq!(counters.native_transition_count, 0);
 
-    // The descriptor is compiled-unit metadata shared across requests.
-    // Both calls in the second request should therefore hit the persistent
-    // monomorphic entry rather than warming another request-local table.
+    // Every body cell is published before execution. A second request selects
+    // the same generated method entry without warming a request-local PIC.
     let warm = vm.execute(unit);
     assert_eq!(warm.return_value, Some(Value::Int(7)), "{warm:#?}");
     let warm_counters = warm.counters.expect("diagnostic counters");
-    assert!(warm_counters.native_method_monomorphic_executed >= 2);
+    assert_eq!(warm_counters.native_method_monomorphic_executed, 0);
+    assert_eq!(warm_counters.native_transition_count, 0);
 }
 
 #[test]

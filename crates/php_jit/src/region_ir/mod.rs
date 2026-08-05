@@ -77,7 +77,8 @@ pub use ssa::{
 };
 pub use value_flow::{
     ExecutableValueFlow, LocalStorageClass, analyze_executable_value_flow,
-    analyze_generic_value_ownership,
+    analyze_executable_value_flow_with_function_returns, analyze_generic_value_ownership,
+    generated_fact_satisfies_type,
 };
 pub use verify::{RegionVerifyError, verify_region_graph};
 

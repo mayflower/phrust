@@ -29,12 +29,13 @@ fn lower_total_optimizing_frame_cleanup(
     builder: &mut FunctionBuilder<'_>,
     cleanup: &[(LocalId, ir::Value)],
     value_release_commit: ir::FuncRef,
+    runtime: ir::Value,
     deopt_out: ir::Value,
 ) {
     for (_, value) in cleanup {
         let _ = builder
             .ins()
-            .call(value_release_commit, &[deopt_out, *value]);
+            .call(value_release_commit, &[runtime, deopt_out, *value]);
     }
 }
 
@@ -154,6 +155,7 @@ fn lower_total_optimizing_reference_writeback(
     reference: ir::Value,
     replacement: ir::Value,
     value_release_commit: ir::FuncRef,
+    runtime: ir::Value,
     deopt_out: ir::Value,
 ) {
     let slot = lower_optimizing_slot_address(builder, reference, deopt_out);
@@ -165,7 +167,7 @@ fn lower_total_optimizing_reference_writeback(
     );
     let _ = builder
         .ins()
-        .call(value_release_commit, &[deopt_out, previous]);
+        .call(value_release_commit, &[runtime, deopt_out, previous]);
     builder.ins().store(
         MemFlagsData::new(),
         replacement,
@@ -366,6 +368,8 @@ pub(super) fn lower_region_terminator(
     pending_value: Variable,
     module: &mut JITModule,
     native_operations: GenericNativeOperations,
+    runtime: ir::Value,
+    value_release_commit: ir::FuncRef,
     function: FunctionId,
     local_count: u32,
     continuation_id: u32,
@@ -458,6 +462,8 @@ pub(super) fn lower_region_terminator(
                     module,
                     builder,
                     native_operations,
+                    runtime,
+                    value_release_commit,
                     function,
                     local_count,
                     continuation_id,
@@ -479,14 +485,13 @@ pub(super) fn lower_region_terminator(
 
                 builder.switch_to_block(preserve);
                 if fact.ownership == SsaOwnership::Borrowed {
-                    lower_guarded_value_release(
-                        module,
+                    lower_guarded_value_owner_change(
                         builder,
-                        native_operations.value_release,
-                        native_dim_operation(0, function, 0),
+                        true,
                         checked,
-                        result_out,
                         deopt_out,
+                        runtime,
+                        value_release_commit,
                     )?;
                 } else if let Some(literal_borrowed) = literal_borrowed {
                     lower_optimizing_retain_if(builder, checked, literal_borrowed, deopt_out);
@@ -500,14 +505,13 @@ pub(super) fn lower_region_terminator(
                 checked
             } else {
                 if fact.ownership == SsaOwnership::Borrowed {
-                    lower_guarded_value_release(
-                        module,
+                    lower_guarded_value_owner_change(
                         builder,
-                        native_operations.value_release,
-                        native_dim_operation(0, function, 0),
+                        true,
                         value,
-                        result_out,
                         deopt_out,
+                        runtime,
+                        value_release_commit,
                     )?
                 } else if let Some(literal_borrowed) = literal_borrowed {
                     lower_optimizing_retain_if(builder, value, literal_borrowed, deopt_out);
@@ -531,7 +535,8 @@ pub(super) fn lower_region_terminator(
                 status,
                 *finally,
                 module,
-                native_operations,
+                runtime,
+                value_release_commit,
                 value_flow,
                 function,
             )?;
@@ -549,6 +554,8 @@ pub(super) fn lower_region_terminator(
                     module,
                     builder,
                     native_operations,
+                    runtime,
+                    value_release_commit,
                     function,
                     local_count,
                     continuation_id,
@@ -563,14 +570,13 @@ pub(super) fn lower_region_terminator(
             } else {
                 local_value
             };
-            let value = lower_guarded_value_release(
-                module,
+            let value = lower_guarded_value_owner_change(
                 builder,
-                native_operations.value_release,
-                native_dim_operation(0, function, 0),
+                true,
                 local_value,
-                result_out,
                 deopt_out,
+                runtime,
+                value_release_commit,
             )?;
             let status = builder.ins().iconst(
                 types::I32,
@@ -588,7 +594,8 @@ pub(super) fn lower_region_terminator(
                 status,
                 *finally,
                 module,
-                native_operations,
+                runtime,
+                value_release_commit,
                 value_flow,
                 function,
             )?;
@@ -600,14 +607,13 @@ pub(super) fn lower_region_terminator(
                 let (value, literal_borrowed) =
                     lower_terminator_storage_value(builder, value, operand, constants, deopt_out);
                 if fact.ownership == SsaOwnership::Borrowed {
-                    lower_guarded_value_release(
-                        module,
+                    lower_guarded_value_owner_change(
                         builder,
-                        native_operations.value_release,
-                        native_dim_operation(0, function, 0),
+                        true,
                         value,
-                        result_out,
                         deopt_out,
+                        runtime,
+                        value_release_commit,
                     )?
                 } else if let Some(literal_borrowed) = literal_borrowed {
                     lower_optimizing_retain_if(builder, value, literal_borrowed, deopt_out);
@@ -633,7 +639,8 @@ pub(super) fn lower_region_terminator(
                 status,
                 *finally,
                 module,
-                native_operations,
+                runtime,
+                value_release_commit,
                 value_flow,
                 function,
             )?;
@@ -653,6 +660,7 @@ pub(super) fn lower_optimizing_region_terminator(
     locals: &NativeLocalMap,
     registers: &NativeRegisterMap,
     result_out: ir::Value,
+    runtime: ir::Value,
     deopt_out: ir::Value,
     value_release_commit: ir::FuncRef,
     return_plan: Option<NativeOptimizingReturnPlan>,
@@ -777,14 +785,17 @@ pub(super) fn lower_optimizing_region_terminator(
                 builder,
                 &cleanup,
                 value_release_commit,
+                runtime,
                 deopt_out,
             );
-            builder
-                .ins()
-                .store(MemFlagsData::new(), value, result_out, 0);
             let status = builder
                 .ins()
                 .iconst(types::I32, i64::from(crate::JitCallStatus::RETURN.0));
+            let (status, value) =
+                select_generated_release_control(builder, deopt_out, status, value);
+            builder
+                .ins()
+                .store(MemFlagsData::new(), value, result_out, 0);
             return_native_or_fragment_control(builder, status, result_out);
         }
         RegionTerminator::ReturnReference {
@@ -812,6 +823,7 @@ pub(super) fn lower_optimizing_region_terminator(
                         current,
                         replacement,
                         value_release_commit,
+                        runtime,
                         deopt_out,
                     );
                 }
@@ -822,7 +834,7 @@ pub(super) fn lower_optimizing_region_terminator(
                         lower_total_optimizing_return_plan(builder, current, plan, deopt_out);
                     let _ = builder
                         .ins()
-                        .call(value_release_commit, &[deopt_out, current]);
+                        .call(value_release_commit, &[runtime, deopt_out, current]);
                     replacement
                 } else {
                     current
@@ -841,15 +853,18 @@ pub(super) fn lower_optimizing_region_terminator(
                 builder,
                 &cleanup,
                 value_release_commit,
+                runtime,
                 deopt_out,
             );
-            builder
-                .ins()
-                .store(MemFlagsData::new(), value, result_out, 0);
             let status = builder.ins().iconst(
                 types::I32,
                 i64::from(crate::JitCallStatus::RETURN_REFERENCE.0),
             );
+            let (status, value) =
+                select_generated_release_control(builder, deopt_out, status, value);
+            builder
+                .ins()
+                .store(MemFlagsData::new(), value, result_out, 0);
             return_native_or_fragment_control(builder, status, result_out);
         }
         RegionTerminator::Exit {
@@ -899,14 +914,17 @@ pub(super) fn lower_optimizing_region_terminator(
                 builder,
                 &cleanup,
                 value_release_commit,
+                runtime,
                 deopt_out,
             );
-            builder
-                .ins()
-                .store(MemFlagsData::new(), value, result_out, 0);
             let status = builder
                 .ins()
                 .iconst(types::I32, i64::from(crate::JitCallStatus::EXIT.0));
+            let (status, value) =
+                select_generated_release_control(builder, deopt_out, status, value);
+            builder
+                .ins()
+                .store(MemFlagsData::new(), value, result_out, 0);
             return_native_or_fragment_control(builder, status, result_out);
         }
         RegionTerminator::Return {
@@ -937,7 +955,8 @@ fn lower_region_frame_exit(
     status: ir::Value,
     finally: Option<BlockId>,
     module: &mut JITModule,
-    native_operations: GenericNativeOperations,
+    runtime: ir::Value,
+    value_release_commit: ir::FuncRef,
     value_flow: &ExecutableValueFlow,
     function: FunctionId,
 ) -> Result<(), CraneliftLoweringError> {
@@ -950,12 +969,13 @@ fn lower_region_frame_exit(
             module,
             builder,
             locals,
-            native_operations,
+            runtime,
+            value_release_commit,
             value_flow,
             function,
-            result_out,
             deopt_out,
         )?;
+        let (status, value) = select_generated_release_control(builder, deopt_out, status, value);
         builder
             .ins()
             .store(MemFlagsData::new(), value, result_out, 0);
@@ -969,10 +989,10 @@ pub(super) fn lower_owned_frame_locals(
     module: &mut JITModule,
     builder: &mut FunctionBuilder<'_>,
     locals: &NativeLocalMap,
-    native_operations: GenericNativeOperations,
+    runtime: ir::Value,
+    value_release_commit: ir::FuncRef,
     value_flow: &ExecutableValueFlow,
     function: FunctionId,
-    result_out: ir::Value,
     deopt_out: ir::Value,
 ) -> Result<(), CraneliftLoweringError> {
     let mut owned_values = Vec::new();
@@ -991,14 +1011,13 @@ pub(super) fn lower_owned_frame_locals(
         return Ok(());
     };
     if owned_values.len() == 1 {
-        let _ = lower_guarded_value_release(
-            module,
+        let _ = lower_guarded_value_owner_change(
             builder,
-            native_operations.value_release,
-            native_frame_cleanup_operation(function),
+            false,
             first,
-            result_out,
             deopt_out,
+            runtime,
+            value_release_commit,
         )?;
         return Ok(());
     }
@@ -1053,14 +1072,13 @@ pub(super) fn lower_owned_frame_locals(
     let value = builder
         .ins()
         .load(types::I64, MemFlagsData::new(), address, 0);
-    let _ = lower_guarded_value_release(
-        module,
+    let _ = lower_guarded_value_owner_change(
         builder,
-        native_operations.value_release,
-        native_frame_cleanup_operation(function),
+        false,
         value,
-        result_out,
         deopt_out,
+        runtime,
+        value_release_commit,
     )?;
     let next = builder.ins().iadd_imm(index, 1);
     let more = builder.ins().icmp_imm(

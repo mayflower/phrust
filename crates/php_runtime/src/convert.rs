@@ -392,6 +392,25 @@ pub fn native_bytes_to_number(value: &[u8]) -> Result<NumericValue, String> {
     }
 }
 
+/// Coerces a complete numeric string for a weakly typed native `int`
+/// parameter. Leading-numeric strings are rejected just as they are by PHP's
+/// scalar parameter binder; explicit integer casts use the more permissive
+/// conversion path above.
+#[must_use]
+pub fn native_bytes_to_weak_int_parameter(value: &[u8]) -> Option<i64> {
+    let classified = crate::numeric_string::classify(value);
+    if !matches!(
+        classified.kind,
+        NumericStringKind::IntString | NumericStringKind::FloatString
+    ) {
+        return None;
+    }
+    match classified.value? {
+        NumericStringValue::Int(value) => Some(value),
+        NumericStringValue::Float(value) => Some(php_float_to_int(value)),
+    }
+}
+
 /// Converts a value to a PHP numeric arithmetic operand and preserves whether
 /// a leading numeric string warning is required.
 pub fn to_arithmetic_number(value: &Value) -> Result<ArithmeticNumber, String> {
