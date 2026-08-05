@@ -2255,11 +2255,19 @@ fn collect_optimizing_assumptions(
             .filter_map(|(index, count)| (*count > 1).then_some(index)),
     );
     let mut unstable_before = BTreeSet::new();
+    // Instability from an external effect alone, excluding the purely
+    // structural instability of a control-flow join. An entry proof about a
+    // parameter the region can never change survives a join, but never
+    // survives an effect.
+    let mut effect_unstable_before = BTreeSet::new();
     let mut external_effect_seen = false;
     for (block_index, block) in region.blocks.iter().enumerate() {
         for instruction in &block.instructions {
             if control_unstable_blocks.contains(&block_index) || external_effect_seen {
                 unstable_before.insert(instruction.continuation_id);
+            }
+            if external_effect_seen {
+                effect_unstable_before.insert(instruction.continuation_id);
             }
             let planned_lvalue_effect = matches!(
                 &instruction.kind,
@@ -2351,6 +2359,76 @@ fn collect_optimizing_assumptions(
                 );
         }
     }
+    // An entry proof is established once, at the native entry. A control-flow
+    // join re-reaches an instruction with different local state, which can
+    // invalidate that proof only when the entry datum itself can change: a
+    // by-reference or variadic parameter, an aggregate an effect can reach
+    // through, or a parameter the region reassigns. When every parameter is a
+    // by-value scalar that the region never writes and never binds by
+    // reference, the entry proof holds on every path into the loop.
+    //
+    // Treating the join itself as invalidating rejected the loop header of
+    // every `for (…; $i < $n; …)`, which forced that header — and with it the
+    // entire loop body — back into Generic. The loop then ran through runtime
+    // helper calls rather than the native leaves it had already proved.
+    let region_writes_local = |written: LocalId| {
+        region
+            .blocks
+            .iter()
+            .flat_map(|block| &block.instructions)
+            .any(|instruction| match &instruction.kind {
+                RegionInstructionKind::StoreLocal { local, .. }
+                | RegionInstructionKind::AssignLocalResult { local, .. }
+                | RegionInstructionKind::UnsetLocal { local } => *local == written,
+                RegionInstructionKind::BindReference { target, source } => {
+                    *target == written || *source == written
+                }
+                _ => false,
+            })
+    };
+    let entry_data_survives_joins = !region.params.is_empty()
+        && region.params.iter().enumerate().all(|(index, parameter)| {
+            !parameter.by_ref
+                && !parameter.variadic
+                && matches!(
+                    parameter.type_.as_ref(),
+                    Some(
+                        php_ir::IrReturnType::Int
+                            | php_ir::IrReturnType::Float
+                            | php_ir::IrReturnType::Bool
+                            | php_ir::IrReturnType::String
+                    )
+                )
+                && region
+                    .parameter_locals
+                    .get(index)
+                    .is_none_or(|local| !region_writes_local(*local))
+        });
+    // Parameter shape alone is not enough: an entry proof may also be rooted in
+    // a global, a request local, a static local, a constant, or an object's
+    // layout, none of which this region controls. Narrow the staleness scope
+    // only when every entry proof the collection actually recorded is rooted in
+    // one of those immutable by-value scalar parameters.
+    let entry_proofs_are_immutable_parameters = |admission: &NativeOptimizingAssumptions| {
+        entry_data_survives_joins
+            && admission.array_requirements.is_empty()
+            && admission.initialized_request_locals.is_empty()
+            && admission.releasable_request_locals.is_empty()
+            && admission.initialized_globals.is_empty()
+            && admission.releasable_globals.is_empty()
+            && admission.plain_globals.is_empty()
+            && admission.property_requirements.is_empty()
+            && admission.static_property_requirements.is_empty()
+            && admission.dynamic_property_requirements.is_empty()
+            && admission.object_layout_requirements.is_empty()
+            && admission.instanceof_requirements.is_empty()
+            && admission.callable_requirements.is_empty()
+            && admission.clone_requirements.is_empty()
+            && admission.exception_requirements.is_empty()
+            && admission.resource_type_requirements.is_empty()
+            && admission.trusted_constant_requirements.is_empty()
+            && admission.trusted_static_local_requirements.is_empty()
+    };
     admission.proven_reference_locals = region
         .blocks
         .iter()
@@ -2670,6 +2748,18 @@ fn collect_optimizing_assumptions(
                             }
                             _ => unreachable!("integer arithmetic publication operation"),
                         };
+                    // A static non-overflow proof lets the operands skip their
+                    // entry range guard. It is an optimization, not a
+                    // correctness precondition: the selected lowering for
+                    // integer add/subtract/multiply is total, computing the
+                    // result under an overflow check and producing the PHP
+                    // float result when it overflows. An unbounded accumulator
+                    // can never carry such a proof, so demanding one resumed
+                    // every `$acc += …` in Generic and dragged its whole loop
+                    // out of the optimizing tier with it. Keep the instruction
+                    // and pay one branch instead.
+                    let admission_before_ranges = admission.clone();
+                    let mut proven_range = true;
                     if lhs_fixed.is_none() && !published_integer(lhs) {
                         if let Some(parameter_index) = by_reference_integer_parameter(lhs) {
                             admission
@@ -2697,7 +2787,7 @@ fn collect_optimizing_assumptions(
                             )
                             .is_err()
                             {
-                                resume_binary_in_generic!();
+                                proven_range = false;
                             }
                         }
                     }
@@ -2728,14 +2818,25 @@ fn collect_optimizing_assumptions(
                             )
                             .is_err()
                             {
-                                resume_binary_in_generic!();
+                                proven_range = false;
                             }
                         }
                     }
-                    published_integer_results.insert(dst);
-                    if result_depends_on_entry {
-                        entry_dependent_integer_results.insert(dst);
-                        entry_dependent_continuations.insert(continuation);
+                    if proven_range {
+                        // Only a proved operand range may publish its result as
+                        // a range-proved integer; downstream arithmetic would
+                        // otherwise skip its own guard on an unproved claim.
+                        published_integer_results.insert(dst);
+                        if result_depends_on_entry {
+                            entry_dependent_integer_results.insert(dst);
+                            entry_dependent_continuations.insert(continuation);
+                        }
+                    } else {
+                        // A failed attempt may already have pushed a scalar
+                        // class requirement; drop the whole attempt so no entry
+                        // guard survives for a proof this instruction no longer
+                        // relies on.
+                        admission = admission_before_ranges;
                     }
                 }
                 RegionBinaryOp::Add | RegionBinaryOp::Sub | RegionBinaryOp::Mul
@@ -9145,8 +9246,13 @@ fn collect_optimizing_assumptions(
         }
     }
     rejection_continuation.set(None);
+    let stale_entry_scope = if entry_proofs_are_immutable_parameters(&admission) {
+        &effect_unstable_before
+    } else {
+        &unstable_before
+    };
     if let Some(continuation_id) = entry_dependent_continuations
-        .intersection(&unstable_before)
+        .intersection(stale_entry_scope)
         .next()
         .copied()
     {
@@ -9511,8 +9617,13 @@ fn collect_optimizing_assumptions(
             .proven_terminators
             .insert(block.terminator_continuation_id);
     }
+    let stale_entry_scope = if entry_proofs_are_immutable_parameters(&admission) {
+        &effect_unstable_before
+    } else {
+        &unstable_before
+    };
     if let Some(continuation_id) = entry_dependent_continuations
-        .intersection(&unstable_before)
+        .intersection(stale_entry_scope)
         .next()
         .copied()
     {
