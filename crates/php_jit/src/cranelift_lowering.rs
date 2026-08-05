@@ -2465,8 +2465,26 @@ fn publish_native_shadow_frame(
         .ins()
         .load(types::I32, MemFlagsData::new(), depth_field, 0);
     let depth_wide = builder.ins().uextend(pointer_type, depth);
+    // Recursion is bounded by the frame arena, not by this buffer, so the
+    // depth can exceed the published shadow stack. Writing at that depth
+    // overruns the request-owned mapping. Clamp to the last slot instead: the
+    // deepest frames stop being individually addressable once the stack is
+    // full, which only truncates a backtrace, while the arena keeps owning
+    // the actual recursion limit.
+    let capacity = builder.ins().load(
+        types::I32,
+        MemFlagsData::new(),
+        runtime,
+        std::mem::offset_of!(crate::JitNativeFastStateHeader, trace_capacity) as i32,
+    );
+    let capacity_wide = builder.ins().uextend(pointer_type, capacity);
+    let last_slot = builder.ins().iadd_imm(capacity_wide, -1);
+    let bounded = builder.ins().umin(depth_wide, last_slot);
+    let empty = builder.ins().icmp_imm(IntCC::Equal, capacity_wide, 0);
+    let zero = builder.ins().iconst(pointer_type, 0);
+    let bounded = builder.ins().select(empty, zero, bounded);
     let offset = builder.ins().imul_imm(
-        depth_wide,
+        bounded,
         i64::try_from(std::mem::size_of::<crate::JitNativeTraceFrame>()).unwrap_or(i64::MAX),
     );
     let frame = builder.ins().iadd(frames, offset);
